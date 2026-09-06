@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+# 현재 전송 구현은 Winsock과 IOCP를 쓴다. Windows 밖에서 늦게 링크 오류로 보이게 하지 않고,
+# 패키지를 찾는 자리에서 지원하지 않는 소비 경계를 알린다.
+if (NOT WIN32)
+    set(ServerCore_FOUND FALSE)
+    set(ServerCore_NOT_FOUND_MESSAGE "ServerCore currently supports Windows only.")
+    return()
+endif ()
+
+include("${CMAKE_CURRENT_LIST_DIR}/ServerCoreTargets.cmake")
+check_required_components(ServerCore)
