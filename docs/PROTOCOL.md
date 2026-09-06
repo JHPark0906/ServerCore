@@ -93,7 +93,7 @@ TCP 수신 바이트
 
 ### 2.4 DatagramCodec의 독립적인 경계
 
-[DatagramCodec.h](../include/ServerCore/Protocol/DatagramCodec.h)는 TCP FrameCodec과 별개의 datagram 포맷이다. 실제 UDP 소켓, 토큰 발급·등록·폐기, endpoint 연결, 패킷 순서 검증과 수신 pump는 소비자가 구현한다. ServerCore Host가 UDP 소켓을 만들거나 TCP 세션과 자동 연결하지 않는다.
+[DatagramCodec.h](../include/ServerCore/Protocol/DatagramCodec.h)는 TCP FrameCodec과 별개의 datagram 포맷이다. 별도의 `Runtime::DatagramTransport`가 UDP 소켓, 토큰 발급·등록·폐기, endpoint 연결, 패킷 순서 검증과 수신 pump를 제공한다. 소비자가 이 전송을 생성하고 세션 수명과 연결한다. ServerHost가 UDP 소켓을 만들거나 TCP 세션과 자동 연결하지 않는다.
 
 | 오프셋 | 바이트 | 내용 |
 | ---: | ---: | --- |
@@ -108,7 +108,17 @@ TCP 수신 바이트
 
 토큰은 16바이트 배열이며 `TokenToHex`는 32자리 소문자 hex 문자열을 만든다. `TokenFromHex`는 정확히 32자리인 대소문자 hex만 받는다. Codec은 임의 토큰이 등록됐는지, 순번이 이전 패킷보다 최신인지, payload가 JSON인지 검사하지 않는다. 순번의 생성·중복/역순 제거·wrap 방지와 JSON 파싱은 호출자 책임이다. 문자열 변환 함수가 할당하는 것과 Encode/Decode의 비할당 경계도 구분해야 한다.
 
-이 토큰 머리는 암호화·MAC·재전송 ACK가 아니다. 토큰 생성과 안전한 전달, TCP 신원과의 대응, NAT endpoint 변경 정책, 유실 복구와 송신 예산은 소비자가 정의한다. Codec에는 조각 재조립, 과거 패킷 큐, 신뢰 전송이나 혼잡 제어가 없다. 따라서 이 헤더가 추가됐다는 사실만으로 ServerCore Host가 UDP를 지원하거나 특정 게임이 더 많은 사용자를 수용한다고 해석하지 않는다.
+이 토큰 머리는 암호화·MAC·재전송 ACK가 아니다. Codec에는 조각 재조립, 과거 패킷 큐, 신뢰 전송이나 혼잡 제어가 없다. 토큰의 안전한 전달, TCP 신원과의 대응, 유실 복구와 게임 송신 예산은 소비자가 정의한다.
+
+### 2.5 DatagramTransport의 세션과 수신 계약
+
+[DatagramTransport.h](../include/ServerCore/Runtime/DatagramTransport.h)는 위 codec과 공용 JSON 봉투를 조립하는 비차단 IPv4 UDP API다. `Bind(address, port)`는 숫자 IPv4를 받으며 포트 0이면 OS가 배정한 값을 `Port()`로 읽는다. `RegisterSession(id)`는 CSPRNG로 만든 16바이트 토큰을 반환하고, 소비자가 신뢰 채널로 전달한다. `UnregisterSession(id)`와 `Close()`는 토큰을 폐기하며 Close를 반복해도 안전하다.
+
+`Poll(admission, receiver, budget)`은 등록된 토큰과 새로운 패킷 순번을 확인한 뒤 JSON을 한 번 파싱한다. admission이 true를 반환하고 같은 등록이 여전히 유효한 경우에만 순번·발신 endpoint·ready를 확정하고 receiver를 호출한다. 따라서 손상 JSON, 금지 메시지와 폐기된 등록은 더 높은 순번이더라도 정상 경로를 덮지 않는다. 유효한 새 패킷은 endpoint를 재바인딩할 수 있으며 순번은 초기화하지 않는다. 게임 메시지 이름은 코어가 정하지 않는다.
+
+콜백은 잠금 없이 동기 실행하므로 Send·등록 해제·Close를 호출할 수 있다. 콜백 예외는 거절 지표에 기록하고 해당 Poll을 끝낸다. admission 예외는 상태 확정 전이고 receiver 예외는 확정 후다. 비어 있는 콜백이나 한도 0은 패킷을 소비하지 않는다. 호출자는 Poll을 직렬화하고 전송 객체를 모든 호출이 끝날 때까지 유지한다.
+
+`Send(id, prepared.Bytes())`는 큐를 만들거나 JSON을 재파싱하지 않는다. 정상 반환은 OS의 datagram 수락이고 전달 보장이 아니다. 미등록은 Closed, 아직 준비되지 않은 경로와 일시적 역압은 WouldBlock, 초과 크기는 TooLarge, 플랫폼 오류는 PlatformError다. 송신 성공 때만 순번을 증가시키며 최댓값에서 wrap하지 않는다. TCP 세션 종료 여부는 소비자가 정한다. 지표는 Close 뒤에도 유지한다.
 
 ## 3. JSON 메시지 봉투
 
@@ -387,7 +397,7 @@ ServerCore가 제공하는 것은 길이 프레이밍, JSON 봉투, 타입 라�
 - 큰 데이터의 페이지·청크 구성, 명단 동기화 완료 표시, 재동기화
 - 재접속한 사용자의 신원과 상태 복원, 영속 저장
 - TLS, 메시지 서명·암호화·압축과 HTTP/WebSocket 전송
-- UDP 소켓/수신 pump, 토큰 발급과 신원 연결, endpoint 관리, replay 방지·유실 복구·혼잡 제어(공유 DatagramCodec은 머리의 Encode/Decode만 제공)
+- UDP 토큰의 신뢰 채널 전달과 계정 신원 검증, 허용 메시지·응답·유실 복구·혼잡 제어
 
 TCP는 바이트 순서를 제공하지만 게임 이벤트의 처리 성공을 상대에게 확인해 주지는 않는다. 현재 구현에 일반적인 RPC 호출 계층이나 메시지당 ACK는 없다. 오류를 보내고 유지할지, 즉시 끊을지, 마지막 프레임을 보낸 뒤 끊을지 역시 게임이 Session API로 선택한다.
 
@@ -407,6 +417,7 @@ TCP는 바이트 순서를 제공하지만 게임 이벤트의 처리 성공을 
 | double 왕복·UTF-8·직접 만든 송신 값 | 같은 파일의 `JsonDumpRejectsUnsafeValues()`, `MessageRejectsInvalidUtf8()`, `MessageRejectsUnsafeOutboundJson()` |
 | body가 객체여야 한다는 봉투 규칙 | 같은 파일의 `MessageRejectsNonObjectBodies()` |
 | Prepared 소유권·거절·깊이·기존 Session 위임 | 같은 ProtocolTest.cpp의 `PreparedMessagesOwnImmutableJsonAndEnvelope()`, `PreparedMessagesRejectInvalidInputs()`, `PreparedMessagesAdaptLegacySessions()`, `PreparedArrayReservesEnvelopeDepth()` |
+| UDP 소켓·토큰·replay·재바인딩·콜백 수명·수신 예산 | [DatagramTransportTest.cpp](../tests/Runtime/DatagramTransportTest.cpp) |
 | datagram 상한·순번 byte order·token 변환 | 같은 파일의 `DatagramBoundariesAndWireOrder()` |
 | 등록·Freeze·unknown type·처리기 거부 | [DispatcherTest.cpp](../tests/Dispatch/DispatcherTest.cpp) |
 | 실제 Host의 파싱·송신·순서·역압·종료 통합 | [ServerHostTest.cpp](../tests/Runtime/ServerHostTest.cpp) |

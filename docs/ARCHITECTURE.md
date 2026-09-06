@@ -7,11 +7,11 @@ ServerCore는 서버 실행에 필요한 전송·프로토콜·세션·작업 �
 | 모듈 | 공개 API와 책임 | 대표 구현 |
 | --- | --- | --- |
 | Core | `Status`/`Result`, 버퍼, 설정, 로깅, 시계와 작업 큐 | [src/Core](../src/Core) |
-| Net | `IoContext`, `Acceptor`, `Connection`: TCP 수락과 비동기 송수신 | [src/Net](../src/Net) |
+| Net | `IoContext`, `Acceptor`, `Connection`: TCP 수락과 비동기 송수신. 내부 `DatagramSocket`: 비차단 IPv4 UDP와 Winsock 수명 | [src/Net](../src/Net) |
 | Protocol | 길이 프레임, JSON 값·봉투, 준비된 송신 값, datagram 포맷 | [src/Protocol](../src/Protocol) |
 | Session | 게임이 다루는 연결 상대, ID와 등록표, 수명 관찰자 | [Session.h](../include/ServerCore/Session/Session.h), [SessionRegistry.cpp](../src/Session/SessionRegistry.cpp) |
 | Dispatch | 메시지 타입 등록, 본문 크기 검사와 처리기 호출 | [Dispatcher.cpp](../src/Dispatch/Dispatcher.cpp) |
-| Runtime | `ServerHost`, 직렬 `JobRunner`, 주기 작업과 지표 | [src/Runtime](../src/Runtime) |
+| Runtime | `ServerHost`, 직렬 `JobRunner`, 주기 작업과 지표, `DatagramTransport`의 토큰·순번·endpoint 관리 | [src/Runtime](../src/Runtime) |
 
 게임별 메시지는 Host의 Dispatcher에 등록한다. 연결 수명은 `ISessionObserver`로 관찰하고, 주기 게임 작업은 Host에서 얻은 `JobRunner::Lease`와 `PeriodicRunner`로 예약한다. 방·인증 규칙·DB·AOI 같은 게임 기능은 이 공개 API를 소비하는 별도 애플리케이션에 둔다. Windows 구조체와 내부 `NetworkSession`, 파싱 풀은 공개 확장 지점이 아니다.
 
@@ -67,7 +67,11 @@ Dispatcher는 등록된 처리기를 현재 스레드에서 호출한다. 등록
 
 송신 성공은 로컬 큐의 수락이며 원격 애플리케이션의 수신 확인이 아니다. `WouldBlock`으로 거절한 메시지는 자동 재시도하지 않는다. 최신 상태를 병합하거나 이벤트를 재시도할지, 상대를 종료할지는 게임이 결정한다. 각 기본값과 메모리 계산 범위는 [지원 범위와 설정](SUPPORT_AND_LIMITS.md)에 있다.
 
-`DatagramCodec`은 28바이트 머리와 최대 1,200바이트 datagram 형식을 다루는 독립적인 헤더 API다. Host의 전송은 IPv4 TCP/IOCP이며, UDP 소켓·인증 토큰 발급·endpoint 관리·유실 복구는 소비자가 구현한다.
+`DatagramCodec`은 28바이트 머리와 최대 1,200바이트 datagram 형식을 다루는 독립적인 헤더 API다. [Runtime::DatagramTransport](../include/ServerCore/Runtime/DatagramTransport.h)는 이 형식 위에서 비차단 UDP 소켓, 난수 토큰의 등록·폐기, replay 거절, endpoint 재바인딩과 지표를 관리한다. Net의 내부 소켓은 게임 메시지나 SessionId를 알지 않는다.
+
+UDP 수신 순서는 `Decode → token/순번 검사 → ParseMessage → admission → 등록·순번 재검사 → endpoint/ready/순번 확정 → receiver`다. JSON은 한 번만 파싱하며 admission 거절이나 예외는 순번과 endpoint를 바꾸지 않는다. 콜백은 상태 mutex 밖에서 실행하고, admission 중 Close·재바인딩·등록 교체가 일어나면 해당 패킷을 적용하지 않는다. 메시지 참조는 동기 콜백 동안만 유효하다.
+
+소비자가 `Poll`을 같은 실행 문맥에서 직렬 호출하며 나머지 메서드는 스레드 안전하다. 기본 Poll은 수신 시도 4,096회와 약 1 MiB에서 멈추고, 손상 패킷과 소켓 오류도 한도를 소비한다. 자체 스레드나 송신 대기열은 없다. 신뢰 채널에서 토큰을 배포하고 종료 때 등록을 해제하는 작업, 허용 메시지·응답·유실 복구·주기·게임 송신 예산은 소비자 책임이다. ServerHost가 이 전송을 자동으로 생성하거나 TCP 세션에 연결하지 않는다.
 
 ## 5. 소유권과 종료
 

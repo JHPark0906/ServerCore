@@ -15,7 +15,7 @@ ServerCore는 게임 서버가 링크하는 **Windows용 C++20 정적 라이브�
 | Ninja | 기본 `msvc-debug`, `msvc-release` 프리셋의 생성기다. |
 | PowerShell | `scripts/VerifyBuild.ps1` 사용 시 5.1 이상. 직접 CMake 명령만 사용하는 빌드에는 필요하지 않다. |
 
-서드파티 패키지 설치 단계는 없다. CMake에서 vcpkg·Conan·FetchContent를 사용하지 않으며, 검사도 저장소의 작은 C++ 하네스를 사용한다. Windows 시스템 라이브러리 `ws2_32`는 `ServerCore::ServerCore`를 통해 최종 실행 파일에 전이된다. 다른 엔진·게임 소스 트리는 빌드 입력으로 요구하지 않는다.
+서드파티 패키지 설치 단계는 없다. CMake에서 vcpkg·Conan·FetchContent를 사용하지 않으며, 검사도 저장소의 작은 C++ 하네스를 사용한다. Windows 시스템 라이브러리 `ws2_32`와 UDP 토큰 생성에 쓰는 `bcrypt`는 `ServerCore::ServerCore`를 통해 최종 실행 파일에 전이된다. 다른 엔진·게임 소스 트리는 빌드 입력으로 요구하지 않는다.
 
 직접 프리셋을 쓸 때는 **x64 Native Tools Command Prompt** 또는 같은 MSVC x64 환경을 가져온 PowerShell에서 시작한다. Ninja 프리셋은 `CMAKE_CXX_COMPILER=cl`만 지정하므로 일반 터미널에서 `cl.exe`나 SDK 도구를 찾지 못할 수 있다. 현재 터미널의 `cl`, `cmake --version`, `ninja --version`으로 선택한 도구를 확인한다.
 
@@ -101,13 +101,16 @@ ctest --preset msvc-debug -R '^ServerCore\.CMake\.InstallAndSourceTreeConsume$'
 | Session·Dispatch | ID 발급·등록·해제, 관찰 중 제거, 등록 동결, 라우팅과 본문 제한, 알 수 없는 타입 정책 |
 | Transport | 실제 loopback 통신, 분할 수신, 동시 송신, 송신 예산, close-after-send, IOCP worker와 종료 순서 |
 | Runtime | JobRunner·PeriodicRunner, ServerHost 조립, 유휴·종료 기한, 파싱 순서, 공유 수신·파싱·송신 예산, 종료 fallback |
+| DatagramTransport | 실제 UDP 왕복, 토큰·순번·endpoint, 잘못된 패킷 거절, 콜백 수명, 수신 시도·바이트 예산 |
 | CMake 소비 | 소스 트리 소비, 설치·이동한 패키지 소비, CRT와 CMP0091 계약 |
 
 [PublicHeaderCompileCheck.cpp](../src/PublicHeaderCompileCheck.cpp)는 라이브러리에 항상 포함된다. 목록에 있는 공개 헤더를 한 번역 단위에서 함께 컴파일하므로 테스트를 끈 빌드에도 공개 선언 컴파일 확인이 남는다. 각 헤더를 독립된 번역 단위로 하나씩 검사하는 방식은 아니며, 새 공개 헤더는 이 파일의 목록에도 추가해야 한다.
 
-### TCP 검사와 시간 제한
+### TCP·UDP 검사와 시간 제한
 
 Transport·ServerHost 검사에는 CTest `TIMEOUT 60`과 `RESOURCE_LOCK ServerCore.TcpPorts`가 있다. 같은 CTest 실행 안에서는 해당 자원을 요구하는 검사끼리 겹치지 않는다. 별도 터미널의 다른 CTest 프로세스까지 잠그지는 않으므로 동일 빌드 트리나 같은 포트 블록을 사용하는 검사를 동시에 실행하지 않는다.
+
+`DatagramTransport` 검사는 별도의 UDP resource lock과 60초 제한을 사용하고 loopback의 임시 포트에 바인딩한다. 토큰 등록·폐기, 왕복 송수신, 순번과 endpoint 재바인딩, 잘못된 고순번 입력, 콜백 재진입과 수신 예산을 실제 UDP datagram으로 확인한다. `ctest -R Runtime[.]Datagram`로 이 검사만 선택할 수 있다.
 
 포트 기준값은 configure 시 `CMAKE_BUILD_TYPE`이 정확히 `Debug`이면 17000, 그 외에는 17050이다. 각 검사는 여기에 자신이 사용하는 offset을 더하고 `127.0.0.1`에서 통신한다. 따라서 기본 Ninja Debug·Release는 서로 다른 블록이지만, 일반적인 Visual Studio 다중 구성 트리는 `CMAKE_BUILD_TYPE`이 비어 있어 **Debug·Release 모두 17050 기준**을 쓴다. 다중 구성의 검증은 순차 실행한다.
 
@@ -202,7 +205,7 @@ cmake --build build/debug
 .\build\debug\MyServer.exe
 ```
 
-`ServerCore::ServerCore`를 링크하면 공개 include 경로, C++20 기능 요구, `ws2_32`, MSVC `/utf-8`이 전이된다. `src` 내부 include 경로와 내부 테스트 hook 정의는 전이되지 않는다. 소스 트리 포함 시 테스트의 기본값은 OFF지만 기존 CMake 캐시에 이미 다른 값이 있으면 그 값이 유지된다. 예제의 `CACHE` 설정도 사용자의 기존 값을 강제로 덮어쓰지 않는다.
+`ServerCore::ServerCore`를 링크하면 공개 include 경로, C++20 기능 요구, `ws2_32`·`bcrypt` 링크 의존성, MSVC `/utf-8`이 전이된다. `src` 내부 include 경로와 내부 테스트 hook 정의는 전이되지 않는다. 소스 트리 포함 시 테스트의 기본값은 OFF지만 기존 CMake 캐시에 이미 다른 값이 있으면 그 값이 유지된다. 예제의 `CACHE` 설정도 사용자의 기존 값을 강제로 덮어쓰지 않는다.
 
 ## 6. 설치 패키지로 소비하기
 

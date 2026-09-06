@@ -56,11 +56,13 @@ add_library(ServerCore STATIC
         src/Dispatch/Dispatcher.cpp
         src/Net/Acceptor.cpp
         src/Net/Connection.cpp
+        src/Net/DatagramSocket.cpp
         src/Net/IoContext.cpp
         src/Net/WinsockInternal.cpp
         src/Protocol/Framing.cpp
         src/Protocol/Json.cpp
         src/Protocol/Message.cpp
+        src/Runtime/DatagramTransport.cpp
         src/Runtime/JobRunner.cpp
         src/Runtime/ParseWorkerPool.cpp
         src/Runtime/PeriodicRunner.cpp
@@ -81,7 +83,7 @@ target_include_directories(ServerCore
 
 # 전송 층이 Winsock을 쓴다. 정적 라이브러리라 이 의존은 우리를 링크하는 쪽까지 따라가야
 # 하므로 PRIVATE이 아니라 PUBLIC이다.
-target_link_libraries(ServerCore PUBLIC ws2_32)
+target_link_libraries(ServerCore PUBLIC ws2_32 PRIVATE bcrypt)
 
 target_compile_features(ServerCore PUBLIC cxx_std_20)
 

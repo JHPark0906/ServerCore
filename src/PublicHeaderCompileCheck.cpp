@@ -29,6 +29,7 @@
 #include "ServerCore/Protocol/Json.h"
 #include "ServerCore/Protocol/Message.h"
 #include "ServerCore/Runtime/JobRunner.h"
+#include "ServerCore/Runtime/DatagramTransport.h"
 #include "ServerCore/Runtime/Metrics.h"
 #include "ServerCore/Runtime/PeriodicRunner.h"
 #include "ServerCore/Runtime/ServerHost.h"

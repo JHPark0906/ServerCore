@@ -141,13 +141,26 @@ set(SERVERCORE_HOST_TEST_NAMES
         Runtime.ServerHostBoundsPendingReceiveBytes
         Runtime.ServerHostBoundsTotalPendingReceiveBytes)
 
+set(SERVERCORE_DATAGRAM_TEST_NAMES
+        Runtime.DatagramBindLifecycleAndWinsockIsolation
+        Runtime.DatagramRegistrationLifecycle
+        Runtime.DatagramGenericRoundTripAndSendSequence
+        Runtime.DatagramInvalidPacketsCannotRebindOrPoisonSequence
+        Runtime.DatagramReceiverCallbacksCanSendUnregisterAndClose
+        Runtime.DatagramAdmissionCallbacksRespectRegistrationLifetime
+        Runtime.DatagramCallbackExceptionsEndPoll
+        Runtime.DatagramBudgetCountsRejectedAndEmptyPackets
+        Runtime.DatagramByteBudgetAndEmptyCallbacksPreservePendingPackets
+        Runtime.DatagramTruncatedDatagramsRecover)
+
 list(APPEND SERVERCORE_TEST_NAMES
         ${SERVERCORE_PROTOCOL_TEST_NAMES}
         ${SERVERCORE_JOB_TEST_NAMES}
         ${SERVERCORE_SESSION_TEST_NAMES}
         ${SERVERCORE_DISPATCH_TEST_NAMES}
         ${SERVERCORE_NET_TEST_NAMES}
-        ${SERVERCORE_HOST_TEST_NAMES})
+        ${SERVERCORE_HOST_TEST_NAMES}
+        ${SERVERCORE_DATAGRAM_TEST_NAMES})
 
 add_executable(ServerCoreTests
         TestHarness.cpp
@@ -162,6 +175,7 @@ add_executable(ServerCoreTests
         Protocol/ProtocolTest.cpp
         Runtime/RuntimeTest.cpp
         Runtime/ServerHostTest.cpp
+        Runtime/DatagramTransportTest.cpp
         Session/SessionRegistryTest.cpp
         Net/TransportTest.cpp)
 
@@ -205,6 +219,13 @@ foreach (test_name IN LISTS SERVERCORE_NET_TEST_NAMES SERVERCORE_HOST_TEST_NAMES
     set_tests_properties(ServerCore.${test_name} PROPERTIES
             TIMEOUT 60
             RESOURCE_LOCK ServerCore.TcpPorts)
+endforeach ()
+
+# UDP checks use ephemeral loopback ports and bounded receive waits.
+foreach (test_name IN LISTS SERVERCORE_DATAGRAM_TEST_NAMES)
+    set_tests_properties(ServerCore.${test_name} PROPERTIES
+            TIMEOUT 60
+            RESOURCE_LOCK ServerCore.UdpPorts)
 endforeach ()
 
 # 이 시험이 위 목록과 실행 파일의 등록표가 같은지 본다. 어느 한쪽에만 있는 이름이 있으면

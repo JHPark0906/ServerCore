@@ -1,6 +1,6 @@
 # ServerCore
 
-Windows 게임 서버의 구조와 구현을 학습하기 위한 **C++20 서버 코어 라이브러리**입니다. TCP/IOCP 전송, 메시지 프레이밍과 JSON, 세션, 디스패치, 작업 실행과 자원 예산을 제공하며, 게임별 백엔드가 그 위에 자신의 규칙을 구현합니다.
+Windows 게임 서버의 구조와 구현을 학습하기 위한 **C++20 서버 코어 라이브러리**입니다. TCP/IOCP와 비차단 UDP 전송, 메시지 프레이밍과 JSON, 세션, 디스패치, 작업 실행과 자원 예산을 제공하며, 게임별 백엔드가 그 위에 자신의 규칙을 구현합니다.
 
 개발 과정에서 생성형 AI의 도움을 받은 프로젝트입니다.
 
@@ -22,7 +22,7 @@ Windows 게임 서버의 구조와 구현을 학습하기 위한 **C++20 서버 
 - **스트림 프레이밍:** 4바이트 길이 머리와 UTF-8 JSON 본문. 나뉘어 도착하거나 연속으로 도착한 프레임을 처리합니다.
 - **공용 메시지 봉투:** `type`, `body`, 선택적 `seq`와 `error`를 파싱·직렬화합니다. UTF-8, JSON 값, 본문 형식과 크기를 검증합니다.
 - **준비된 송신 값:** `PreparedJsonValue`와 `PreparedMessage`를 소유 값으로 만들고 여러 수신자에게 재사용합니다. 실제 NetworkSession의 `SendPrepared`는 JSON을 다시 직렬화하지 않고 기존 프레임·송신 큐에 넣습니다.
-- **공유 datagram 포맷:** 별도 UDP 전송을 구현하는 소비자를 위해 최대 1,200바이트의 헤더 전용 `DatagramCodec`을 제공합니다. 소켓·토큰 발급·재전송 정책은 포함하지 않습니다.
+- **비차단 UDP 전송:** `Runtime::DatagramTransport`가 소켓, 세션별 토큰, 순번·재전송 입력 거절, endpoint 재바인딩과 제한된 수신 pump를 제공합니다. 공유 `DatagramCodec`의 최대 1,200바이트 형식을 사용하며 게임 메시지 정책은 소비자가 정합니다.
 - **세션과 처리기:** 세션 ID 발급, 연결·인증·종료 상태, 타입별 처리기와 본문 크기 제한, 시작 전 등록표 동결.
 - **실행 문맥:** 게임 처리를 직렬화하는 JobRunner와 PeriodicRunner. 선택적으로 JSON 파싱만 별도 worker에서 처리하며 같은 세션의 순서를 유지합니다.
 - **자원 제한:** 연결 수, 프레임 크기, 수신·파싱·송신 대기량에 상한을 적용합니다. 유휴 세션과 마지막 송신을 기다리는 세션의 종료 기한도 설정할 수 있습니다.
@@ -37,7 +37,7 @@ Windows 게임 서버의 구조와 구현을 학습하기 위한 **C++20 서버 
 | --- | --- |
 | [include/ServerCore](include/ServerCore) | 소비자가 포함하는 공개 API. Core·Net·Protocol·Session·Dispatch·Runtime으로 구분 |
 | [src](src) | 공개 API 구현과 내부 전송·파싱 상태. Windows 헤더와 소켓 구현을 내부에 둠 |
-| [tests](tests) | C++ 회귀, 실제 TCP 통합과 소스/설치 패키지 소비 검사 |
+| [tests](tests) | C++ 회귀, 실제 TCP·UDP 통합과 소스/설치 패키지 소비 검사 |
 | [cmake](cmake) | 설치 패키지의 Config/Targets 구성 |
 | [scripts](scripts) | 개발 빌드 검증 스크립트 |
 | [docs](docs) | 프로토콜·설정·빌드 계약 |
@@ -156,21 +156,21 @@ int main()
 
 ## 검증 범위
 
-CTest는 기반 자료형, 설정, JSON·프레이밍, 세션, 디스패치, 작업 실행, 실제 TCP와 ServerHost의 수명·예산·종료 경로, CMake 소비를 검사합니다. 테스트 분류와 명령은 [빌드·테스트·배포](docs/BUILD_TEST_DEPLOY.md), 실행 환경과 결과는 [검증 결과](docs/VALIDATION.md)에 정리합니다.
+CTest는 기반 자료형, 설정, JSON·프레이밍, 세션, 디스패치, 작업 실행, 실제 TCP·UDP와 ServerHost의 수명·예산·종료 경로, CMake 소비를 검사합니다. 테스트 분류와 명령은 [빌드·테스트·배포](docs/BUILD_TEST_DEPLOY.md), 실행 환경과 결과는 [검증 결과](docs/VALIDATION.md)에 정리합니다.
 
 회귀 테스트의 성공이나 설정상 연결 상한은 실제 게임의 동시 플레이 수와 처리량을 보장하지 않습니다. 성능을 판단할 때는 소비 서버의 메시지 크기·빈도·방송 대상 수·처리기 비용을 포함한 부하에서 지연 분포, 대기열과 자원 사용량을 함께 측정해야 합니다.
 
 ## TCP와 UDP의 책임 경계
 
-ServerHost의 실제 네트워크 세션은 **Windows IPv4 TCP/IOCP**입니다. `Protocol/DatagramCodec.h`는 magic·128비트 opaque token·big-endian 순번으로 된 28바이트 머리를 encode/decode하는 공유 포맷입니다. 바이트 형식을 제공하는 것과 UDP 세션을 운영하는 것은 별개의 책임입니다.
+ServerHost의 네트워크 세션은 **Windows IPv4 TCP/IOCP**입니다. 별도의 [Runtime::DatagramTransport](include/ServerCore/Runtime/DatagramTransport.h)는 비차단 IPv4 UDP 소켓과 세션별 토큰·순번·endpoint를 관리합니다. `Protocol/DatagramCodec.h`의 magic·128비트 토큰·big-endian 순번으로 된 28바이트 머리를 그대로 사용합니다.
 
-UDP를 사용하는 소비자는 소켓, 토큰 발급과 세션 연결, endpoint 관리, 순번 검증과 유실 처리를 구현해야 합니다. heartbeat 주기, AOI와 틱별 바이트 예산도 게임이 정합니다.
+소비자는 신뢰 가능한 제어 채널에서 `RegisterSession`의 토큰을 전달하고 세션 종료 시 `UnregisterSession`을 호출합니다. `Poll(admission, receiver)`는 JSON 봉투를 한 번 파싱하고 게임의 admission이 허용한 뒤에만 순번·endpoint·준비 상태를 갱신합니다. 콜백은 내부 잠금 밖에서 실행됩니다. 수신 호출은 소비자의 실행 문맥에서 직렬화하며 기본 한도는 호출당 4,096회 수신 시도와 약 1 MiB입니다. heartbeat, 유실 복구, AOI와 틱별 송신 예산은 게임이 정합니다.
 
 `PreparedMessage::Size()`는 JSON 봉투 바이트만 나타내며, `PreparedJsonValue::Size()`는 항목 하나의 바이트 수입니다. 소비자가 전송량을 계산할 때 TCP 머리 4바이트 또는 DatagramCodec 머리 28바이트를 더해야 하며, 이는 IP·UDP/TCP 커널 헤더와 재전송 트래픽을 포함한 링크 대역폭과 다릅니다. 자세한 소유권·검증·기본 Session 위임 경로는 [프로토콜 문서](docs/PROTOCOL.md#61-준비된-json과-봉투-재사용)를 참고합니다.
 
 ## 지원 범위
 
-현재 Host는 TLS/DTLS, UDP 소켓과 세션 관리, IPv6, DNS 연결, 자동 재접속, 계정 인증, DB, 매치메이킹, 서버 권위 물리, 방·관심 영역 분할을 제공하지 않습니다. 인증 상태 전이 API는 자격 증명을 검증하지 않습니다.
+현재 라이브러리는 TLS/DTLS, IPv6, DNS 연결, 자동 재접속, 계정 인증, DB, 매치메이킹, 서버 권위 물리, 방·관심 영역 분할을 제공하지 않습니다. 인증 상태 전이 API는 자격 증명을 검증하지 않습니다.
 
 공개 헤더는 WinSock 구조체를 노출하지 않지만, 라이브러리 전체가 다른 운영체제에서 빌드되는 것은 아닙니다. MSVC에서는 라이브러리와 소비 실행 파일이 동일한 `/MD` 또는 `/MDd` CRT 계약을 따라야 합니다. 자세한 계약과 제약은 [지원 범위와 설정](docs/SUPPORT_AND_LIMITS.md)을 기준으로 확인합니다.
 
