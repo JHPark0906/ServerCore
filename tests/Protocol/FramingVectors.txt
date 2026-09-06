@@ -1,0 +1,13 @@
+# name|wire specification|receive chunks|expected bodies|append status|finish status
+# @bodies:<semicolon-separated bodies> uses ordinary valid frames. @rawhex:<hex bytes> describes
+# malformed streams. @none means no frames; @empty means one zero-length body.
+# @repeat:<ASCII byte>:<count> creates a body without putting 64 KiB of text in this file.
+empty|@bodies:@none|all|@none|Ok|Ok
+normal|@bodies:{}|all|{}|Ok|Ok
+maximum|@bodies:@repeat:A:65536|all|@repeat:A:65536|Ok|Ok
+fragmented|@bodies:{"x":1}|1,2,4,all|{"x":1}|Ok|Ok
+coalesced|@bodies:first;second|all|first;second|Ok|Ok
+maximum-followed-by-next|@bodies:@repeat:A:65536;{}|all|@repeat:A:65536;{}|Ok|Ok
+over-64-kib|@rawhex:01000100|all|@none|TooLarge|TooLarge
+lying-length|@rawhex:05000000616263|all|@none|Ok|InvalidFormat
+zero-header-with-trailing-raw|@rawhex:000000007b7d|all|@empty|Ok|InvalidFormat

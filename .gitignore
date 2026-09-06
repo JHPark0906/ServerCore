@@ -1,0 +1,33 @@
+# --- 빌드 디렉터리 ---
+# CLion이 만드는 트리(cmake-build-debug 등)와 스크립트가 만드는 트리 전부
+cmake-build-*/
+build/
+out/
+Builds/
+stage/
+
+# --- vcpkg 매니페스트 모드 산출물 ---
+vcpkg_installed/
+CMakeUserPresets.json
+
+# --- IDE ---
+.idea/
+.vs/
+.claude/
+.codex/
+.agents/
+*.user
+
+# --- 컴파일/링크 부산물 ---
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exe
+*.lib
+*.dll
+*.exp
+*.idb
+
+# --- 기타 ---
+*.log

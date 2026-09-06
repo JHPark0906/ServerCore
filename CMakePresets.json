@@ -1,0 +1,43 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "msvc-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "cl"
+      }
+    },
+    {
+      "name": "msvc-debug",
+      "displayName": "MSVC Debug (Ninja)",
+      "inherits": "msvc-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "msvc-release",
+      "displayName": "MSVC Release (Ninja)",
+      "inherits": "msvc-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "msvc-debug", "configurePreset": "msvc-debug" },
+    { "name": "msvc-release", "configurePreset": "msvc-release" }
+  ],
+  "testPresets": [
+    {
+      "name": "msvc-debug",
+      "configurePreset": "msvc-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "msvc-release",
+      "configurePreset": "msvc-release",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
