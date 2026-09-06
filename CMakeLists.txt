@@ -3,7 +3,7 @@
 #
 # 최소 버전을 3.21로 두는 이유:
 #   - PROJECT_IS_TOP_LEVEL(3.21)을 써서, 다른 프로젝트가 우리를 포함했을 때
-#     시험·샘플이 그쪽 빌드에 딸려 들어가지 않게 한다.
+#     시험이 그쪽 빌드에 딸려 들어가지 않게 한다.
 #   - CMakePresets v3(3.21)를 쓴다.
 cmake_minimum_required(VERSION 3.21)
 
@@ -34,9 +34,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 소비자(게임 프로젝트)가 우리를 add_subdirectory로 포함하면 시험과 샘플은 꺼진다.
+# 소비자(게임 프로젝트)가 우리를 add_subdirectory로 포함하면 시험은 꺼진다.
 option(SERVERCORE_BUILD_TESTS   "ServerCore의 시험을 빌드한다"   ${PROJECT_IS_TOP_LEVEL})
-option(SERVERCORE_BUILD_SAMPLES "ServerCore의 샘플을 빌드한다"   ${PROJECT_IS_TOP_LEVEL})
 
 # ---------------------------------------------------------------------------
 # 라이브러리
@@ -157,12 +156,8 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
         DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/ServerCore")
 
 # ---------------------------------------------------------------------------
-# 샘플 · 시험
+# 시험
 # ---------------------------------------------------------------------------
-if (SERVERCORE_BUILD_SAMPLES)
-    add_subdirectory(samples)
-endif ()
-
 if (SERVERCORE_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)

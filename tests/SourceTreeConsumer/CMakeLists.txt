@@ -15,10 +15,10 @@ if (NOT TARGET ServerCore::ServerCore)
     message(FATAL_ERROR "ServerCore source-tree consumption did not provide ServerCore::ServerCore.")
 endif ()
 
-# ServerCore는 하위 프로젝트일 때 자신만의 tests/samples를 기본값으로 켜면 안 된다. target 유입을
+# ServerCore는 하위 프로젝트일 때 자신만의 tests를 기본값으로 켜면 안 된다. target 유입을
 # 직접 확인해야 option의 기본값만 우연히 false인 상황을 통과시키지 않는다.
-if (TARGET ServerCoreTests OR TARGET HelloServerCore)
-    message(FATAL_ERROR "ServerCore source-tree consumption unexpectedly added tests or samples.")
+if (TARGET ServerCoreTests)
+    message(FATAL_ERROR "ServerCore source-tree consumption unexpectedly added tests.")
 endif ()
 
 add_executable(ServerCoreSourceTreeConsumer

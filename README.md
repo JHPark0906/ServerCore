@@ -36,7 +36,6 @@ Windows 게임 서버의 구조와 구현을 학습하기 위한 **C++20 서버 
 | [include/ServerCore](include/ServerCore) | 소비자가 포함하는 공개 API. Core·Net·Protocol·Session·Dispatch·Runtime으로 구분 |
 | [src](src) | 공개 API 구현과 내부 전송·파싱 상태. Windows 헤더와 소켓 구현을 내부에 둠 |
 | [tests](tests) | C++ 회귀, 실제 TCP 통합과 소스/설치 패키지 소비 검사 |
-| [samples](samples) | 라이브러리 링크를 확인하는 최소 실행 예 |
 | [cmake](cmake) | 설치 패키지의 Config/Targets 구성 |
 | [scripts](scripts) | 개발 빌드 검증 스크립트 |
 | [docs](docs) | 프로토콜·설정·빌드 계약 |
@@ -51,10 +50,9 @@ Windows, C++20을 지원하는 MSVC와 Windows SDK, CMake 3.21 이상, Ninja가 
 cmake --preset msvc-release
 cmake --build --preset msvc-release
 ctest --preset msvc-release
-.\build\msvc-release\samples\HelloServerCore.exe
 ```
 
-마지막 명령은 `ServerCore 0.1.0`을 출력하여 라이브러리 링크를 확인합니다. **HelloServerCore는 포트를 여는 서버 예제가 아닙니다.** Debug는 위 세 명령의 preset 이름을 `msvc-debug`로 바꿉니다. 개발 환경 설정, 전체 검증 스크립트, 출력 경로와 패키지 설치는 [빌드 문서](docs/BUILD_TEST_DEPLOY.md)를 참고합니다.
+Debug는 위 세 명령의 preset 이름을 `msvc-debug`로 바꿉니다. 개발 환경 설정, 전체 검증 스크립트, 출력 경로와 패키지 설치는 [빌드 문서](docs/BUILD_TEST_DEPLOY.md)를 참고합니다.
 
 ## 서버 프로젝트에서 사용하기
 

@@ -194,7 +194,7 @@ if (SERVERCORE_PACKAGE_IS_MSVC)
 endif ()
 
 # 설치 결과물을 보지 않는 별도 부모 프로젝트가 ServerCore를 add_subdirectory()로 넣고, 같은
-# 공개 target 이름으로 configure·build·실행까지 할 수 있어야 한다. fixture는 tests/samples가
+# 공개 target 이름으로 configure·build·실행까지 할 수 있어야 한다. fixture는 tests가
 # 부모 프로젝트에 딸려오지 않는지도 자체적으로 확인한다.
 CreateSourceTreeConsumerConfigureCommand(
         sourceTreeConsumerConfigureCommand
@@ -279,7 +279,7 @@ if (SERVERCORE_PACKAGE_IS_MSVC)
 
     # CMake의 기본값도 현재는 /MD[d]다. 그래서 이 회귀는 기본값만 관찰하지 않고, producer에
     # 의도적으로 /MT[d] 기본값을 주어도 ServerCore target 속성이 /MD[d]를 고정하는지를 본다.
-    # tests/samples를 끈 별도 producer라, 이 검사는 외부 소비자의 전역 CMake 설정을 흉내 내되
+    # tests를 끈 별도 producer라, 이 검사는 외부 소비자의 전역 CMake 설정을 흉내 내되
     # 현재 시험 실행 파일의 CRT 계약을 흔들지 않는다.
     set(runtimeOverrideProducerBuildDirectory "${packageTestRoot}/runtime-override-producer-build")
     set(runtimeOverrideInstallStage "${packageTestRoot}/runtime-override-install-stage")
@@ -310,7 +310,6 @@ if (SERVERCORE_PACKAGE_IS_MSVC)
             "-DCMAKE_RC_COMPILER=${SERVERCORE_PACKAGE_RC_COMPILER}"
             "-DCMAKE_MT=${SERVERCORE_PACKAGE_MT}"
             -DSERVERCORE_BUILD_TESTS=OFF
-            -DSERVERCORE_BUILD_SAMPLES=OFF
             "-DCMAKE_MSVC_RUNTIME_LIBRARY=${mismatchedMsvcRuntimeLibrary}")
 
     RunOrFail("Configuring ServerCore with an incompatible global MSVC runtime"

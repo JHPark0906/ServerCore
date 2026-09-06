@@ -1,6 +1,6 @@
 # 빌드·테스트·배포
 
-ServerCore는 게임 서버가 링크하는 **Windows용 C++20 정적 라이브러리**다. 이 저장소를 빌드하면 `ServerCore.lib`와 선택적인 샘플·검사 실행 파일이 만들어진다. 실제 게임의 메시지 처리, 실행 진입점과 운영 설정은 ServerCore를 소비하는 서버 프로젝트가 제공한다.
+ServerCore는 게임 서버가 링크하는 **Windows용 C++20 정적 라이브러리**다. 이 저장소를 빌드하면 `ServerCore.lib`와 선택적인 검사 실행 파일이 만들어진다. 실제 게임의 메시지 처리, 실행 진입점과 운영 설정은 ServerCore를 소비하는 서버 프로젝트가 제공한다.
 
 아래 명령은 별도 설명이 없으면 저장소 루트에서 실행한다. 빌드 설정의 원본은 [CMakeLists.txt](../CMakeLists.txt), 프리셋은 [CMakePresets.json](../CMakePresets.json)이다. 런타임 구조와 지원 범위는 [아키텍처](ARCHITECTURE.md), [지원 범위와 제한](SUPPORT_AND_LIMITS.md)을 참고한다.
 
@@ -19,7 +19,7 @@ ServerCore는 게임 서버가 링크하는 **Windows용 C++20 정적 라이브�
 
 직접 프리셋을 쓸 때는 **x64 Native Tools Command Prompt** 또는 같은 MSVC x64 환경을 가져온 PowerShell에서 시작한다. Ninja 프리셋은 `CMAKE_CXX_COMPILER=cl`만 지정하므로 일반 터미널에서 `cl.exe`나 SDK 도구를 찾지 못할 수 있다. 현재 터미널의 `cl`, `cmake --version`, `ninja --version`으로 선택한 도구를 확인한다.
 
-라이브러리는 MSVC에서 `/W4 /WX /permissive- /utf-8 /EHsc`로 컴파일한다. `/WX`는 라이브러리의 경고를 빌드 실패로 취급한다. 테스트와 샘플도 `/W4 /permissive- /utf-8 /EHsc`를 사용하지만 현재 각 대상에 `/WX`를 직접 설정하지는 않는다.
+라이브러리는 MSVC에서 `/W4 /WX /permissive- /utf-8 /EHsc`로 컴파일한다. `/WX`는 라이브러리의 경고를 빌드 실패로 취급한다. 테스트도 `/W4 /permissive- /utf-8 /EHsc`를 사용하지만 현재 각 대상에 `/WX`를 직접 설정하지는 않는다.
 
 ## 2. 기본 빌드: Ninja Debug·Release
 
@@ -41,13 +41,12 @@ Ninja는 이 프리셋에서 단일 구성 생성기다. Debug와 Release는 각
 | --- | --- | --- |
 | 정적 라이브러리 | `build/msvc-debug/ServerCore.lib` | `build/msvc-release/ServerCore.lib` |
 | 검사 실행 파일 | `build/msvc-debug/tests/ServerCoreTests.exe` | `build/msvc-release/tests/ServerCoreTests.exe` |
-| 최소 샘플 | `build/msvc-debug/samples/HelloServerCore.exe` | `build/msvc-release/samples/HelloServerCore.exe` |
 | CTest 실행 로그 | `build/msvc-debug/Testing/Temporary/LastTest.log` | `build/msvc-release/Testing/Temporary/LastTest.log` |
 
-최상위로 구성할 때 `SERVERCORE_BUILD_TESTS`와 `SERVERCORE_BUILD_SAMPLES`는 기본 ON이다. 라이브러리만 만들려면 별도 빌드 트리를 두거나 옵션을 명시한다.
+최상위로 구성할 때 `SERVERCORE_BUILD_TESTS`는 기본 ON이다. 라이브러리만 만들려면 별도 빌드 트리를 두거나 옵션을 명시한다.
 
 ```powershell
-cmake -S . -B build/library-release -G Ninja -DCMAKE_CXX_COMPILER=cl -DCMAKE_BUILD_TYPE=Release -DSERVERCORE_BUILD_TESTS=OFF -DSERVERCORE_BUILD_SAMPLES=OFF
+cmake -S . -B build/library-release -G Ninja -DCMAKE_CXX_COMPILER=cl -DCMAKE_BUILD_TYPE=Release -DSERVERCORE_BUILD_TESTS=OFF
 cmake --build build/library-release --target ServerCore
 ```
 
@@ -65,21 +64,11 @@ cmake --build build/vs2022 --config Release
 ctest --test-dir build/vs2022 -C Release --output-on-failure
 ```
 
-다중 구성 생성기에서는 `--config`와 CTest의 `-C`로 구성을 지정한다. 출력은 `build/vs2022/Debug/ServerCore.lib`, `build/vs2022/tests/Debug/ServerCoreTests.exe`, `build/vs2022/samples/Debug/HelloServerCore.exe`처럼 구성 이름이 추가된다. Release도 같은 위치의 `Release` 디렉터리를 사용한다.
+다중 구성 생성기에서는 `--config`와 CTest의 `-C`로 구성을 지정한다. 출력은 `build/vs2022/Debug/ServerCore.lib`, `build/vs2022/tests/Debug/ServerCoreTests.exe`처럼 구성 이름이 추가된다. Release도 같은 위치의 `Release` 디렉터리를 사용한다.
 
 저장소의 최소 CMake 버전이 모든 신형 Visual Studio 생성기를 지원한다는 뜻은 아니다. 다른 Visual Studio 버전은 실제 `cmake --help`에 나타나는 생성기 이름과 그 버전을 지원하는 CMake를 사용한다. `VerifyBuild.ps1`은 이 Visual Studio 생성기 경로 대신 Ninja 프리셋을 사용한다.
 
-## 3. 샘플이 확인하는 것
-
-[HelloServerCore](../samples/HelloServerCore/main.cpp)는 `ServerCore::GetVersionString()`을 호출하고 `ServerCore <버전>`을 출력한 뒤 종료한다.
-
-```powershell
-.\build\msvc-debug\samples\HelloServerCore.exe
-```
-
-이 샘플의 목적은 시험 밖의 실행 파일이 공개 헤더와 라이브러리를 실제로 소비할 수 있는지 확인하는 것이다. TCP 포트를 열거나 Echo·Join 서버를 실행하지 않는다. 실제 전송과 서버 호스트 동작은 다음 절의 검사들이 담당한다. 게임 서버를 만들 때는 샘플 출력 프로그램에 접속하는 대신, 소비 프로젝트에서 `ServerHost`, `Dispatcher`와 세션 관찰자를 조립한다.
-
-## 4. 검사 선택과 결과 확인
+## 3. 검사 선택과 결과 확인
 
 검사 목록과 CTest 등록은 [tests/CMakeLists.txt](../tests/CMakeLists.txt)에 있다. C++ 검사 하나를 CTest 한 개로 등록하므로 문제 영역을 이름으로 필터링할 수 있다.
 
@@ -124,7 +113,7 @@ Transport·ServerHost 검사에는 CTest `TIMEOUT 60`과 `RESOURCE_LOCK ServerCo
 
 60초는 정상이 걸리는 시간을 약속하는 값이 아니라 멈춘 검사를 종료할 상한이다. 특정 검사 이름이 마지막으로 남았는지, 포트를 다른 프로세스가 점유했는지, 구성과 실행 파일이 맞는지 확인한다. 회귀 검사는 장시간 부하나 최대 연결 수의 측정을 대신하지 않는다. 실제 처리량은 소비 서버의 메시지·방송 정책을 포함한 별도 부하에서 측정한다.
 
-## 5. 검증 스크립트
+## 4. 검증 스크립트
 
 [scripts/VerifyBuild.ps1](../scripts/VerifyBuild.ps1)은 MSVC 환경 준비부터 프리셋 configure → build → CTest까지 연결한다. 일반 PowerShell에서 실행할 수 있다.
 
@@ -152,7 +141,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/VerifyBuild.ps1 -Ski
 
 `ServerCore.CMake.InstallAndSourceTreeConsume`은 [CMakePackageTest.cmake](../tests/CMakePackageTest.cmake)를 실행하며 180초 제한이 있다. 일반 C++ 검사와 달리 이 검사는 내부에서 작은 별도 프로젝트를 구성·빌드·실행한다.
 
-1. `add_subdirectory()`로 ServerCore를 포함한 소비자를 구성·빌드·실행한다. 테스트·샘플이 부모에 기본으로 딸려오지 않는지도 확인한다.
+1. `add_subdirectory()`로 ServerCore를 포함한 소비자를 구성·빌드·실행한다. 테스트가 부모에 기본으로 딸려오지 않는지도 확인한다.
 2. 현재 빌드의 설치 결과를 전용 prefix에 만들고 다른 경로로 이동한다.
 3. 이동한 prefix만 `find_package(... NO_DEFAULT_PATH)`로 찾아 소비자를 구성·빌드·실행한다. 개발기에 남아 있는 다른 설치본으로 우연히 통과하는 것을 방지한다.
 4. MSVC에서는 CXX 활성화 이전에 CMP0091을 NEW로 선택하지 않은 오래된 부모가 명확한 오류로 거절되는지 검사한다.
@@ -160,7 +149,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/VerifyBuild.ps1 -Ski
 
 중간 파일은 현재 빌드 트리의 `tests/PackageConsumer` 아래에 두며 매회 해당 전용 디렉터리를 다시 준비한다. 같은 트리에서 이 검사를 중복 실행하지 않는다. 검사 소비자의 C++20 코드, 공개 헤더, 버전 함수와 잘못된 endpoint의 오류 반환을 통해 target의 사용 요구 사항과 실제 링크를 확인한다. 설치 압축 파일이나 운영 서버 설치 프로그램을 생성하는 검사는 아니다.
 
-## 6. 다른 프로젝트에서 소스 트리로 소비하기
+## 5. 다른 프로젝트에서 소스 트리로 소비하기
 
 예를 들어 다음처럼 프로젝트를 배치한다.
 
@@ -182,7 +171,6 @@ project(MyServer LANGUAGES CXX)
 set(SERVERCORE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ServerCore"
     CACHE PATH "ServerCore source tree")
 set(SERVERCORE_BUILD_TESTS OFF CACHE BOOL "Build ServerCore tests")
-set(SERVERCORE_BUILD_SAMPLES OFF CACHE BOOL "Build ServerCore samples")
 add_subdirectory("${SERVERCORE_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/ServerCore")
 
 add_executable(MyServer main.cpp)
@@ -214,9 +202,9 @@ cmake --build build/debug
 .\build\debug\MyServer.exe
 ```
 
-`ServerCore::ServerCore`를 링크하면 공개 include 경로, C++20 기능 요구, `ws2_32`, MSVC `/utf-8`이 전이된다. `src` 내부 include 경로와 내부 테스트 hook 정의는 전이되지 않는다. 소스 트리 포함 시 테스트·샘플의 기본값은 OFF지만 기존 CMake 캐시에 이미 다른 값이 있으면 그 값이 유지된다. 예제의 `CACHE` 설정도 사용자의 기존 값을 강제로 덮어쓰지 않는다.
+`ServerCore::ServerCore`를 링크하면 공개 include 경로, C++20 기능 요구, `ws2_32`, MSVC `/utf-8`이 전이된다. `src` 내부 include 경로와 내부 테스트 hook 정의는 전이되지 않는다. 소스 트리 포함 시 테스트의 기본값은 OFF지만 기존 CMake 캐시에 이미 다른 값이 있으면 그 값이 유지된다. 예제의 `CACHE` 설정도 사용자의 기존 값을 강제로 덮어쓰지 않는다.
 
-## 7. 설치 패키지로 소비하기
+## 6. 설치 패키지로 소비하기
 
 설치 대상은 공개 헤더, 정적 라이브러리, CMake package 파일과 MIT-0 라이선스다. 기본 설치 레이아웃은 다음과 같다. `GNUInstallDirs` 변수를 바꾸면 경로도 바뀐다.
 
@@ -232,15 +220,15 @@ cmake --build build/debug
   share/doc/ServerCore/LICENSE
 ```
 
-배포용 설치본은 내부 테스트 hook이 필요하지 않으므로 tests와 samples를 끈 별도 트리에서 만든다. ServerCore 저장소 루트에서:
+배포용 설치본은 내부 테스트 hook이 필요하지 않으므로 tests를 끈 별도 트리에서 만든다. ServerCore 저장소 루트에서:
 
 ```powershell
-cmake -S . -B build/package-release -G Ninja -DCMAKE_CXX_COMPILER=cl -DCMAKE_BUILD_TYPE=Release -DSERVERCORE_BUILD_TESTS=OFF -DSERVERCORE_BUILD_SAMPLES=OFF
+cmake -S . -B build/package-release -G Ninja -DCMAKE_CXX_COMPILER=cl -DCMAKE_BUILD_TYPE=Release -DSERVERCORE_BUILD_TESTS=OFF
 cmake --build build/package-release --target ServerCore
 $serverCoreInstallRelease = Join-Path (Get-Location).Path out/install-release
 cmake --install build/package-release --prefix "$serverCoreInstallRelease"
 
-cmake -S . -B build/package-debug -G Ninja -DCMAKE_CXX_COMPILER=cl -DCMAKE_BUILD_TYPE=Debug -DSERVERCORE_BUILD_TESTS=OFF -DSERVERCORE_BUILD_SAMPLES=OFF
+cmake -S . -B build/package-debug -G Ninja -DCMAKE_CXX_COMPILER=cl -DCMAKE_BUILD_TYPE=Debug -DSERVERCORE_BUILD_TESTS=OFF
 cmake --build build/package-debug --target ServerCore
 $serverCoreInstallDebug = Join-Path (Get-Location).Path out/install-debug
 cmake --install build/package-debug --prefix "$serverCoreInstallDebug"
@@ -277,7 +265,7 @@ cmake --build build/release
 
 현재 package 버전은 CMake 프로젝트의 `0.1.0`이며 버전 파일은 `SameMajorVersion` 규칙을 사용한다. 특정 산출물이 필요하면 `find_package(ServerCore 0.1.0 EXACT CONFIG REQUIRED)`로 고정할 수 있다. 이 버전 선택 규칙이 임의의 컴파일러·CRT·표준 라이브러리 ABI 호환을 보증하는 것은 아니다.
 
-## 8. CRT·ABI와 실제 배포 경계
+## 7. CRT·ABI와 실제 배포 경계
 
 ServerCore는 정적 라이브러리이지만 MSVC CRT는 Debug에서 `/MDd`, 그 밖의 구성에서 `/MD`를 선택한다. **정적 라이브러리와 정적 CRT는 다른 선택**이다. 기본 빌드에서 `ServerCore.dll`은 만들어지지 않으며 ServerCore 코드는 소비 실행 파일에 링크된다. 그래도 `/MD` 실행 파일에는 그 도구 집합에 맞는 동적 MSVC 런타임이 실행 환경에 있어야 한다.
 
@@ -289,7 +277,7 @@ ServerCore는 정적 라이브러리이지만 MSVC CRT는 Debug에서 `/MDd`, �
 
 `build/`, `out/`, `cmake-build-*` 및 일반 바이너리·로그는 [.gitignore](../.gitignore)에 제외되어 있다. Git에 소스를 올리는 것과 빌드 산출물을 배포하는 것은 별도 작업이다. 검증 기록에는 구성·툴체인·소스 상태와 실제 실행한 검사 범위를 남긴다.
 
-## 9. 문제 해결
+## 8. 문제 해결
 
 | 증상 | 확인할 내용 |
 | --- | --- |
