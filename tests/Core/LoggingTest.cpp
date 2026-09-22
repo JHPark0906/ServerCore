@@ -1,5 +1,12 @@
 #include "TestHarness.h"
 
+// This file explicitly verifies the deprecated application's compatibility API.
+#if defined(_MSC_VER)
+#pragma warning(disable: 4996)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
 #include "ServerCore/Core/Logging.h"
 
 #include <cstddef>

@@ -1,4 +1,5 @@
 #include "Web/WebProtocol.h"
+#include "Web/ResponseEncoding.h"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,13 @@ std::string_view HttpRequest::Header(std::string_view name) const noexcept
     {
         if (Detail::EqualInsensitive(field.first, name)) return field.second;
     }
+    return {};
+}
+
+std::string_view HttpRequest::PathParameter(std::string_view name) const noexcept
+{
+    for (const auto& parameter : pathParameters)
+        if (parameter.first == name) return parameter.second;
     return {};
 }
 
@@ -225,6 +233,11 @@ bool ValidHeaderValue(std::string_view value) noexcept
     return true;
 }
 
+bool ValidUpgradeProtocols(std::string_view value) noexcept
+{
+    return UpgradeProtocols(value);
+}
+
 bool HasToken(const HttpRequest& request, std::string_view header, std::string_view token)
 {
     for (const auto& [name, field] : request.headers)
@@ -242,8 +255,16 @@ bool HasToken(const HttpRequest& request, std::string_view header, std::string_v
     return false;
 }
 
-HttpParser::HttpParser(std::size_t maxHeaders, std::size_t maxBody)
-    : mMaxHeaders(maxHeaders), mMaxBody(maxBody) {}
+HttpParser::HttpParser(std::size_t maxHeaders, std::size_t maxBody, bool separateHeaders)
+    : mMaxHeaders(maxHeaders), mMaxBody(maxBody), mSeparateHeaders(separateHeaders) {}
+
+bool HttpParser::ConfigureBody(bool streaming, std::size_t maxBody, std::size_t maxChunk) noexcept
+{
+    mStreaming = streaming;
+    mMaxBody = maxBody;
+    mMaxChunk = maxChunk;
+    return (streaming || maxChunk != 0) && mRemaining <= maxBody;
+}
 
 bool HttpParser::Started() const noexcept { return mStage != Stage::Headers; }
 bool HttpParser::IsHeadRequest() const noexcept { return mHeadRequest; }
@@ -262,6 +283,7 @@ HttpParseResult HttpParser::Complete(HttpRequest& output)
     mRemaining = mChunkOverhead = mTrailerBytes = mHeaderSearch = 0;
     mContinue = false;
     mHeadRequest = false;
+    mBodyBytes = 0;
     return {HttpParseKind::Complete, 200};
 }
 
@@ -373,18 +395,23 @@ HttpParseResult HttpParser::Parse(std::string& input, HttpRequest& output)
             const auto result = ParseHeaders(std::string_view(input).substr(0, end + 2));
             if (result.kind == HttpParseKind::Error) return result;
             input.erase(0, end + 4);
-            if (mContinue)
-            {
-                mContinue = false;
-                return {HttpParseKind::Continue, 100};
-            }
+            if (mSeparateHeaders)
+            { output = std::move(mRequest); mRequest = {}; return {HttpParseKind::Headers, 200}; }
+        }
+        if (mContinue)
+        {
+            mContinue = false;
+            return {HttpParseKind::Continue, 100};
         }
         if (mStage == Stage::FixedBody)
         {
-            const auto count = (std::min)(input.size(), mRemaining);
+            const auto count = (std::min)({input.size(), mRemaining, mStreaming ? mMaxChunk : mRemaining});
             mRequest.body.append(input, 0, count);
             input.erase(0, count);
             mRemaining -= count;
+            mBodyBytes += count;
+            if (mStreaming && count != 0)
+            { output.body = std::move(mRequest.body); mRequest.body.clear(); return {HttpParseKind::Body, 200}; }
             if (mRemaining == 0) return Complete(output);
             return {};
         }
@@ -402,17 +429,24 @@ HttpParseResult HttpParser::Parse(std::string& input, HttpRequest& output)
             const auto digits = line.substr(0, hexEnd);
             if (digits.empty() || (hexEnd != std::string_view::npos && !ValidChunkExtensions(line.substr(hexEnd)))) return Fail(400);
             const auto result = std::from_chars(digits.data(), digits.data() + digits.size(), mRemaining, 16);
-            if (result.ec != std::errc{} || mRemaining > mMaxBody - mRequest.body.size()) return Fail(413);
+            if (result.ec != std::errc{} || mRemaining > mMaxBody - mBodyBytes) return Fail(413);
             mChunkOverhead += end + 2;
             input.erase(0, end + 2);
             mStage = mRemaining == 0 ? Stage::Trailers : Stage::ChunkData;
         }
         if (mStage == Stage::ChunkData)
         {
-            const auto count = (std::min)(input.size(), mRemaining);
+            const auto count = (std::min)({input.size(), mRemaining, mStreaming ? mMaxChunk : mRemaining});
             mRequest.body.append(input, 0, count);
             input.erase(0, count);
             mRemaining -= count;
+            mBodyBytes += count;
+            if (mStreaming && count != 0)
+            {
+                if (mRemaining == 0) mStage = Stage::ChunkEnd;
+                output.body = std::move(mRequest.body); mRequest.body.clear();
+                return {HttpParseKind::Body, 200};
+            }
             if (mRemaining != 0) return {};
             mStage = Stage::ChunkEnd;
         }
@@ -423,6 +457,7 @@ HttpParseResult HttpParser::Parse(std::string& input, HttpRequest& output)
             if (mChunkOverhead > mMaxHeaders - 2) return Fail(431);
             mChunkOverhead += 2;
             input.erase(0, 2);
+            if (mStreaming) mChunkOverhead = 0;
             mStage = Stage::ChunkSize;
             continue;
         }
@@ -459,6 +494,7 @@ std::string_view ReasonPhrase(unsigned int status) noexcept
     case 202: return "Accepted";
     case 204: return "No Content";
     case 205: return "Reset Content";
+    case 206: return "Partial Content";
     case 301: return "Moved Permanently";
     case 302: return "Found";
     case 304: return "Not Modified";
@@ -468,7 +504,9 @@ std::string_view ReasonPhrase(unsigned int status) noexcept
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 408: return "Request Timeout";
+    case 412: return "Precondition Failed";
     case 413: return "Content Too Large";
+    case 416: return "Range Not Satisfiable";
     case 417: return "Expectation Failed";
     case 426: return "Upgrade Required";
     case 431: return "Request Header Fields Too Large";
@@ -502,44 +540,12 @@ std::string HttpDate(std::chrono::system_clock::time_point time)
 bool SerializeResponse(const HttpResponse& response, bool head, bool close,
     std::size_t maxHeaders, std::size_t maxBody, std::string& output)
 {
-    if (response.status < 200 || response.status > 599 || response.body.size() > maxBody) return false;
-    output = "HTTP/1.1 " + std::to_string(response.status) + " " + std::string(ReasonPhrase(response.status)) + "\r\n";
-    bool haveDate = false;
-    bool haveUpgrade = false;
-    for (const auto& [name, value] : response.headers)
-    {
-        if (!IsToken(name) || !ValidHeaderValue(value) || EqualInsensitive(name, "content-length") ||
-            EqualInsensitive(name, "transfer-encoding") || EqualInsensitive(name, "connection") ||
-            EqualInsensitive(name, "trailer")) return false;
-        if (EqualInsensitive(name, "upgrade"))
-        {
-            if (!UpgradeProtocols(value)) return false;
-            haveUpgrade = true;
-        }
-        if (EqualInsensitive(name, "date"))
-        {
-            if (haveDate) return false;
-            haveDate = true;
-        }
-        if (name.size() > maxHeaders || value.size() > maxHeaders ||
-            name.size() + value.size() + 4 > maxHeaders - (std::min)(maxHeaders, output.size())) return false;
-        output += name;
-        output += ": ";
-        output += value;
-        output += "\r\n";
-    }
-    if (response.status == 426 && !haveUpgrade) return false;
-    if (!haveDate) output += "Date: " + HttpDate(std::chrono::system_clock::now()) + "\r\n";
-    // 304 carries no selected representation here, so its optional Content-Length
-    // is omitted. A 205 has an explicitly empty body on a persistent connection.
-    const bool noContent = response.status == 204 || response.status == 205 || response.status == 304;
-    if (response.status != 204 && response.status != 304)
-        output += "Content-Length: " + std::to_string(response.status == 205 ? 0 : response.body.size()) + "\r\n";
-    output += close ? "Connection: close" : "Connection: keep-alive";
-    if (haveUpgrade) output += ", Upgrade";
-    output += "\r\n\r\n";
-    if (output.size() > maxHeaders) return false;
-    if (!head && !noContent) output += response.body;
+    if (response.body.size() > maxBody) return false;
+    auto prepared = PrepareResponseHead(response.status, response.headers,
+        static_cast<std::uint64_t>(response.body.size()), head, close, maxHeaders);
+    if (!prepared.IsOk()) return false;
+    output = std::move(prepared.Value().wire);
+    if (prepared.Value().mode != ResponseBodyMode::None) output += response.body;
     return true;
 }
 

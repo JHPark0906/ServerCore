@@ -1,121 +1,247 @@
 #include "ServerCore/Runtime/JobRunner.h"
-
-#include "ServerCore/Core/Assert.h"
-
+#include "Observability/MetricsInternal.h"
 #include <atomic>
-#include <memory>
+#include <limits>
+#include <list>
 #include <utility>
 
 namespace ServerCore::Runtime
 {
-class JobRunner::SharedState
+namespace
+{
+using Core::ErrorCode;
+using Core::Status;
+struct QueuedJob
+{
+    std::function<void()> callback;
+    std::size_t bytes = 0;
+    bool control = false;
+    std::chrono::steady_clock::time_point admitted{};
+};
+}
+class JobRunner::ReservationState
 {
 public:
-    Core::Status Post(std::function<void()> job)
+    ~ReservationState();
+    std::shared_ptr<SharedState> owner;
+    std::list<QueuedJob> node;
+};
+class JobRunner::SharedState : public std::enable_shared_from_this<SharedState>
+{
+public:
+    Status Configure(const JobRunnerOptions& options)
     {
-        Core::Status queued = Core::Status::Ok();
-        {
-            const std::lock_guard<std::mutex> guard(mMutex);
-            if (mStopRequested)
-            {
-                return Core::Status::Fail(
-                    Core::ErrorCode::Closed, "JobRunner no longer accepts jobs after RequestStop");
-            }
-
-            // 종료 요청 판정과 큐 수락을 같은 잠금에 묶는다. 정지 요청 직전에 수락한 작업이
-            // 실행자의 마지막 빈 큐 검사 뒤로 밀려 남는 틈을 만들지 않는다.
-            queued = mQueue.Post(std::move(job));
-        }
-
-        if (queued.IsOk())
-        {
-            mWake.notify_one();
-        }
-        return queued;
+        if (!options.maxOutstandingJobs || !options.maxRetainedBytes || !options.maxControlJobs ||
+            !options.maxControlBytes ||
+            options.maxControlJobs >
+                (std::numeric_limits<std::size_t>::max)() - options.maxOutstandingJobs ||
+            options.maxControlBytes >
+                (std::numeric_limits<std::size_t>::max)() - options.maxRetainedBytes)
+            return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
+        const std::lock_guard guard(mMutex);
+        if (mOptions.maxOutstandingJobs == options.maxOutstandingJobs &&
+            mOptions.maxRetainedBytes == options.maxRetainedBytes &&
+            mOptions.maxControlJobs == options.maxControlJobs &&
+            mOptions.maxControlBytes == options.maxControlBytes)
+            return Status::Ok();
+        if (mUsed || mRunActive || mAdmissionClosed || mStopRequested)
+            return Status::FailWithoutMessage(ErrorCode::Closed);
+        mOptions = options;
+        return Status::Ok();
     }
-
-    void RunUntilStopped()
+    Status Admission(std::size_t bytes, bool control) const noexcept
     {
-        {
-            const std::lock_guard<std::mutex> guard(mMutex);
-            SERVERCORE_ASSERT(!mRunActive, "RunUntilStopped() may run on only one thread at a time");
-            mRunActive = true;
-            mRunnerThreadId = std::this_thread::get_id();
-        }
-
-        const auto clearRunnerThread = [this]() {
-            const std::lock_guard<std::mutex> guard(mMutex);
-            mRunActive = false;
-            mRunnerThreadId = std::thread::id();
-        };
-
+        if (mStopRequested || (!control && mAdmissionClosed))
+            return Status::FailWithoutMessage(ErrorCode::Closed);
+        const auto limit = control ? mOptions.maxControlBytes : mOptions.maxRetainedBytes;
+        if (bytes > limit)
+            return Status::FailWithoutMessage(ErrorCode::TooLarge);
+        if ((control ? mControlCount : mCount) >=
+                (control ? mOptions.maxControlJobs : mOptions.maxOutstandingJobs) ||
+            bytes > limit - (control ? mControlBytes : mBytes))
+            return Status::FailWithoutMessage(ErrorCode::WouldBlock);
+        return Status::Ok();
+    }
+    void Charge(std::size_t bytes, bool control) noexcept
+    {
+        ++(control ? mControlCount : mCount);
+        (control ? mControlBytes : mBytes) += bytes;
+        mUsed = true;
+    }
+    void Release(std::size_t bytes, bool control) noexcept
+    {
+        const std::lock_guard guard(mMutex);
+        --(control ? mControlCount : mCount);
+        (control ? mControlBytes : mBytes) -= bytes;
+    }
+    Status Post(std::function<void()> callback, std::size_t bytes, bool control)
+    {
+        if (!callback)
+            return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
+        // Capture destruction is arbitrary code; allocate outside the lock.
+        std::list<QueuedJob> node;
         try
         {
-            for (;;)
-            {
-                {
-                    std::unique_lock<std::mutex> guard(mMutex);
-                    mWake.wait(guard, [this]() { return mStopRequested || mQueue.PendingCount() != 0; });
-                }
-
-                (void)mQueue.DrainOnce();
-
-                {
-                    const std::lock_guard<std::mutex> guard(mMutex);
-                    if (!mStopRequested || mQueue.PendingCount() != 0)
-                    {
-                        continue;
-                    }
-
-                    mRunActive = false;
-                    mRunnerThreadId = std::thread::id();
-                    return;
-                }
-            }
+            node.push_back({ std::move(callback), bytes, control });
         }
         catch (...)
         {
-            clearRunnerThread();
-            Core::ReportAssertFailure(
-                "JobRunner execution did not throw",
-                __FILE__,
-                __LINE__,
-                "JobRunner encountered an exception while it was running");
+            return Status::AllocationFailure();
+        }
+        {
+            const std::lock_guard guard(mMutex);
+            auto admitted = Admission(bytes, control);
+            if (!admitted.IsOk())
+                return admitted;
+            Charge(bytes, control);
+            node.front().admitted = std::chrono::steady_clock::now();
+            Observability::Detail::Add(mMetrics.acceptedJobs);
+            mQueue.splice(mQueue.end(), node);
+        }
+        mWake.notify_one();
+        return Status::Ok();
+    }
+    Core::Result<Reservation> Reserve(std::size_t bytes)
+    {
+        using Result = Core::Result<Reservation>;
+        std::shared_ptr<ReservationState> reserved;
+        try
+        {
+            reserved = std::make_shared<ReservationState>();
+            reserved->node.push_back({ {}, bytes, false });
+        }
+        catch (...)
+        {
+            return Result::FromStatus(Status::AllocationFailure());
+        }
+        {
+            const std::lock_guard guard(mMutex);
+            auto admitted = Admission(bytes, false);
+            if (!admitted.IsOk())
+                return Result::FromStatus(std::move(admitted));
+            Charge(bytes, false);
+            reserved->owner = shared_from_this();
+        }
+        return Result::FromValue(Reservation(std::move(reserved)));
+    }
+    Status PostReserved(ReservationState& reserved, std::function<void()> callback)
+    {
+        if (!callback)
+            return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
+        {
+            const std::lock_guard guard(mMutex);
+            if (mStopRequested || reserved.node.empty())
+                return Status::FailWithoutMessage(ErrorCode::Closed);
+            reserved.node.front().callback = std::move(callback);
+            reserved.node.front().admitted = std::chrono::steady_clock::now();
+            Observability::Detail::Add(mMetrics.acceptedJobs);
+            mQueue.splice(mQueue.end(), reserved.node);
+        }
+        mWake.notify_one();
+        return Status::Ok();
+    }
+    void RunUntilStopped()
+    {
+        {
+            const std::lock_guard guard(mMutex);
+            SERVERCORE_ASSERT(!mRunActive, "RunUntilStopped may have only one consumer");
+            mUsed = true;
+            mRunActive = true;
+            mRunnerThreadId = std::this_thread::get_id();
+        }
+        for (;;)
+        {
+            std::list<QueuedJob> current;
+            {
+                std::unique_lock guard(mMutex);
+                mWake.wait(guard, [this] { return mStopRequested || !mQueue.empty(); });
+                if (mQueue.empty())
+                {
+                    mRunActive = false;
+                    mRunnerThreadId = {};
+                    return;
+                }
+                current.splice(current.end(), mQueue, mQueue.begin());
+            }
+            const auto bytes = current.front().bytes;
+            const auto control = current.front().control;
+            const auto admitted = current.front().admitted;
+            try
+            {
+                current.front().callback();
+            }
+            catch (...)
+            {
+                Core::ReportAssertFailure("JobRunner callback did not throw", __FILE__, __LINE__,
+                    "JobRunner callbacks must contain exceptions");
+            }
+            // Captures remain charged through their destructor, outside locks.
+            current.clear();
+            Release(bytes, control);
+            {
+                const std::lock_guard guard(mMutex);
+                const auto elapsed = Observability::Detail::Elapsed(admitted);
+                Observability::Detail::Add(mMetrics.completedJobs);
+                Observability::Detail::Add(mMetrics.totalLatencyNanoseconds, elapsed);
+                if (elapsed > mMetrics.maxLatencyNanoseconds)
+                    mMetrics.maxLatencyNanoseconds = elapsed;
+                Observability::Detail::ObserveLatency(mMetrics.latencyHistogram, elapsed);
+            }
         }
     }
-
+    void CloseAdmission() noexcept
+    {
+        const std::lock_guard guard(mMutex);
+        mAdmissionClosed = true;
+    }
     void RequestStop()
     {
         {
-            const std::lock_guard<std::mutex> guard(mMutex);
+            const std::lock_guard guard(mMutex);
+            mAdmissionClosed = true;
             mStopRequested = true;
         }
         mWake.notify_all();
     }
-
-    [[nodiscard]] bool IsCurrentThread() const noexcept
+    bool IsCurrentThread() const noexcept
     {
-        const std::lock_guard<std::mutex> guard(mMutex);
+        const std::lock_guard guard(mMutex);
         return mRunActive && mRunnerThreadId == std::this_thread::get_id();
     }
-
-    [[nodiscard]] bool IsStopRequested() const noexcept
+    bool IsStopRequested(bool control = false) const noexcept
     {
-        const std::lock_guard<std::mutex> guard(mMutex);
-        return mStopRequested;
+        const std::lock_guard guard(mMutex);
+        return control ? mStopRequested : mAdmissionClosed;
     }
-
-    [[nodiscard]] std::size_t PendingCount() const
+    std::size_t PendingCount() const noexcept
     {
-        return mQueue.PendingCount();
+        const std::lock_guard guard(mMutex);
+        return mQueue.size();
     }
-
-    void RecordSkippedPeriodicPeriods(const std::uint64_t count) noexcept
+    std::size_t OutstandingCount() const noexcept
+    {
+        const std::lock_guard guard(mMutex);
+        return mCount + mControlCount;
+    }
+    std::size_t RetainedBytes() const noexcept
+    {
+        const std::lock_guard guard(mMutex);
+        return mBytes + mControlBytes;
+    }
+    Observability::JobRunnerMetricsSnapshot GetMetrics() const noexcept
+    {
+        const std::lock_guard guard(mMutex);
+        auto value = mMetrics;
+        value.pendingJobs = mQueue.size();
+        value.outstandingJobs = mCount + mControlCount;
+        value.retainedBytes = mBytes + mControlBytes;
+        return value;
+    }
+    void RecordSkippedPeriodicPeriods(std::uint64_t count) noexcept
     {
         mSkippedPeriodicCount.fetch_add(count, std::memory_order_relaxed);
     }
-
-    [[nodiscard]] std::uint64_t PeriodicSkippedCount() const noexcept
+    std::uint64_t PeriodicSkippedCount() const noexcept
     {
         return mSkippedPeriodicCount.load(std::memory_order_relaxed);
     }
@@ -123,97 +249,143 @@ public:
 private:
     mutable std::mutex mMutex;
     std::condition_variable mWake;
-    Core::JobQueue mQueue;
-    bool mStopRequested = false;
-    bool mRunActive = false;
+    JobRunnerOptions mOptions;
+    Observability::JobRunnerMetricsSnapshot mMetrics;
+    std::list<QueuedJob> mQueue;
+    std::size_t mCount = 0, mBytes = 0, mControlCount = 0, mControlBytes = 0;
+    bool mAdmissionClosed = false, mStopRequested = false, mRunActive = false, mUsed = false;
     std::thread::id mRunnerThreadId;
     std::atomic<std::uint64_t> mSkippedPeriodicCount{ 0 };
 };
-
-JobRunner::Lease::Lease(std::shared_ptr<SharedState> state) noexcept
+JobRunner::ReservationState::~ReservationState()
+{
+    if (owner && !node.empty())
+        owner->Release(node.front().bytes, false);
+}
+JobRunner::Reservation::Reservation(std::shared_ptr<ReservationState> state) noexcept
     : mState(std::move(state))
 {
 }
-
-Core::Status JobRunner::Lease::Post(std::function<void()> job) const
+bool JobRunner::Reservation::IsValid() const noexcept
 {
-    const std::shared_ptr<SharedState> state = mState;
-    if (state == nullptr)
-    {
-        return Core::Status::Fail(Core::ErrorCode::Closed, "JobRunner lease is closed");
-    }
-
-    return state->Post(std::move(job));
+    return mState && !mState->node.empty();
 }
-
+Core::Status JobRunner::Reservation::Post(std::function<void()> job)
+{
+    if (!mState)
+        return Status::FailWithoutMessage(ErrorCode::Closed);
+    auto result = mState->owner->PostReserved(*mState, std::move(job));
+    if (result.IsOk() || result.Code() == ErrorCode::Closed)
+        mState.reset();
+    return result;
+}
+void JobRunner::Reservation::Cancel() noexcept
+{
+    mState.reset();
+}
+JobRunner::Lease::Lease(std::shared_ptr<SharedState> state, bool control) noexcept
+    : mState(std::move(state))
+    , mControl(control)
+{
+}
+Core::Status JobRunner::Lease::Post(std::function<void()> job, std::size_t bytes) const
+{
+    return mState ? mState->Post(std::move(job), bytes, mControl)
+                  : Status::FailWithoutMessage(ErrorCode::Closed);
+}
+Core::Status JobRunner::Lease::PostControl(std::function<void()> job, std::size_t bytes) const
+{
+    return mState ? mState->Post(std::move(job), bytes, true)
+                  : Status::FailWithoutMessage(ErrorCode::Closed);
+}
+Core::Result<JobRunner::Reservation> JobRunner::Lease::Reserve(std::size_t bytes) const
+{
+    return mState ? mState->Reserve(bytes)
+                  : Core::Result<Reservation>::FromStatus(
+                        Status::FailWithoutMessage(ErrorCode::Closed));
+}
 bool JobRunner::Lease::IsStopRequested() const noexcept
 {
-    const std::shared_ptr<SharedState> state = mState;
-    return state == nullptr || state->IsStopRequested();
+    return !mState || mState->IsStopRequested(mControl);
 }
-
-void JobRunner::Lease::RecordSkippedPeriodicPeriods(const std::uint64_t count) const noexcept
+void JobRunner::Lease::RecordSkippedPeriodicPeriods(std::uint64_t count) const noexcept
 {
-    const std::shared_ptr<SharedState> state = mState;
-    if (state != nullptr)
-    {
-        state->RecordSkippedPeriodicPeriods(count);
-    }
+    if (mState)
+        mState->RecordSkippedPeriodicPeriods(count);
 }
-
 JobRunner::JobRunner()
     : mState(std::make_shared<SharedState>())
 {
 }
-
 JobRunner::~JobRunner()
 {
-    // RunUntilStopped와 Lease는 모두 SharedState의 자기 소유 복사본을 잡고 실행한다. 따라서
-    // 여기서 정지를 요청한 뒤 JobRunner 외피가 사라져도 그 경로들이 this를 다시 읽지 않는다.
     mState->RequestStop();
 }
-
 JobRunner::Lease JobRunner::AcquireLease() const noexcept
 {
     return Lease(mState);
 }
-
-Core::Status JobRunner::Post(std::function<void()> job)
+JobRunner::Lease JobRunner::AcquireControlLease() const noexcept
 {
-    return mState->Post(std::move(job));
+    return Lease(mState, true);
 }
-
+Core::Status JobRunner::Configure(const JobRunnerOptions& options)
+{
+    return mState->Configure(options);
+}
+Core::Status JobRunner::Post(std::function<void()> job, std::size_t bytes)
+{
+    return mState->Post(std::move(job), bytes, false);
+}
+Core::Status JobRunner::PostControl(std::function<void()> job, std::size_t bytes)
+{
+    return mState->Post(std::move(job), bytes, true);
+}
+Core::Result<JobRunner::Reservation> JobRunner::Reserve(std::size_t bytes)
+{
+    return mState->Reserve(bytes);
+}
 void JobRunner::RunUntilStopped()
 {
-    const std::shared_ptr<SharedState> state = mState;
+    const auto state = mState;
     state->RunUntilStopped();
 }
-
+void JobRunner::CloseAdmission() noexcept
+{
+    mState->CloseAdmission();
+}
 void JobRunner::RequestStop()
 {
     mState->RequestStop();
 }
-
 void JobRunner::Stop()
 {
     RequestStop();
 }
-
 bool JobRunner::IsCurrentThread() const noexcept
 {
     return mState->IsCurrentThread();
 }
-
 bool JobRunner::IsStopRequested() const noexcept
 {
     return mState->IsStopRequested();
 }
-
 std::size_t JobRunner::PendingCount() const
 {
     return mState->PendingCount();
 }
-
+std::size_t JobRunner::OutstandingCount() const noexcept
+{
+    return mState->OutstandingCount();
+}
+std::size_t JobRunner::RetainedBytes() const noexcept
+{
+    return mState->RetainedBytes();
+}
+Observability::JobRunnerMetricsSnapshot JobRunner::GetMetrics() const noexcept
+{
+    return mState->GetMetrics();
+}
 std::uint64_t JobRunner::PeriodicSkippedCount() const noexcept
 {
     return mState->PeriodicSkippedCount();

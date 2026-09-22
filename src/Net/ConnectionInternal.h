@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ServerCore/Net/Connection.h"
+#include "ServerCore/Net/ConnectionFlowControl.h"
 #include "Net/SendBudgetInternal.h"
 #include "Net/SendQueueInternal.h"
 
@@ -90,6 +91,7 @@ struct SendOperation : ConnectionOperation
 /// - 이 헤더는 공개 계약이 아니다. 여기 있는 것은 예고 없이 바뀐다.
 /// </remarks>
 class TcpConnection final : public Connection,
+                            public ConnectionFlowControl,
                             public IIoCompletionTarget,
                             public std::enable_shared_from_this<TcpConnection>
 {
@@ -134,6 +136,12 @@ public:
     void SetObserver(std::weak_ptr<IConnectionObserver> observer) override;
     [[nodiscard]] bool IsOpen() const noexcept override;
     [[nodiscard]] std::size_t QueuedSendBytes() const noexcept override;
+    Core::Status PauseReceive() override;
+    Core::Status ResumeReceive() override;
+    [[nodiscard]] bool IsReceivePaused() const noexcept override;
+    [[nodiscard]] std::size_t RetainedSendBytes() const noexcept override;
+    Core::Result<SendCapacitySubscription> WaitForSendCapacity(std::size_t requiredBytes,
+        std::function<void(Core::Status)> callback, std::stop_token cancellation = {}) override;
 
     void OnIoCompleted(
         IoOperation& operation, DWORD bytesTransferred, unsigned long errorCode) override;
@@ -204,6 +212,10 @@ private:
     SendQueue mSendQueue;
 
     bool mSendInFlight = false;
+    // A submitted receive retains its buffer and owner even while paused.
+    // mMutex serializes submission/completion; the public pause query is atomic.
+    bool mReceiveInFlight = false;
+    std::atomic<bool> mReceivePaused{ false };
 
     /// <summary>새 Send를 막고 현재 송신 큐가 빈 뒤 닫으라는 요청이다. mMutex가 지킨다.</summary>
     bool mCloseAfterSendRequested = false;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ServerCore/Core/Error.h"
+#include "ServerCore/Core/Logging.h"
 #include "ServerCore/Protocol/Message.h"
 #include "ServerCore/Session/Session.h"
 
@@ -9,6 +10,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -81,6 +83,9 @@ inline constexpr std::size_t UnlimitedRawBodySize = (std::numeric_limits<std::si
 class Dispatcher
 {
 public:
+    // Instance-owned sink. Safe to replace; an in-flight write retains its sink.
+    // An unset sink discards diagnostics without consulting process globals.
+    void SetLogger(std::shared_ptr<Core::ILogger> logger) noexcept;
     /// <summary>타입 하나에 처리기를 건다.</summary>
     /// <param name="type">봉투의 type과 정확히 같아야 한다. 대소문자를 구분한다.</param>
     /// <param name="maximumRawBodySize">
@@ -150,5 +155,7 @@ private:
         mHandlers;
     std::atomic<bool> mFrozen{ false };
     std::atomic<UnknownTypePolicy> mUnknownTypePolicy{ UnknownTypePolicy::LogAndIgnore };
+    std::shared_ptr<Core::ILogger> mLogger;
+    std::mutex mLoggerMutex;
 };
 }

@@ -19,12 +19,15 @@ namespace
         "no handler is registered for message type: " + std::string(type));
 }
 
-void LogUnknownType(const std::string_view type)
-{
-    Core::GetGlobalLogger().Write(
-        Core::LogLevel::Warn, "unregistered message type: " + std::string(type));
 }
 
+void Dispatcher::SetLogger(std::shared_ptr<Core::ILogger> logger) noexcept
+{
+    std::shared_ptr<Core::ILogger> previous;
+    {
+        const std::lock_guard guard(mLoggerMutex);
+        previous = std::exchange(mLogger, std::move(logger));
+    }
 }
 
 Core::Status Dispatcher::Register(
@@ -165,7 +168,13 @@ Core::Status Dispatcher::Dispatch(
         Core::Status unknown = Core::Status::FailWithoutMessage(Core::ErrorCode::UnknownType);
         try
         {
-            LogUnknownType(message.Type());
+            std::shared_ptr<Core::ILogger> logger;
+            {
+                const std::lock_guard guard(mLoggerMutex);
+                logger = mLogger;
+            }
+            if (logger)
+                logger->Write(Core::LogLevel::Warn, "unregistered message type: " + std::string(message.Type()));
             if (policy == UnknownTypePolicy::LogAndIgnore)
             {
                 return Core::Status::Ok();

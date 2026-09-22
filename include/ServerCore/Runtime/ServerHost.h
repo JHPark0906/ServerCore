@@ -7,6 +7,7 @@
 #include "ServerCore/Protocol/Framing.h"
 #include "ServerCore/Runtime/JobRunner.h"
 #include "ServerCore/Runtime/Metrics.h"
+#include "ServerCore/Runtime/DatagramTransport.h"
 #include "ServerCore/Session/Session.h"
 #include "ServerCore/Session/SessionRegistry.h"
 
@@ -64,7 +65,7 @@ struct ServerHostOptions
     /// </remarks>
     std::chrono::milliseconds idleSessionTimeout{ 0 };
 
-    /// <summary>프레임 하나의 JSON 본문 상한. 기본은 64 KiB다.</summary>
+    /// <summary>프레임 하나의 JSON 또는 바이너리 봉투 상한. 기본은 64 KiB다.</summary>
     /// <remarks>
     /// 이 Host가 보내는 프레임도 L1의 단일 송신 큐에 통째로 들어가야 한다. 따라서 Configure는
     /// 머리까지 포함한 크기가 그 큐 상한을 넘는 값을 거절한다. 더 큰 메시지의 분할·스트리밍은
@@ -148,6 +149,18 @@ struct ServerHostOptions
     /// aggregate 초기화 호환성을 위해 이 필드까지의 선언 순서를 유지한다.
     /// </remarks>
     std::chrono::milliseconds gracefulCloseTimeout{ 5000 };
+
+    /// Absolute partial-frame and unauthenticated-session deadlines; zero disables each.
+    std::chrono::milliseconds frameCompletionTimeout{ 0 };
+    std::chrono::milliseconds authenticationTimeout{ 0 };
+    /// Per-session fixed one-second receive windows. Zero disables; excess closes TooLarge.
+    std::uint32_t maxInputBytesPerSecond = 0;
+    std::uint32_t maxInputFramesPerSecond = 0;
+    /// Binary uses the existing length framing and budgets; JSON remains the default adapter.
+    Protocol::PayloadMode payloadMode = Protocol::PayloadMode::Json;
+    JobRunnerOptions jobRunner;
+    /// Bounds receive-arrival metadata as well as byte storage; 1..65,536 per session.
+    std::uint32_t maxPendingReceiveChunks = 1024;
 };
 
 /// <summary>
@@ -177,7 +190,7 @@ struct ServerHostOptions
 /// 약속하지 않는 것:
 /// - 종료 대기 경계는 Stop()의 호출 계약을 따른다.
 /// - 게임의 주기 실행(틱) 정책은 호출자가 정한다.
-/// - 여러 서버 인스턴스를 한 프로세스에서 돌리는 것을 약속하지 않는다.
+/// - 독립 Host를 서로 다른 포트에 동시에 실행할 수 있다. SetLogger는 Host별 소유자다.
 /// </remarks>
 class ServerHost
 {
@@ -209,6 +222,10 @@ public:
     /// - servercore.host.max-total-pending-parse-bytes
     /// - servercore.host.max-pending-parse-tasks
     /// - servercore.host.max-total-pending-parse-tasks
+    /// - servercore.host.frame-completion-timeout-ms, authentication-timeout-ms
+    /// - servercore.host.max-input-bytes-per-second, max-input-frames-per-second
+    /// - servercore.host.max-pending-receive-chunks
+    /// - servercore.host.payload-mode: json 또는 binary
     ///
     /// 이 어댑터는 위 목록 외의 키를 읽지 않는다. 나머지 키의 소유자와 해석은 호출자가 정한다.
     /// 모든 값을 지역 옵션에 옮긴 뒤 ServerHostOptions overload를 한 번 호출하므로, 기존 옵션
@@ -225,6 +242,16 @@ public:
 
     /// <summary>기록을 남길 곳을 정한다. 부팅의 가장 첫 단계다.</summary>
     void SetLogger(std::shared_ptr<Core::ILogger> logger);
+
+    using BinaryHandler = std::function<Core::Status(
+        const std::shared_ptr<Session::Session>&, Protocol::BinaryMessageView)>;
+    /// Before Start only. Binary views are callback-local; handler executes on this Host's runner.
+    [[nodiscard]] Core::Status SetBinaryHandler(BinaryHandler handler);
+    /// Optional, already bound transport dedicated to this Host. Automatically registers before OnSessionOpened and
+    /// unregisters before OnSessionClosed. The caller still schedules Poll and distributes tokens
+    /// over an authenticated control channel. This Host never closes a caller-owned UDP socket.
+    [[nodiscard]] Core::Status AttachDatagramTransport(std::shared_ptr<DatagramTransport> transport);
+    [[nodiscard]] Core::Result<Protocol::DatagramCodec::Token> GetDatagramToken(Session::SessionId id) const;
 
     /// <summary>
     /// 게임 백엔드가 메시지 처리기를 등록하는 자리다.
@@ -273,6 +300,14 @@ public:
     /// 완료하고 Closed를 돌려준다.
     /// </remarks>
     void Stop();
+
+    /// Stops new admission, drains admitted work then locally queued sends, aborting remaining
+    /// connections at deadline. Stop remains immediate and may interrupt this drain. Deadline
+    /// bounds the drain phase, not joining non-cooperative application callbacks. External thread only.
+    [[nodiscard]] Core::Status BeginDrain();
+    /// Ok when drained/stopped; WouldBlock while admitted work or sends remain; Closed before Start.
+    [[nodiscard]] Core::Status DrainStatus() const;
+    [[nodiscard]] Core::Status StopGracefully(std::chrono::steady_clock::time_point deadline);
 
     /// <summary>종료가 요청될 때까지 이 스레드를 붙잡아 둔다.</summary>
     /// <returns>프로세스 종료 코드로 쓸 값. 정상 종료면 0.</returns>

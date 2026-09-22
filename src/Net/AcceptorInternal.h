@@ -8,6 +8,12 @@ namespace ServerCore::Net
 {
 class SendBudget;
 
+inline bool ValidSendQueueLimits(const SendQueueLimits& limits) noexcept
+{
+    return limits.connectionBytes > 0 && limits.connectionBytes <= 1024 * 1024 &&
+        limits.totalBytes > 0 && limits.totalBytes <= 512 * 1024 * 1024;
+}
+
 // Store one callable, then retain it during each handoff without copying mutable
 // capture state. Different accepted connections may invoke it concurrently.
 using SharedConnectionHandler =

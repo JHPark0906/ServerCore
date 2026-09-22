@@ -52,9 +52,9 @@ constexpr std::chrono::seconds PendingAcceptDrainTimeout{ 10 };
 /// 수락 완료는 아무도 반환값을 받지 않는 자리다. 여기서 실패를 그냥 버리면 접속이 사라지는데
 /// 아무 흔적이 없다. 기록이 그 흔적이다.
 /// </remarks>
-void ReportAcceptFailure(const Core::Status& status)
+void ReportAcceptFailure(const std::shared_ptr<Core::ILogger>& logger, const Core::Status& status)
 {
-    Core::GetGlobalLogger().Write(Core::LogLevel::Warn, status.Message());
+    if (logger) logger->Write(Core::LogLevel::Warn, status.Message());
 }
 }
 
@@ -114,7 +114,8 @@ public:
     IoContext* io = nullptr;
     LPFN_ACCEPTEX acceptEx = nullptr;
     SharedConnectionHandler connectionHandler;
-    std::shared_ptr<SendBudget> sendBudget;
+    std::shared_ptr<Core::ILogger> logger;
+    std::shared_ptr<SendBudget> sendBudget = std::make_shared<SendBudget>(SendQueueLimits{}.totalBytes);
 
     std::array<AcceptOperation, PendingAcceptCount> acceptOperations;
     std::size_t pendingAccepts = 0;
@@ -212,7 +213,7 @@ void Acceptor::State::HandleAcceptedSocket(SOCKET accepted, SOCKET listenSocketA
                 reinterpret_cast<const char*>(&listenSocketAtAccept),
                 sizeof(listenSocketAtAccept)) == SOCKET_ERROR)
         {
-            ReportAcceptFailure(
+            ReportAcceptFailure(logger,
                 MakeSocketFailure("setsockopt(SO_UPDATE_ACCEPT_CONTEXT)", ::WSAGetLastError()));
             ::closesocket(accepted);
             return;
@@ -221,7 +222,7 @@ void Acceptor::State::HandleAcceptedSocket(SOCKET accepted, SOCKET listenSocketA
         const Core::Status attached = IoContextAccess::AssociateSocket(context, accepted);
         if (!attached.IsOk())
         {
-            ReportAcceptFailure(attached);
+            ReportAcceptFailure(logger, attached);
             ::closesocket(accepted);
             return;
         }
@@ -237,7 +238,7 @@ void Acceptor::State::HandleAcceptedSocket(SOCKET accepted, SOCKET listenSocketA
         const Core::Status receiveStarted = connection->Start();
         if (!receiveStarted.IsOk())
         {
-            ReportAcceptFailure(receiveStarted);
+            ReportAcceptFailure(logger, receiveStarted);
 
             // 수신을 못 걸었으면 이 연결은 아무것도 받지 못한다. 닫아서 그것을 관찰자에게 알린다.
             // Start()가 이미 닫았을 수도 있으나 Close()는 여러 번 불러도 된다.
@@ -249,7 +250,7 @@ void Acceptor::State::HandleAcceptedSocket(SOCKET accepted, SOCKET listenSocketA
         // 사용자 처리기와 동적 할당은 I/O 완료 루프 밖으로 예외를 내보내면 안 된다. 연결을
         // 닫아 이 세션만 정리하고, 아래 CompleteHandoff가 항상 다음 수락 자리와 Stop 대기를
         // 회복한다.
-        Core::GetGlobalLogger().Write(Core::LogLevel::Warn,
+        if (logger) logger->Write(Core::LogLevel::Warn,
             "an accept completion handoff threw and the connection was closed");
 
         if (connection != nullptr)
@@ -280,7 +281,7 @@ void Acceptor::State::CompleteHandoff(AcceptOperation& operation) noexcept
                 const Core::Status posted = PostAcceptLocked(operation);
                 if (!posted.IsOk())
                 {
-                    ReportAcceptFailure(posted);
+                    ReportAcceptFailure(logger, posted);
 
                     if (pendingAccepts == 0)
                     {
@@ -367,7 +368,7 @@ void Acceptor::State::OnIoCompleted(IoOperation& operation, DWORD, unsigned long
             // 멈추는 중이거나 수락 자체가 실패했다. 미리 만들어 둔 소켓을 여기서 거둔다.
             if (errorCode != 0 && !isStopping)
             {
-                ReportAcceptFailure(
+                ReportAcceptFailure(logger,
                     MakeSocketFailure("AcceptEx completion", static_cast<int>(errorCode)));
             }
             ::closesocket(accepted);
@@ -389,7 +390,7 @@ void Acceptor::State::OnIoCompleted(IoOperation& operation, DWORD, unsigned long
         {
             ::closesocket(accepted);
         }
-        Core::GetGlobalLogger().Write(
+        if (logger) logger->Write(
             Core::LogLevel::Warn, "an accept completion setup threw and the connection was closed");
     }
 
@@ -491,6 +492,15 @@ Core::Status Acceptor::Listen(
     return Core::Status::Ok();
 }
 
+void Acceptor::SetLogger(std::shared_ptr<Core::ILogger> logger)
+{
+    std::shared_ptr<Core::ILogger> previous;
+    {
+        const std::lock_guard guard(mState->mutex);
+        SERVERCORE_ASSERT(!mState->started, "Acceptor::SetLogger requires an inactive listener");
+        previous = std::exchange(mState->logger, std::move(logger));
+    }
+}
 void Acceptor::SetConnectionHandler(std::function<void(std::shared_ptr<Connection>)> handler)
 {
     SharedConnectionHandler registered = handler ?
@@ -499,6 +509,18 @@ void Acceptor::SetConnectionHandler(std::function<void(std::shared_ptr<Connectio
     SERVERCORE_ASSERT(!mState->started && mState->activeCompletionHandoffs == 0,
         "the connection handler must be configured before accepting");
     mState->connectionHandler.swap(registered);
+}
+
+Core::Status Acceptor::SetSendQueueLimits(const SendQueueLimits& limits)
+{
+    if (!ValidSendQueueLimits(limits))
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+    const std::lock_guard guard(mState->mutex);
+    if (mState->started || mState->activeCompletionHandoffs != 0)
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+    try { mState->sendBudget = std::make_shared<SendBudget>(limits.totalBytes, limits.connectionBytes); }
+    catch (...) { return Core::Status::AllocationFailure(); }
+    return Core::Status::Ok();
 }
 
 Core::Status Acceptor::Start(IoContext& io)
@@ -561,7 +583,7 @@ Core::Status Acceptor::Start(IoContext& io)
     if (!lastFailure.IsOk())
     {
         // 일부만 걸렸다. 받기는 하지만 자리가 모자란 상태이므로 기록에 남긴다.
-        ReportAcceptFailure(lastFailure);
+        ReportAcceptFailure(mState->logger, lastFailure);
     }
 
     mState->started = true;

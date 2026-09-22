@@ -1,7 +1,9 @@
 #pragma once
 
 #include "ServerCore/Core/Error.h"
+#include "ServerCore/Core/Logging.h"
 #include "ServerCore/Net/Connection.h"
+#include "ServerCore/Net/ConnectionFlowControl.h"
 
 #include <cstdint>
 #include <functional>
@@ -52,6 +54,8 @@ class Acceptor
 {
 public:
     Acceptor();
+    // Configure before Start. Unset sinks discard diagnostics; no global state.
+    void SetLogger(std::shared_ptr<Core::ILogger> logger);
 
     /// <summary>Stop()을 부르고, 진행 중인 수락이 정리된 뒤에 끝난다.</summary>
     ~Acceptor();
@@ -94,6 +98,13 @@ public:
     /// 받은 바이트는 버려진다.
     /// </remarks>
     void SetConnectionHandler(std::function<void(std::shared_ptr<Connection>)> handler);
+
+    // Configure before Start, on the boot thread. Positive connectionBytes up to
+    // 1 MiB and totalBytes up to 512 MiB; defaults are 1 MiB / 256 MiB. The shared
+    // budget covers retained send payloads across all connections accepted here.
+    // Closed while accepting; InvalidArgument for invalid limits. Reconfiguration
+    // after Stop creates a new budget; surviving old connections keep the old one.
+    Core::Status SetSendQueueLimits(const SendQueueLimits& limits);
 
     /// <summary>수락을 시작한다. 처리기가 걸려 있지 않은 상태로 부르는 것은 계약 위반이다.</summary>
     /// <remarks>

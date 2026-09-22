@@ -47,12 +47,12 @@ public:
 /// 코어 전체가 쓸 로거를 설치한다.
 /// </summary>
 /// <remarks>
-/// 누가 이것을 부르는가:
-/// 실행 환경 층(Runtime::ServerHost)의 부팅 절차가 첫 단계에서 한 번 부른다. 시험이 자기
-/// 로거를 끼워 넣더라도 프로덕션 경로에 부르는 자리가 따로 있다는 뜻이다.
+/// Legacy application-only global sink. ServerHost, HttpServer, Dispatcher and
+/// Acceptor now own their sinks; this does not configure any server instance.
 ///
 /// 스레드 안전성: 부팅 때 한 번만 부르는 것을 전제한다. 도는 중에 바꾸는 것은 지원하지 않는다.
 /// </remarks>
+[[deprecated("Use ServerHost/HttpServer/Dispatcher/Acceptor::SetLogger for instance-owned logging")]]
 void SetGlobalLogger(std::shared_ptr<ILogger> logger);
 
 /// <summary>
@@ -65,5 +65,6 @@ void SetGlobalLogger(std::shared_ptr<ILogger> logger);
 /// 약속하지 않는 것:
 /// - 설치 전의 기록이 어딘가에 남는다고 약속하지 않는다. 그 기록은 사라진다.
 /// </remarks>
+[[deprecated("Retain an ILogger per application/server instance")]]
 [[nodiscard]] ILogger& GetGlobalLogger();
 }

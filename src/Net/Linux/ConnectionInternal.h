@@ -3,6 +3,7 @@
 #include "Net/SendBudgetInternal.h"
 #include "Net/SendQueueInternal.h"
 #include "ServerCore/Net/Connection.h"
+#include "ServerCore/Net/ConnectionFlowControl.h"
 #include "ServerCore/Net/IoContext.h"
 
 #include <atomic>
@@ -15,7 +16,8 @@ namespace ServerCore::Net
 {
 inline constexpr std::size_t ReceiveBufferSize = 16 * 1024;
 
-class TcpConnection final : public Connection, public std::enable_shared_from_this<TcpConnection>
+class TcpConnection final : public Connection, public ConnectionFlowControl,
+                            public std::enable_shared_from_this<TcpConnection>
 {
 public:
     struct CreationKey {};
@@ -33,9 +35,16 @@ public:
     void SetObserver(std::weak_ptr<IConnectionObserver> observer) override;
     [[nodiscard]] bool IsOpen() const noexcept override;
     [[nodiscard]] std::size_t QueuedSendBytes() const noexcept override;
+    Core::Status PauseReceive() override;
+    Core::Status ResumeReceive() override;
+    [[nodiscard]] bool IsReceivePaused() const noexcept override;
+    [[nodiscard]] std::size_t RetainedSendBytes() const noexcept override;
+    Core::Result<SendCapacitySubscription> WaitForSendCapacity(std::size_t requiredBytes,
+        std::function<void(Core::Status)> callback, std::stop_token cancellation) override;
 
 private:
     void OnReady(std::uint32_t events);
+    [[nodiscard]] std::uint32_t InterestLocked() const noexcept;
     [[nodiscard]] Core::Status RearmLocked() noexcept;
     void CloseWithFailureLocked(Core::Status& failure) noexcept;
     void CloseLocked(Core::Status reason, bool graceful = false) noexcept;
@@ -49,6 +58,7 @@ private:
     std::weak_ptr<IConnectionObserver> mObserver;
     bool mObserverAssigned = false;
     bool mStarted = false;
+    bool mReceivePaused = false;
     bool mProcessing = false;
     bool mCloseAfterSend = false;
     bool mDisconnectNotified = false;

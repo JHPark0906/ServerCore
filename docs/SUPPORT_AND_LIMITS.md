@@ -8,16 +8,27 @@
 | --- | --- | --- |
 | 플랫폼 | Windows WinSock2·IOCP, Linux epoll·POSIX 소켓, CMake 기반 빌드 | macOS 백엔드, 서로 다른 플랫폼·툴체인의 바이너리 호환 보장 |
 | 네트워크 | IPv4 TCP 수락, 부분 수신·송신, 연결별 송신 큐, 비차단 UDP와 토큰·endpoint·순번 관리 | IPv6, TLS/DTLS, DNS 해석·TCP outbound connect API |
-| 웹 | 별도 `Web::HttpServer`의 HTTP/1.1·WebSocket | HTTP/2·HTTP/3, 내장 TLS |
-| 프로토콜 | 길이 프레임, UTF-8 JSON, 준비된 봉투 재사용, 타입별 디스패치, 헤더 전용 DatagramCodec | 게임 스키마 자동 생성, 압축, 암호화, 큰 메시지 분할·스트리밍 |
-| 세션 | ID 발급, 연결 상태, 인증 완료 상태 표시, 목록, UDP 토큰 등록·폐기 | 계정 인증과 자격 증명 검증, 자동 재접속, 세션 이관·복구 |
-| 실행 | 직렬 JobRunner, 주기 작업 예약, 선택적 JSON 파싱 병렬화 | 게임 처리기의 병렬 실행 보장, 고정 시간 내 완료 보장 |
+| 웹 | HTTP/1.1·WebSocket, 패턴 라우팅, 비동기 정책·처리, 요청·응답 스트리밍·SSE, 파일 단일 Range·ETag·조건부 응답 | 외부 HTTP 요청, HTTP/2·HTTP/3, 서버 내장 TLS, 실행 중 라우트 변경, multipart Range |
+| 프로토콜 | 길이 프레임, 선택적 JSON/바이너리 payload, 준비된 JSON 봉투 재사용, 타입별 디스패치, DatagramCodec | 게임 스키마 자동 생성, 압축, 암호화, 큰 게임 메시지 분할·스트리밍 |
+| 세션 | ID 발급, 연결 상태, 인증 상태 표시·기한, 프레임 완결 기한·입력 속도 제한, 작업 취소 토큰, TCP 수명에 연결한 UDP 등록·폐기 | 계정 인증과 자격 증명 검증, 자동 재접속, 세션 이관·복구 |
+| 실행 | 제한된 JobRunner·TaskExecutor, 예약된 세션 작업 결과 복귀, 취소·마감 시간, 서버 drain, 주기 작업, 선택적 JSON 파싱 병렬화 | 게임 처리기의 자동 병렬화, 실행 중 작업의 강제 중단·고정 시간 내 완료 보장 |
 | 게임 | 게임이 처리기와 관찰자를 등록하는 확장 지점 | 방, AOI, 매치메이킹, DB, 월드 저장, 서버 권위 물리 |
-| 관측 | 주입형 ILogger, 고정 지표 스냅숏 | 기본 파일 로거, 로그 회전, 시계열 저장, HTTP 관리 서버 |
+| 관측 | 인스턴스별 ILogger, 비동기 콘솔·회전 파일 로거, 작업·HTTP·게임 지표·고정 지연 histogram·Prometheus 변환, HTTP 종료 추적 | 시계열 저장, 자동 HTTP 관리 서버, 분산 추적 프로토콜 |
+| 언어 연동 | C++20, 선택적 C ABI, 안전한 Rust HTTP 서버·WebSocket·TCP·정책·요청 스트리밍·drain·운영 도구와 Future | C++ 전체 API의 Rust 매핑, Rust UDP·ServerHost 래퍼, 네이티브 알림 기반 Rust 이벤트 reactor |
 
 구체 게임의 채팅·프로필 검증·접속 제한 정책은 소비 프로젝트의 기능입니다. ServerCore의 `MarkAuthenticated()`는 검증이 끝났음을 표시하는 상태 전이이며, 그 호출만으로 사용자가 인증되었다는 근거를 만들지 않습니다.
 
+웹 백엔드도 외부 HTTP 호출, 플러그인 발견·실행·복구, UI·VRM 검증, 업무 작업 상태와 배포를 소비 애플리케이션에서 구현합니다. 서버 라우팅·정책 콜백·취소·스트리밍·관측은 그 로직을 연결하는 공통 기반으로 제공합니다. 내부 층의 책임과 include 방향은 [아키텍처](ARCHITECTURE.md)의 계층 구분을 따릅니다.
+
 `Runtime::ServerHost`의 길이 프레임 프로토콜과 `Web::HttpServer`의 HTTP·WebSocket 프로토콜은 별도 API입니다. 웹 API의 입력 크기·시간 제한과 지원 범위는 [HTTP·WebSocket](WEB.md)을 따릅니다. 플랫폼 구현의 제공 여부와 실행 검증 결과는 구분하며, 실제 검증 환경은 [검증 결과](VALIDATION.md)에 기록합니다.
+
+패턴은 `RegisterRoutePattern`·`RegisterAsyncRoutePattern` 또는 `RegisterWebSocketPattern`으로 시작 전에 등록합니다. `{id}`는 비어 있지 않은 세그먼트 하나만 받으며 wildcard·정규식은 제공하지 않습니다. 원래 경로의 정확 일치가 먼저이고, 패턴 간에는 왼쪽부터 정적 세그먼트가 매개변수보다 우선합니다. 패턴 경로는 세그먼트별로 한 번 디코딩하고 UTF-8·구분자·제어 문자·dot segment를 검증합니다. 경로는 있으나 HTTP 메서드가 맞지 않으면 `405`와 `Allow`를 반환합니다. `HttpRequest::pathParameters`가 캡처 문자열을 소유하며 모든 HTTP 처리기는 제한된 worker 풀에서 실행합니다.
+
+### 공통 실행·TCP 흐름 제어
+
+TCP의 `ConnectionFlowControl`은 수신 일시정지·재개와 송신 용량 알림을 제공합니다. `Acceptor::SetSendQueueLimits`는 연결별 1바이트~1 MiB, 전체 1바이트~512 MiB를 받으며 기본값은 1 MiB·256 MiB입니다. HTTP·WebSocket도 `HttpServerOptions::maxTotalSendQueueCapacityBytes`로 같은 전체 송신 예산을 설정합니다. 예산은 아직 OS가 참조하는 부분 송신 벡터를 포함한 payload 저장소 기준입니다. HTTP는 응답 대기 중 제한된 pipeline 버퍼에 수신 watermark를 적용하며, 스트리밍과 WebSocket 공개 API에서 송신 용량 알림을 사용합니다.
+
+`TaskExecutorOptions` 기본값은 worker 2개, 대기 작업 128개, 대기·실행 중 선언된 보유 바이트 합계 4 MiB입니다. 각각 양수여야 하며 worker 외에 취소·마감 시간을 처리하는 coordinator 1개가 있습니다. 실행 중 작업의 임의 할당이나 외부 큐 메모리까지 제한하지 않습니다. 자세한 계약은 [실행·취소·흐름 제어](EXECUTION_AND_FLOW_CONTROL.md)를 따릅니다.
 
 ### UDP 전송의 별도 한도
 
@@ -142,6 +153,8 @@ if (!configured.IsOk())
 
 유휴 시간은 **마지막 비어 있지 않은 TCP 바이트 수신** 이후로 셉니다. 완성된 메시지나 인증 성공을 기준으로 하지 않으므로, 조금씩 보내는 부분 프레임도 활동입니다. 따라서 이 타임아웃을 가입 완료 기한이나 프레임 완결 기한으로 대체해서 사용하지 않습니다.
 
+별도 `frameCompletionTimeout`, `authenticationTimeout`, `maxInputBytesPerSecond`, `maxInputFramesPerSecond`를 활성화할 수 있습니다. 0은 해당 보호를 끕니다. 프레임 기한은 첫 조각에서 시작해 다음 조각으로 연장되지 않습니다. 입력 속도는 세션별 1초 고정 구간 한도입니다. 수신 시각 경계를 보관하는 조각 수도 `maxPendingReceiveChunks`로 제한합니다. 서버 전체 drain과 각 보호 옵션은 [프로토콜](PROTOCOL.md)과 [실행 계약](EXECUTION_AND_FLOW_CONTROL.md)을 참고합니다.
+
 `SendAndDisconnect`의 graceful 기한은 Closing 시작부터 셉니다. 상대가 계속 바이트를 보내도 기한을 연장하지 않으며, 기한 후 남은 송신을 버리고 연결을 정리합니다. 명시적인 `Disconnect`나 Host 종료는 그보다 먼저 drain을 중단할 수 있습니다. 어떤 경우도 마지막 메시지의 상대 애플리케이션 수신을 보증하지 않습니다.
 
 내부 검사는 활성 제한 중 짧은 시간의 1/4을 10~1,000ms로 제한한 주기로 예약합니다. 검사 작업 자체도 JobRunner에서 기다리므로 설정 시간에 정확히 종료된다는 실시간 보장은 없습니다. 긴 처리기는 다른 요청, 주기 작업과 지표 관측까지 지연시킵니다.
@@ -152,6 +165,6 @@ if (!configured.IsOk())
 
 지표 스냅숏에는 세션 수와 대기량, 프레임 누계 등이 있지만 전체 값이 한 원자적 시점의 상태는 아닙니다. `errorCount`는 Closed·Timeout·WouldBlock과 게임이 직접 정한 종료를 제외하므로 0이 성공률 100%를 뜻하지 않습니다. 스냅숏은 JobRunner에서 읽고 외부 저장·시각화는 소비자가 구현합니다.
 
-기본 로거는 메시지를 버립니다. 주입하는 `ILogger::Write`는 여러 스레드에서 호출될 수 있고 예외를 던지지 않아야 합니다. 파일 저장·회전·보존 정책, 플레이어 입장·채팅 같은 게임 로그는 소비 서버의 책임입니다. 전역 로거를 공유하므로 서로 독립적인 여러 Host를 같은 프로세스에 띄우는 구성은 지원 계약으로 제공하지 않습니다.
+미설정 로거는 메시지를 버립니다. 서버별 `SetLogger`에 `Observability::AsyncLogger`를 주입하면 제한된 큐와 별도 작업자에서 콘솔·회전 파일 출력을 처리합니다. 여러 Host와 HttpServer가 독립된 포트·큐·로거로 한 프로세스에서 실행될 수 있습니다. 주입하는 `ILogger::Write`는 여러 스레드에서 호출될 수 있고 예외를 던지지 않아야 합니다. 파일 경로·보존 수, 플레이어 입장·채팅 등 기록할 내용은 소비 서버가 정합니다. 지표·추적 및 출력 실패 계약은 [운영 도구](OPERATIONS.md)를 따릅니다.
 
 MSVC 빌드는 `/MD` 또는 `/MDd`를 사용하며 소비 타깃과 CRT를 맞춰야 합니다. 정적 `ServerCore.lib`를 링크한다고 CRT까지 정적으로 묶이지는 않습니다. Debug/Release 설치 패키지 분리와 실행 파일 배포 조건은 [빌드 문서](BUILD_TEST_DEPLOY.md)를 따릅니다. 이 저장소의 현재 문서와 버전 표시는 장기 ABI 호환성, 서비스 가용성 또는 특정 동접 수를 보증하지 않습니다.

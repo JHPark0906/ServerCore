@@ -15,7 +15,9 @@ ServerCore는 게임 서버가 링크하는 **Windows·Linux용 C++20 정적 라
 | Ninja | `msvc-debug`, `msvc-release`, `linux-debug`, `linux-release` 프리셋의 생성기다. |
 | PowerShell | `scripts/VerifyBuild.ps1` 사용 시 5.1 이상. 직접 CMake 명령만 사용하는 빌드에는 필요하지 않다. |
 
-서드파티 패키지 설치 단계는 없다. CMake에서 vcpkg·Conan·FetchContent를 사용하지 않으며, 검사도 저장소의 작은 C++ 하네스를 사용한다. Windows 시스템 라이브러리 `ws2_32`와 UDP 토큰 생성에 쓰는 `bcrypt`는 `ServerCore::ServerCore`를 통해 최종 실행 파일에 전이된다. Linux에서는 `Threads::Threads`를 통해 스레드 사용 조건을 전달하며 epoll과 getrandom 등 OS 기능을 사용한다. 다른 엔진·게임 소스 트리는 빌드 입력으로 요구하지 않는다.
+ServerCore에는 서드파티 패키지 설치 단계가 없다. CMake에서 의존성을 자동 다운로드하지 않으며, 검사도 저장소의 작은 C++ 하네스를 사용한다. Windows 시스템 라이브러리 `ws2_32`와 UDP 토큰 생성에 쓰는 `bcrypt`는 `ServerCore::ServerCore`를 통해 최종 실행 파일에 전이된다. Linux에서는 `Threads::Threads`를 통해 스레드 사용 조건을 전달하며 epoll과 getrandom 등 OS 기능을 사용한다. 다른 엔진·게임 소스 트리는 빌드 입력으로 요구하지 않는다.
+
+코어·C ABI·Rust의 표준 라이브러리·OS 의존성 원칙은 [의존성 정책](DEPENDENCIES.md)을 따른다. 외부 HTTP 요청은 소비 애플리케이션의 책임이다. 이전 클라이언트 타깃·API·Cargo feature를 쓰는 프로젝트는 [API 이전 안내](API_MIGRATION.md)에 따라 정리하고 네이티브 라이브러리와 함께 다시 빌드한다.
 
 Windows에서 직접 프리셋을 쓸 때는 **x64 Native Tools Command Prompt** 또는 같은 MSVC x64 환경을 가져온 PowerShell에서 시작한다. Ninja 프리셋은 `CMAKE_CXX_COMPILER=cl`만 지정하므로 일반 터미널에서 `cl.exe`나 SDK 도구를 찾지 못할 수 있다. 현재 터미널의 `cl`, `cmake --version`, `ninja --version`으로 선택한 도구를 확인한다.
 
@@ -325,13 +327,13 @@ cmake --build build/release
 
 `CMAKE_PREFIX_PATH`에는 `include`나 `.lib`/`.a` 파일이 아닌 설치 prefix를 넘긴다. 대안으로 `ServerCore_DIR`에 `lib/cmake/ServerCore`를 지정할 수 있다. Debug 소비자는 Debug 빌드와 `out/install-debug`를 짝지어 사용한다.
 
-현재 package 버전은 CMake 프로젝트의 `0.1.0`이며 버전 파일은 `SameMajorVersion` 규칙을 사용한다. 특정 산출물이 필요하면 `find_package(ServerCore 0.1.0 EXACT CONFIG REQUIRED)`로 고정할 수 있다. 이 버전 선택 규칙이 임의의 컴파일러·CRT·표준 라이브러리 ABI 호환을 보증하는 것은 아니다.
+현재 package 버전은 CMake 프로젝트의 `0.2.0`이다. 0.x 개발 단계에서는 minor 변경에 공개 API 변경이 포함될 수 있으므로 버전 파일은 `SameMinorVersion` 규칙을 사용한다. 따라서 0.1.x 요청을 0.2.x로 자동 대체하지 않는다. 특정 산출물이 필요하면 `find_package(ServerCore 0.2.0 EXACT CONFIG REQUIRED)`로 고정할 수 있다. 이 버전 선택 규칙이 임의의 컴파일러·CRT·표준 라이브러리 ABI 호환을 보증하는 것은 아니다. C ABI 버전 1은 라이브러리 배포 버전과 별개다.
 
 ## 7. CRT·ABI와 실제 배포 경계
 
 Windows에서 ServerCore는 정적 라이브러리이지만 MSVC CRT는 Debug에서 `/MDd`, 그 밖의 구성에서 `/MD`를 선택한다. **정적 라이브러리와 정적 CRT는 다른 선택**이다. 기본 빌드에서 `ServerCore.dll`은 만들어지지 않으며 ServerCore 코드는 소비 실행 파일에 링크된다. 그래도 `/MD` 실행 파일에는 그 도구 집합에 맞는 동적 MSVC 런타임이 실행 환경에 있어야 한다.
 
-공개 API에서 `std::string`, `std::function`, `std::shared_ptr`와 컨테이너 등 C++ 객체를 주고받는다. 소비자와 라이브러리는 아키텍처, Debug/Release, CRT, 컴파일러·표준 라이브러리 ABI를 일치시켜 사용한다. 임의의 바이너리 ABI 호환 계층이나 C API가 있는 패키지는 아니다. 소비자를 `/MT[d]`로 바꿔 연결하면 현재 MSVC 소비 회귀가 기대하는 `LNK2038 RuntimeLibrary` 불일치 대상이 된다. 오류를 링크 옵션으로 감추기보다 양쪽 빌드 설정을 맞춘다.
+C++ 공개 API에서 `std::string`, `std::function`, `std::shared_ptr`와 컨테이너 등 C++ 객체를 주고받는다. 소비자와 라이브러리는 아키텍처, Debug/Release, CRT, 컴파일러·표준 라이브러리 ABI를 일치시켜 사용한다. 이 C++ 타깃은 임의의 바이너리 ABI 호환을 제공하지 않으며 외부 언어에는 별도 `ServerCore::CAbi`를 사용한다. 소비자를 `/MT[d]`로 바꿔 연결하면 현재 MSVC 소비 회귀가 기대하는 `LNK2038 RuntimeLibrary` 불일치 대상이 된다. 오류를 링크 옵션으로 감추기보다 양쪽 빌드 설정을 맞춘다.
 
 `MSVC_RUNTIME_LIBRARY`가 작동하려면 MSVC ABI 언어를 처음 활성화하는 `project()` 또는 `enable_language()` **이전**에 CMP0091이 NEW여야 한다. ServerCore 하위 디렉터리에 들어온 뒤 정책을 바꾸는 것만으로 이미 활성화된 부모 언어 설정을 되돌릴 수 없다. 소스 소비 예제에서 정책 줄을 부모의 `project()` 위에 둔 이유다. ServerCore는 자기 대상의 CRT를 정하지만 소비 실행 파일의 CRT까지 자동으로 강제하지는 않는다.
 
@@ -360,3 +362,11 @@ Linux 소비자는 CPU 아키텍처와 컴파일러·표준 라이브러리 ABI 
 | 한글 소스가 깨지거나 MSVC 문자 인코딩 경고 | target의 `/utf-8` 설정과 원본 파일 인코딩을 확인한다. ServerCore의 `/utf-8`은 소비 대상에도 전이된다. |
 
 프로토콜 호환성 문제는 [프레이밍·메시지 문서](PROTOCOL.md), 서버의 메모리 예산과 동시성 제한은 [지원 범위와 제한](SUPPORT_AND_LIMITS.md)에서 이어서 확인한다.
+
+## Rust·C ABI와 운영 도구 빌드
+
+운영 로그·메트릭·추적은 기본 코어에 포함됩니다. C ABI는 `-DSERVERCORE_BUILD_C_API=ON`으로 선택하며 기본 공유 라이브러리의 CMake 이름은 `ServerCore::CAbi`입니다. `--component CAbi` 설치는 공유 C ABI를 별도 prefix에 배포할 때 사용합니다. 순수 C 소비 검사에서는 이 prefix를 이동한 뒤 C++ 언어를 활성화하지 않은 별도 프로젝트에서 구성·링크·실행합니다.
+
+Rust workspace는 저장소의 `rust/`입니다. `cargo test --workspace --all-targets --locked --offline`은 네이티브 공유 라이브러리를 CMake로 빌드하고 안전한 래퍼를 검증합니다. 기존 네이티브 라이브러리를 소비할 때에는 `SERVERCORE_CABI_DIR`를 설정합니다. 정확한 요구 버전, 동적/정적 링크와 cross compile 설정은 [RUST.md](RUST.md), ABI 소유권과 라이브러리 배포는 [C_ABI.md](C_ABI.md)를 따릅니다.
+
+`.github/workflows/build.yml`은 Windows·Ubuntu C ABI 검사, 순수 C 설치 소비, Rust source 소비 및 Linux sanitizer 검사를 포함합니다. 워크플로 추가와 원격 실행 확인은 다릅니다. 실제 수행한 결과만 [VALIDATION.md](VALIDATION.md)에 기록합니다.

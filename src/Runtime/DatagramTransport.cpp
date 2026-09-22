@@ -6,6 +6,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -57,10 +58,24 @@ struct DatagramTransport::Impl
     std::unordered_map<SessionId, Peer> peers;
     std::unordered_map<Codec::Token, SessionId, TokenHash> tokens;
     Metrics metrics;
+    DatagramTransportOptions options;
 };
 
 DatagramTransport::DatagramTransport() : mImpl(std::make_unique<Impl>()) {}
 DatagramTransport::~DatagramTransport() { Close(); }
+
+Status DatagramTransport::Configure(const DatagramTransportOptions& options)
+{
+    if (options.maxRegisteredSessions == 0 ||
+        (options.payloadMode != Protocol::PayloadMode::Json && options.payloadMode != Protocol::PayloadMode::Binary))
+        return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
+    if (options.maxRegisteredSessions > 65536)
+        return Status::FailWithoutMessage(ErrorCode::TooLarge);
+    const std::lock_guard guard(mImpl->mutex);
+    if (mImpl->bindingGeneration != 0) return Status::FailWithoutMessage(ErrorCode::Closed);
+    mImpl->options = options;
+    return Status::Ok();
+}
 
 Status DatagramTransport::Bind(const std::string_view address, const std::uint16_t port)
 {
@@ -96,6 +111,8 @@ Result<Codec::Token> DatagramTransport::RegisterSession(const SessionId id)
             return Result<Codec::Token>::FromStatus(Status::FailWithoutMessage(ErrorCode::Closed));
         if (!Session::IsValid(id) || mImpl->peers.contains(id))
             return Result<Codec::Token>::FromStatus(Status::FailWithoutMessage(ErrorCode::InvalidArgument));
+        if (mImpl->peers.size() >= mImpl->options.maxRegisteredSessions)
+            return Result<Codec::Token>::FromStatus(Status::FailWithoutMessage(ErrorCode::WouldBlock));
         if (mImpl->registrationGeneration == std::numeric_limits<std::uint64_t>::max())
             return Result<Codec::Token>::FromStatus(Status::FailWithoutMessage(ErrorCode::Closed));
 
@@ -149,6 +166,16 @@ Status DatagramTransport::Send(const SessionId id, const std::span<const std::by
 
 Status DatagramTransport::SendSerialized(const SessionId id, const std::span<const std::byte> payload) noexcept
 {
+    {
+        const std::lock_guard guard(mImpl->mutex);
+        if (mImpl->options.payloadMode != Protocol::PayloadMode::Json)
+            return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
+    }
+    return SendPayload(id, payload);
+}
+
+Status DatagramTransport::SendPayload(const SessionId id, const std::span<const std::byte> payload) noexcept
+{
     const std::lock_guard guard(mImpl->mutex);
     const auto found = mImpl->peers.find(id);
     if (found == mImpl->peers.end()) return Status::FailWithoutMessage(ErrorCode::Closed);
@@ -176,6 +203,29 @@ Status DatagramTransport::SendSerialized(const SessionId id, const std::span<con
 }
 
 void DatagramTransport::Poll(const Admission& admission, const Receiver& receiver,
+    const DatagramPollBudget budget) noexcept
+{
+    if (!admission || !receiver) return;
+    {
+        const std::lock_guard guard(mImpl->mutex);
+        if (mImpl->options.payloadMode != Protocol::PayloadMode::Json) return;
+    }
+    try
+    {
+        std::optional<Protocol::Message> message;
+        PollPayload([&](SessionId id, std::span<const std::byte> bytes)
+            {
+                auto parsed = Protocol::ParseMessage(bytes);
+                if (!parsed.IsOk()) return false;
+                message.emplace(std::move(parsed.Value()));
+                return admission(id, *message);
+            },
+            [&](SessionId id, std::span<const std::byte>) { receiver(id, *message); }, budget);
+    }
+    catch (...) { const std::lock_guard guard(mImpl->mutex); ++mImpl->metrics.rejectedDatagrams; }
+}
+
+void DatagramTransport::PollPayload(const PayloadAdmission& admission, const PayloadReceiver& receiver,
     const DatagramPollBudget budget) noexcept
 {
     if (!admission || !receiver || budget.maximumDatagrams == 0 || budget.maximumBytes == 0) return;
@@ -248,8 +298,7 @@ void DatagramTransport::Poll(const Admission& admission, const Receiver& receive
                 endpoint = received.endpoint;
             }
 
-            auto message = Protocol::ParseMessage(packet.payload);
-            if (!message.IsOk() || !admission(id, message.Value()))
+            if (!admission(id, packet.payload))
             {
                 const std::lock_guard guard(mImpl->mutex);
                 ++mImpl->metrics.rejectedDatagrams;
@@ -276,7 +325,7 @@ void DatagramTransport::Poll(const Admission& admission, const Receiver& receive
                 peer.endpoint = endpoint;
                 peer.ready = true;
             }
-            receiver(id, message.Value());
+            receiver(id, packet.payload);
         }
         catch (...)
         {
@@ -291,5 +340,56 @@ DatagramTransport::Metrics DatagramTransport::SnapshotMetrics() const noexcept
 {
     const std::lock_guard guard(mImpl->mutex);
     return mImpl->metrics;
+}
+
+std::size_t DatagramTransport::RegisteredSessionCount() const noexcept
+{
+    const std::lock_guard guard(mImpl->mutex);
+    return mImpl->peers.size();
+}
+
+Result<Codec::Token> DatagramTransport::GetToken(const SessionId id) const
+{
+    const std::lock_guard guard(mImpl->mutex);
+    const auto peer = mImpl->peers.find(id);
+    if (peer == mImpl->peers.end())
+        return Result<Codec::Token>::FromStatus(Status::FailWithoutMessage(ErrorCode::NotFound));
+    return Result<Codec::Token>::FromValue(peer->second.token);
+}
+
+Status DatagramTransport::SendBinary(const SessionId id, const std::uint32_t type,
+    const std::span<const std::byte> payload) noexcept
+{
+    {
+        const std::lock_guard guard(mImpl->mutex);
+        if (mImpl->options.payloadMode != Protocol::PayloadMode::Binary)
+            return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
+    }
+    auto encoded = Protocol::EncodeBinaryMessage(type, payload, Codec::MaximumPayloadBytes);
+    if (!encoded.IsOk()) return std::move(encoded).TakeStatus();
+    return SendPayload(id, encoded.Value());
+}
+
+void DatagramTransport::PollBinary(const BinaryAdmission& admission, const BinaryReceiver& receiver,
+    const DatagramPollBudget budget) noexcept
+{
+    if (!admission || !receiver) return;
+    {
+        const std::lock_guard guard(mImpl->mutex);
+        if (mImpl->options.payloadMode != Protocol::PayloadMode::Binary) return;
+    }
+    try
+    {
+        Protocol::BinaryMessageView message;
+        PollPayload([&](SessionId id, std::span<const std::byte> bytes)
+            {
+                auto parsed = Protocol::DecodeBinaryMessage(bytes);
+                if (!parsed.IsOk()) return false;
+                message = parsed.Value();
+                return admission(id, message);
+            },
+            [&](SessionId id, std::span<const std::byte>) { receiver(id, message); }, budget);
+    }
+    catch (...) { const std::lock_guard guard(mImpl->mutex); ++mImpl->metrics.rejectedDatagrams; }
 }
 }

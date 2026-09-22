@@ -11,10 +11,10 @@ namespace ServerCore
 /// <summary>버전의 주 번호. 호환되지 않는 변경이 있을 때 올린다.</summary>
 inline constexpr int VersionMajor = 0;
 
-/// <summary>버전의 부 번호. 호환되는 기능 추가가 있을 때 올린다.</summary>
-inline constexpr int VersionMinor = 1;
+/// <summary>버전의 부 번호. 0.x 개발 단계에서는 기능 추가와 공개 API 변경을 포함한다.</summary>
+inline constexpr int VersionMinor = 2;
 
-/// <summary>버전의 수정 번호. 동작을 바꾸지 않는 수정이 있을 때 올린다.</summary>
+/// <summary>버전의 수정 번호. 호환되는 버그 수정에 사용한다.</summary>
 inline constexpr int VersionPatch = 0;
 
 /// <summary>

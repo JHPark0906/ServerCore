@@ -38,6 +38,7 @@ set(SERVERCORE_TEST_NAMES
         Config.RejectsInvalidIntegers)
 
 set(SERVERCORE_PROTOCOL_TEST_NAMES
+        Protocol.BinaryMessageEnvelope
         Protocol.PreparedMessagesOwnImmutableJsonAndEnvelope
         Protocol.PreparedMessagesRejectInvalidInputs
         Protocol.PreparedMessagesAdaptLegacySessions
@@ -59,6 +60,16 @@ set(SERVERCORE_PROTOCOL_TEST_NAMES
         Protocol.MessageRejectsNonObjectBodies)
 
 set(SERVERCORE_JOB_TEST_NAMES
+        Runtime.BoundedRunnerReservations
+        Runtime.RunnerChargesExecutingCaptures
+        Runtime.SessionTaskReturnsThroughReservation
+        Runtime.SessionTaskCancelsQueuedAndRunning
+        Runtime.TaskCompletionCleanupAndRejection
+        Runtime.TaskExecutorBoundedAdmission
+        Runtime.TaskExecutorQueuedCancellation
+        Runtime.TaskExecutorDeadlinesAndExceptions
+        Runtime.TaskExecutorShutdownAndReentrancy
+        Runtime.TaskExecutorCompletionRace
         Core.JobQueueRunsSnapshotOnly
         Core.JobQueueAcceptsConcurrentPosts
         Runtime.JobRunnerDrainsAcceptedJobsOnStop
@@ -94,6 +105,22 @@ set(SERVERCORE_DISPATCH_TEST_NAMES
 # 걸기 때문이다. 매달리는 것이 전송 층의 대표적 실패 형태이고, 시간 제한이 없으면 검증이
 # 멈춘 채 남는다. 포트를 열지 않는 검사에까지 제한을 걸 이유는 없다.
 set(SERVERCORE_NET_TEST_NAMES
+        Runtime.HostBinaryAndUdpLifetime
+        Runtime.DatagramRegistryAndBinary
+        Runtime.HostInputAdmission
+        Runtime.HostGracefulDrain
+        Runtime.HostConcurrentIsolation
+        Transport.SendCapacityRetainsPartialStorage
+        Transport.SendCapacitySharesBudgetWithoutMissedWake
+        Transport.SendCapacityValidatesAndCancels
+        Transport.SendCapacityCloseAndReentrancy
+        Transport.SendCapacityResetWaitsForCallback
+        Transport.PauseReceiveBeforeStart
+        Transport.ResumeReceiveBeforeStart
+        Transport.ReceiveFlowControlSerializesCallbacks
+        Transport.SendWhileReceivePaused
+        Transport.PausedPeerEofDisconnectsOnce
+        Transport.SendQueueLimitsConfiguration
         Transport.SendQueueRetainsPartiallySentStorage
         Transport.AcceptorReusesHandlerStateAndReleasesOnStop
         Transport.SharedSendBudgetSerializesReservations
@@ -160,6 +187,30 @@ set(SERVERCORE_DATAGRAM_TEST_NAMES
         Runtime.DatagramTruncatedDatagramsRecover)
 
 set(SERVERCORE_WEB_TEST_NAMES
+        Web.StreamingUploadBackpressure
+        Web.RequestPolicyAndWebSocketGate
+        Web.GracefulDrain
+        Web.FileRangesAndConditionals
+    Web.AsyncRequestOwnershipAndIoProgress
+    Web.AsyncRetainedRequestBudget
+        Web.AsyncPipelineOrderAndWebSocketUpgrade
+        Web.AsyncCancellationAndShutdown
+        Web.AsyncHandlerDeadline
+        Web.StreamingFramingAndHead
+        Web.StreamingSseOutlivesInboundIdle
+        Web.StreamingBackpressureAndStall
+        Web.StreamingFileIntegrityAndHead
+    Web.StreamingResponseFraming
+    Web.ResponseWaitLifetimeAndReentrancy
+        Web.StreamingResponseRejectsInvalidHeaders
+        Web.HttpChunkEncoding
+        Web.SseEncoding
+        Web.FileTaskQueuedCancellation
+        Web.RoutePatternRegistration
+        Web.RoutePatternDecodingAndOwnership
+        Web.RoutePatternPrecedenceAndMethods
+        Web.RoutePatternWebSocketCoexistence
+        Web.RoutePatternLifecycle
         Web.HttpResponseSemantics
         Web.WebSocketSendValidationSymmetry
         Web.HttpParserConformance
@@ -172,6 +223,10 @@ set(SERVERCORE_WEB_TEST_NAMES
         Web.ConnectionLimitAndActiveShutdown)
 
 list(APPEND SERVERCORE_TEST_NAMES
+        Observability.LoggerFilteringAndRotation
+        Observability.HistogramAndPrometheus
+        Observability.TaskMetrics
+        Observability.HttpMetricsAndTracing
         ${SERVERCORE_PROTOCOL_TEST_NAMES}
         ${SERVERCORE_JOB_TEST_NAMES}
         ${SERVERCORE_SESSION_TEST_NAMES}
@@ -183,6 +238,8 @@ list(APPEND SERVERCORE_TEST_NAMES
 
 add_executable(ServerCoreTests
         TestHarness.cpp
+        Observability/OperationsTest.cpp
+        Web/InputLifecycleTest.cpp
         Core/ByteBufferTest.cpp
         Core/ClockTest.cpp
         Core/ConfigTest.cpp
@@ -193,11 +250,32 @@ add_executable(ServerCoreTests
         Dispatch/DispatcherTest.cpp
         Protocol/ProtocolTest.cpp
         Runtime/RuntimeTest.cpp
+        Runtime/TaskExecutorTest.cpp
+        Runtime/SessionTaskTest.cpp
+        Runtime/GameHostExtensionsTest.cpp
+        Protocol/BinaryMessageTest.cpp
         Runtime/ServerHostTest.cpp
         Runtime/DatagramTransportTest.cpp
         Session/SessionRegistryTest.cpp
         Net/TransportTest.cpp
-        Web/WebTest.cpp)
+        Net/FlowControlTest.cpp
+        Net/ReceiveFlowControlTest.cpp
+        Web/WebTest.cpp
+        Web/RoutingTest.cpp)
+target_sources(ServerCoreTests PRIVATE Web/AsyncStreamingTest.cpp Web/StreamingEncodingTest.cpp)
+
+if (SERVERCORE_BUILD_C_API)
+    target_sources(ServerCoreTests PRIVATE C/WebAbiTest.cpp C/NetAbiTest.cpp)
+    list(APPEND SERVERCORE_TEST_NAMES CAbi.WebHttpOwnershipAndStreaming CAbi.WebSocketOwnershipAndOverflow
+        CAbi.WebPolicyBeforeUpgrade CAbi.WebStreamingBodyOwnership CAbi.WebDrainMetricsAndLogger
+            CAbi.TcpOwnershipAndTerminal CAbi.TcpRetainedEventOverflow)
+    target_link_libraries(ServerCoreTests PRIVATE ServerCore::CAbi)
+    if (SERVERCORE_C_API_SHARED)
+        add_custom_command(TARGET ServerCoreTests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:ServerCoreCAbi> $<TARGET_FILE_DIR:ServerCoreTests>)
+    endif ()
+endif ()
 
 target_include_directories(ServerCoreTests
         PRIVATE
@@ -248,10 +326,24 @@ foreach (test_name IN LISTS SERVERCORE_DATAGRAM_TEST_NAMES)
             RESOURCE_LOCK ServerCore.UdpPorts)
 endforeach ()
 
+foreach (test_name IN LISTS SERVERCORE_JOB_TEST_NAMES)
+    set_tests_properties(ServerCore.${test_name} PROPERTIES TIMEOUT 60)
+endforeach ()
+
+foreach(test_name IN LISTS SERVERCORE_TEST_NAMES)
+    if (test_name MATCHES "^(CAbi|Observability)\\.")
+        set_tests_properties(ServerCore.${test_name} PROPERTIES TIMEOUT 60 RESOURCE_LOCK ServerCore.TcpPorts)
+    endif ()
+endforeach ()
+
 # 이 시험이 위 목록과 실행 파일의 등록표가 같은지 본다. 어느 한쪽에만 있는 이름이 있으면
 # 그 이름을 적어 실패한다.
 add_test(NAME ServerCore.Harness.RegisteredChecksMatchCtest
         COMMAND ServerCoreTests --verify-list ${SERVERCORE_TEST_NAMES})
+
+add_test(NAME ServerCore.Architecture.LayerBoundaries
+        COMMAND "${CMAKE_COMMAND}" "-DSERVERCORE_LAYER_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+        -P "${PROJECT_SOURCE_DIR}/cmake/CheckLayers.cmake")
 
 # 설치한 정적 라이브러리와 소스 트리는 모두 별도 CMake 프로젝트에서 같은 target 이름으로 소비할
 # 수 있어야 한다. 이 검사는 C++ 등록 검사와 성질이 달라 목록 동기화 시험에는 넣지 않는다. build
@@ -289,3 +381,20 @@ add_test(NAME ServerCore.CMake.InstallAndSourceTreeConsume
         "-DSERVERCORE_PACKAGE_VERSION=${ServerCore_VERSION}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/CMakePackageTest.cmake")
 set_tests_properties(ServerCore.CMake.InstallAndSourceTreeConsume PROPERTIES TIMEOUT 600)
+
+if (SERVERCORE_BUILD_C_API AND SERVERCORE_C_API_SHARED)
+    add_test(NAME ServerCore.CMake.CAbiPackageConsume COMMAND "${CMAKE_COMMAND}"
+            "-DSERVERCORE_PACKAGE_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+            "-DSERVERCORE_PACKAGE_BINARY_DIR=${PROJECT_BINARY_DIR}"
+            "-DSERVERCORE_PACKAGE_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/CAbiPackageConsumer-$<CONFIG>"
+            "-DSERVERCORE_PACKAGE_GENERATOR=${CMAKE_GENERATOR}"
+            "-DSERVERCORE_PACKAGE_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+            "-DSERVERCORE_PACKAGE_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+            "-DSERVERCORE_PACKAGE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+            "-DSERVERCORE_PACKAGE_CONFIGURATION=$<CONFIG>"
+            "-DSERVERCORE_PACKAGE_CTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
+            "-DSERVERCORE_PACKAGE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+            "-DSERVERCORE_PACKAGE_CROSSCOMPILING=${CMAKE_CROSSCOMPILING}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/CAbiPackageTest.cmake")
+    set_tests_properties(ServerCore.CMake.CAbiPackageConsume PROPERTIES TIMEOUT 180)
+endif ()

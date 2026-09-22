@@ -1,6 +1,6 @@
 # 프로토콜: 바이트 프레임에서 게임 처리기까지
 
-ServerCore의 TCP 와이어 형식은 **리틀 엔디언 4바이트 길이와 UTF-8 JSON 봉투**다. 검증된 JSON 송신 값을 재사용하는 Prepared API와, 소비자가 별도 UDP 소켓에 사용할 수 있는 헤더 전용 DatagramCodec도 제공한다. 이 문서는 각 형식의 검증, 소유권, 오류 처리와 게임 백엔드가 맡아야 할 경계를 설명한다. 특정 게임의 입장·이동·채팅 메시지는 ServerCore의 내장 프로토콜이 아니다.
+ServerCore의 TCP 와이어 형식은 **리틀 엔디언 4바이트 길이와 메시지 봉투**다. 기본 봉투는 UTF-8 JSON이며, 명시적으로 선택하는 바이너리 모드도 같은 프레이밍·세션·송신 예산을 사용한다. 검증된 JSON 송신 값을 재사용하는 Prepared API와, UDP용 DatagramCodec도 제공한다. 특정 게임의 입장·이동·채팅 메시지는 ServerCore의 내장 프로토콜이 아니다.
 
 전체 소개는 [README](../README.md), 모듈별 책임과 스레드·종료 수명은 [아키텍처](ARCHITECTURE.md)에서 이어서 읽을 수 있다.
 
@@ -93,7 +93,7 @@ TCP 수신 바이트
 
 ### 2.4 DatagramCodec의 독립적인 경계
 
-[DatagramCodec.h](../include/ServerCore/Protocol/DatagramCodec.h)는 TCP FrameCodec과 별개의 datagram 포맷이다. 별도의 `Runtime::DatagramTransport`가 UDP 소켓, 토큰 발급·등록·폐기, endpoint 연결, 패킷 순서 검증과 수신 pump를 제공한다. 소비자가 이 전송을 생성하고 세션 수명과 연결한다. ServerHost가 UDP 소켓을 만들거나 TCP 세션과 자동 연결하지 않는다.
+[DatagramCodec.h](../include/ServerCore/Protocol/DatagramCodec.h)는 TCP FrameCodec과 별개의 datagram 포맷이다. `Runtime::DatagramTransport`가 UDP 소켓, 토큰 발급·등록·폐기, endpoint 연결, 패킷 순서 검증과 수신 pump를 제공한다. 소비자가 전송을 생성하고 Bind한다. `ServerHost::AttachDatagramTransport`는 이미 바인딩한 전송 하나를 해당 Host의 TCP 세션 수명에 연결하는 선택적 어댑터다. Poll 실행 주기와 토큰의 안전한 전달은 호출자가 맡는다.
 
 | 오프셋 | 바이트 | 내용 |
 | ---: | ---: | --- |
@@ -114,11 +114,31 @@ TCP 수신 바이트
 
 [DatagramTransport.h](../include/ServerCore/Runtime/DatagramTransport.h)는 위 codec과 공용 JSON 봉투를 조립하는 비차단 IPv4 UDP API다. `Bind(address, port)`는 숫자 IPv4를 받으며 포트 0이면 OS가 배정한 값을 `Port()`로 읽는다. `RegisterSession(id)`는 CSPRNG로 만든 16바이트 토큰을 반환하고, 소비자가 신뢰 채널로 전달한다. `UnregisterSession(id)`와 `Close()`는 토큰을 폐기하며 Close를 반복해도 안전하다.
 
+첫 Bind 전에 `Configure(DatagramTransportOptions)`로 등록 상한과 봉투 모드를 정한다. 기본 등록 상한은 256이며 1~65,536을 허용한다. 가득 찬 등록표는 새 토큰을 만들기 전에 `WouldBlock`을 반환한다. `RegisteredSessionCount`와 `GetToken`은 스레드 안전한 조회다. Close 뒤에도 처음 선택한 설정은 유지된다.
+
+Host 어댑터는 `OnSessionOpened` 전에 등록하고 `OnSessionClosed` 전에 해제한다. 등록이 실패한 TCP 연결은 게임에 공개하기 전에 종료한다. 열린 세션의 토큰은 Host 실행 문맥에서 `GetDatagramToken(id)`로 얻는다. 하나의 전송은 한 Host에 전용으로 연결한다. Host는 외부에서 소유한 UDP 소켓을 닫지 않으며, 토큰 전달이나 계정 인증을 대신하지 않는다.
+
 `Poll(admission, receiver, budget)`은 등록된 토큰과 새로운 패킷 순번을 확인한 뒤 JSON을 한 번 파싱한다. admission이 true를 반환하고 같은 등록이 여전히 유효한 경우에만 순번·발신 endpoint·ready를 확정하고 receiver를 호출한다. 따라서 손상 JSON, 금지 메시지와 폐기된 등록은 더 높은 순번이더라도 정상 경로를 덮지 않는다. 유효한 새 패킷은 endpoint를 재바인딩할 수 있으며 순번은 초기화하지 않는다. 게임 메시지 이름은 코어가 정하지 않는다.
 
 콜백은 잠금 없이 동기 실행하므로 Send·등록 해제·Close를 호출할 수 있다. 콜백 예외는 거절 지표에 기록하고 해당 Poll을 끝낸다. admission 예외는 상태 확정 전이고 receiver 예외는 확정 후다. 비어 있는 콜백이나 한도 0은 패킷을 소비하지 않는다. 호출자는 Poll을 직렬화하고 전송 객체를 모든 호출이 끝날 때까지 유지한다.
 
 `SendSerialized(id, prepared.Bytes())`는 큐를 만들거나 JSON을 재파싱하지 않는다. 정상 반환은 OS의 datagram 수락이고 전달 보장이 아니다. 미등록은 Closed, 아직 준비되지 않은 경로와 일시적 역압은 WouldBlock, 초과 크기는 TooLarge, 플랫폼 오류는 PlatformError다. 송신 성공 때만 순번을 증가시키며 최댓값에서 wrap하지 않는다. TCP 세션 종료 여부는 소비자가 정한다. 지표는 Close 뒤에도 유지한다.
+
+### 2.6 명시적 바이너리 봉투
+
+`ServerHostOptions::payloadMode = Protocol::PayloadMode::Binary`와 `SetBinaryHandler`를 Start 전에 설정한다. 바이너리 모드에서는 JSON parse worker를 사용하지 않으므로 `parseWorkerThreadCount`는 0이어야 한다. 기본 Json 모드는 기존 API와 wire를 유지한다. 연결 안에서 형식을 추측하거나 모드를 바꾸지 않는다.
+
+바이너리 TCP 형식은 `[uint32 LE 봉투 길이][uint32 LE type][응용 바이트]`다. type 0은 예약값이며 응용 바이트는 빈 값, NUL, 비 UTF-8을 포함할 수 있다. `maxBodySize`에는 type 4바이트가 포함된다. `EncodeBinaryMessage`와 `DecodeBinaryMessage`는 이 봉투만 처리하며 TCP 길이는 기존 `EncodeFrame`이 붙인다. 처리기는 `BinaryMessageView`를 callback 동안만 빌리고, 보관하려면 payload를 복사해야 한다. `Session::SendBinary(type, payload)`는 같은 Connection 송신 큐에 복사한다. 잘못된 모드의 송신 API는 `InvalidArgument`다.
+
+UDP도 `DatagramTransportOptions::payloadMode`로 선택한다. `PollBinary`와 `SendBinary`가 위와 같은 type+payload 봉투를 사용하며, 바깥쪽에는 기존 28바이트 토큰·순번 머리만 붙인다. 따라서 응용 바이트 상한은 1,168바이트다. JSON과 바이너리는 토큰·순번·endpoint 확정 및 수신 예산 코드를 공유한다. 바이너리는 스키마, 압축, 암호화, 재전송 의미를 추가하지 않는다.
+
+### 2.7 게임 입력과 종료 경계
+
+`frameCompletionTimeout`은 첫 바이트부터 미완성 프레임을 유지할 절대 기한, `authenticationTimeout`은 연결 생성부터 인증 상태 전이까지의 기한이다. 0은 각각 해제한다. 부분 프레임에 추가 바이트를 보내도 기한은 늘어나지 않는다. I/O 수신별 도착 시각을 보관하므로 실행자 대기 중 합쳐진 조각도 기한을 새로 시작하지 않는다. `maxPendingReceiveChunks`는 이 메타데이터와 처리 중 조각의 개수를 연결별로 제한한다(기본 1,024, 허용 1~65,536). 첫 조각과 다음 프레임 시작이 같은 수신에 있으면 그 수신 시각을 사용한다. 실제 종료는 실행자 스케줄에 따르며 긴 게임 콜백의 강제 중단은 제공하지 않는다.
+
+`maxInputBytesPerSecond`와 `maxInputFramesPerSecond`는 세션별 고정 1초 창의 입장 한도다. 0은 해제한다. 초과는 `TooLarge`, 기한 초과는 `Timeout`으로 그 세션을 종료한다. 프레임 입장은 완결 본문을 복사하기 전에 검사한다. 창 경계에서 연속된 두 창의 허용량이 짧은 구간에 몰릴 수 있으므로 네트워크 혼잡 제어용 pacing으로 해석하지 않는다.
+
+`BeginDrain`은 새 연결·수신 작업·일반 JobRunner 입장을 닫는다. 이미 받은 작업, 파싱과 예약된 세션 작업 완료가 끝나면 로컬 송신 큐를 비우고 닫는다. `DrainStatus`는 진행 중 `WouldBlock`, 완료·정지 뒤 `Ok`다. `StopGracefully(steady_clock::time_point)`는 기한까지 기다리고 남은 연결을 강제 종료하며 기한 초과를 `Timeout`으로 반환한다. `Stop`은 기존 즉시 종료다. 기한은 drain 단계의 제한이며 협력하지 않는 게임 콜백을 join하는 시간 상한은 아니다. 세션 `GetCancellationToken`은 닫기/끊김과 연동하며 취소 콜백은 Host를 join해서는 안 된다.
 
 ## 3. JSON 메시지 봉투
 

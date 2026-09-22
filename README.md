@@ -4,16 +4,22 @@ Windows와 Linux 서버의 구조와 구현을 학습하기 위한 **C++20 서�
 
 개발 과정에서 생성형 AI의 도움을 받은 프로젝트입니다.
 
-현재 라이브러리 버전은 `0.1.0`입니다. 다른 엔진·게임 저장소 없이 빌드할 수 있는 정적 라이브러리이며, 특정 게임의 규칙이나 게임 서버 진입점을 포함하지 않습니다. 프로젝트 코드는 [MIT-0](LICENSE) 라이선스로 제공합니다.
+현재 라이브러리 버전은 `0.2.0`입니다. 다른 엔진·게임 저장소 없이 빌드할 수 있는 정적 라이브러리이며, 특정 게임의 규칙이나 게임 서버 진입점을 포함하지 않습니다. 프로젝트 코드는 [MIT-0](LICENSE) 라이선스로 제공합니다. 버전별 변경과 호환 범위는 [변경 기록](CHANGELOG.md)을 참고합니다.
+
+ServerCore는 표준 라이브러리·컴파일러 런타임·OS API만 사용하며 서드파티 라이브러리에 의존하지 않습니다. 서버의 요청 수신·응답과 게임 통신을 제공하고, 외부 서비스로 보내는 HTTP 요청은 소비 애플리케이션이 선택한 도구로 처리합니다. 자세한 기준은 [의존성 정책](docs/DEPENDENCIES.md)을 따릅니다.
 
 ## 문서 안내
 
 | 문서 | 내용 |
 | --- | --- |
 | [아키텍처](docs/ARCHITECTURE.md) | 모듈 경계, 소유권, 부팅·메시지·종료 흐름 |
+| [실행·취소·흐름 제어](docs/EXECUTION_AND_FLOW_CONTROL.md) | 웹·게임 공통 계약, 제한된 작업 실행, TCP 송수신 제어 |
 | [프로토콜](docs/PROTOCOL.md) | 프레임 형식, JSON 봉투, 디스패치와 오류 계약 |
 | [HTTP·WebSocket](docs/WEB.md) | 웹 서버 API, 사용 예와 지원 범위 |
+| [Rust](docs/RUST.md) · [C ABI](docs/C_ABI.md) | Cargo 소비, 안전한 소유 handle, Future와 네이티브 배포 |
+| [운영 도구](docs/OPERATIONS.md) | 비동기 로그·회전, 작업·HTTP 메트릭, 요청 종료 추적 |
 | [빌드·테스트·배포](docs/BUILD_TEST_DEPLOY.md) | 요구 사항, CMake, 소스·설치 패키지 소비, 검증 |
+| [의존성 정책](docs/DEPENDENCIES.md) | 표준 라이브러리·OS 의존성, 서버와 소비 애플리케이션의 범위 |
 | [지원 범위와 설정](docs/SUPPORT_AND_LIMITS.md) | 기본값, 설정 파일, 자원 상한, 미지원 기능 |
 | [공개 API 이전](docs/API_MIGRATION.md) | Deprecated API, 대체 이름과 종료·직렬화 계약 |
 | [검증 결과](docs/VALIDATION.md) | 검증한 소스·도구 환경, 빌드와 테스트 결과 |
@@ -21,16 +27,22 @@ Windows와 Linux 서버의 구조와 구현을 학습하기 위한 **C++20 서�
 ## 핵심 기능
 
 - **비동기 TCP 전송:** Windows IOCP·AcceptEx와 Linux epoll, 부분 수신·송신 처리와 연결 수명 관리.
-- **HTTP·WebSocket:** 별도 `Web::HttpServer`가 HTTP/1.1 요청과 WebSocket 연결을 처리합니다. API와 제약은 [웹 서버 문서](docs/WEB.md)를 따릅니다.
-- **스트림 프레이밍:** 4바이트 길이 머리와 UTF-8 JSON 본문. 나뉘어 도착하거나 연속으로 도착한 프레임을 처리합니다.
+- **HTTP·WebSocket:** 별도 `Web::HttpServer`가 HTTP/1.1 요청과 WebSocket 연결을 처리합니다. 정확 일치 라우트와 `/plugins/{id}` 같은 세그먼트 패턴을 등록하고 `HttpRequest::PathParameter("id")`로 값을 읽습니다. 우선순위·메서드별 `405` 응답과 사용 예는 [웹 서버 문서](docs/WEB.md)를 따릅니다.
+- **비동기 웹 응답:** 소유 요청 문맥과 제한된 처리기 풀, 응답 스트리밍·SSE·파일 전송을 제공합니다. HTTP와 WebSocket은 TCP의 송신 예산과 용량 알림을 공유합니다.
+- **스트림 프레이밍:** 4바이트 길이 머리와 선택적 JSON/바이너리 본문. 나뉘어 도착하거나 연속으로 도착한 프레임을 처리합니다. 바이너리는 같은 프레임·세션·송신 예산을 재사용합니다.
 - **공용 메시지 봉투:** `type`, `body`, 선택적 `seq`와 `error`를 파싱·직렬화합니다. UTF-8, JSON 값, 본문 형식과 크기를 검증합니다.
 - **준비된 송신 값:** `PreparedJsonValue`와 `PreparedMessage`를 소유 값으로 만들고 여러 수신자에게 재사용합니다. 실제 NetworkSession의 `SendPrepared`는 JSON을 다시 직렬화하지 않고 기존 프레임·송신 큐에 넣습니다.
 - **비차단 UDP 전송:** `Runtime::DatagramTransport`가 소켓, 세션별 토큰, 순번·재전송 입력 거절, endpoint 재바인딩과 제한된 수신 pump를 제공합니다. 공유 `DatagramCodec`의 최대 1,200바이트 형식을 사용하며 게임 메시지 정책은 소비자가 정합니다.
 - **세션과 처리기:** 세션 ID 발급, 연결·인증·종료 상태, 타입별 처리기와 본문 크기 제한, 시작 전 등록표 동결.
-- **실행 문맥:** 게임 처리를 직렬화하는 JobRunner와 PeriodicRunner. 선택적으로 JSON 파싱만 별도 worker에서 처리하며 같은 세션의 순서를 유지합니다.
+- **실행 문맥:** 작업 수·보유 바이트가 제한된 JobRunner와 PeriodicRunner. `SubmitSessionTask`는 배경 작업과 세션 취소를 연결하고 예약한 완료 슬롯으로 게임 상태 변경을 돌려보냅니다.
+- **제한된 병렬 작업:** `TaskExecutor`가 작업자 수·대기 작업 수·보유 바이트를 제한하고, 부모 토큰·취소·마감 시간을 처리합니다. 실행 중 작업은 취소에 협력해야 합니다.
+- **TCP 흐름 제어:** 수신 일시정지·재개, 실제 보유 송신량 조회와 일회성 용량 알림을 제공합니다. TCP 수락기·게임 Host·웹 서버에 연결별·전체 송신 예산을 적용합니다.
 - **자원 제한:** 연결 수, 프레임 크기, 수신·파싱·송신 대기량에 상한을 적용합니다. 유휴 세션과 마지막 송신을 기다리는 세션의 종료 기한도 설정할 수 있습니다.
-- **관측과 실패 처리:** `Status`/`Result<T>`, 주입 가능한 로거, 활성 세션·프레임 수·대기량 스냅숏을 제공합니다.
+- **관측과 실패 처리:** `Status`/`Result<T>`, 제한된 비동기 콘솔·회전 파일 로거, 작업·HTTP·게임 지표와 비동기 HTTP 요청 종료 추적을 제공합니다.
+- **Rust와 C 연동:** 선택적 C ABI와 안전한 Rust 래퍼가 HTTP 서버·스트리밍·WebSocket·raw TCP를 제공합니다. 표준 Future를 사용하며 이벤트 보관과 객체 해제를 네이티브 자원 상한·취소에 연결합니다.
 - **라이브러리 소비:** 소스 트리의 `add_subdirectory`와 설치 패키지의 `find_package`에서 같은 `ServerCore::ServerCore` 타깃을 사용합니다.
+
+웹 요청의 업로드 스트리밍·정책 문맥·101 전 WebSocket 인증과 파일 단일 Range·ETag·조건부 응답을 지원합니다. 웹·게임 서버의 `BeginDrain/DrainStatus/StopGracefully`는 수락한 작업을 비운 뒤 기한에 남은 연결을 취소합니다. 게임 세션에는 프레임·인증 기한과 입력 속도 상한을 선택적으로 적용하고, UDP 등록을 TCP 세션 수명에 연결할 수 있습니다. 여러 서버는 각자의 로거를 사용하며 고정 지연 histogram과 Prometheus 스냅샷 변환을 제공합니다.
 
 서버 프로세스의 `main`, 주소·포트의 명령행 옵션, 플레이어 목록과 방, 입장 조건, 게임 메시지의 스키마는 소비 프로젝트가 정합니다. 아래 예제에서는 작은 Echo 서버로 이 경계를 보여 줍니다.
 
@@ -42,6 +54,7 @@ Windows와 Linux 서버의 구조와 구현을 학습하기 위한 **C++20 서�
 | [src](src) | 공개 API 구현과 내부 전송·파싱 상태. 플랫폼 헤더와 소켓 구현을 내부에 둠 |
 | [tests](tests) | C++ 회귀, 실제 TCP·UDP·HTTP·WebSocket 통합과 소스/설치 패키지 소비 검사 |
 | [cmake](cmake) | 설치 패키지의 Config/Targets 구성 |
+| [rust](rust) | servercore-sys C ABI 선언·빌드와 안전한 servercore 래퍼·예제 |
 | [scripts](scripts) | 개발 빌드 검증 스크립트 |
 | [docs](docs) | 프로토콜·설정·빌드 계약 |
 
@@ -185,7 +198,7 @@ ServerHost의 네트워크 세션은 **Windows IOCP·Linux epoll 기반 IPv4 TCP
 
 ## 지원 범위
 
-현재 라이브러리는 HTTP/2·HTTP/3, TLS/DTLS, IPv6, DNS 연결, 자동 재접속, 계정 인증, DB, 매치메이킹, 서버 권위 물리, 방·관심 영역 분할을 제공하지 않습니다. 인증 상태 전이 API는 자격 증명을 검증하지 않습니다.
+현재 서버 전송은 HTTP/2·HTTP/3, 내장 TLS/DTLS, IPv6와 범용 outbound TCP 연결 API를 제공하지 않습니다. 외부 HTTP·HTTPS 요청은 소비 애플리케이션의 책임입니다. Rust/C 연동의 범위는 [C ABI](docs/C_ABI.md)에 명시합니다. 자동 재접속, 계정 인증, DB, 매치메이킹, 서버 권위 물리, 방·관심 영역 분할은 아직 제공하지 않습니다. 웹 라우트는 시작 전에 등록하며 실행 중 교체하지 않습니다. 인증 상태 전이 API는 자격 증명을 검증하지 않습니다.
 
 공개 헤더는 OS 소켓 구조체를 노출하지 않으며 CMake가 Windows와 Linux 구현을 선택합니다. macOS 백엔드는 제공하지 않습니다. MSVC에서는 라이브러리와 소비 실행 파일이 동일한 `/MD` 또는 `/MDd` CRT 계약을 따라야 합니다. 자세한 계약과 제약은 [지원 범위와 설정](docs/SUPPORT_AND_LIMITS.md)을 기준으로 확인합니다.
 

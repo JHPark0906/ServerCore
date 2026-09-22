@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ServerCore/Core/Error.h"
-#include "ServerCore/Core/JobQueue.h"
+#include "ServerCore/Observability/Metrics.h"
 
 #include <condition_variable>
 #include <cstddef>
@@ -14,6 +14,18 @@
 namespace ServerCore::Runtime
 {
 class PeriodicRunner;
+
+struct JobRunnerOptions
+{
+    // Includes queued, executing and pre-reserved jobs. Bytes are caller-declared
+    // capture sizes, not an allocator limit on work performed inside a callback.
+    std::size_t maxOutstandingJobs = 4096;
+    std::size_t maxRetainedBytes = 16 * 1024 * 1024;
+    // Independent bounded admission for transport/control work. Both lanes
+    // execute in the same FIFO order; this is capacity isolation, not priority.
+    std::size_t maxControlJobs = 1024;
+    std::size_t maxControlBytes = 4 * 1024 * 1024;
+};
 
 /// <summary>
 /// 하나의 상태를 여러 스레드가 동시에 건드리지 않도록, 그 상태를 만지는 일을 한 스레드에서
@@ -45,8 +57,31 @@ class JobRunner
 {
 private:
     class SharedState;
+    class ReservationState;
 
 public:
+    // A move-only completion slot. Reserve before starting asynchronous work.
+    // Post consumes its preallocated queue node; unused slots release on drop.
+    // CloseAdmission preserves slots; RequestStop rejects their later Post.
+    // Operations on the same reservation handle require caller serialization.
+    class Reservation
+    {
+    public:
+        Reservation() noexcept = default;
+        Reservation(Reservation&&) noexcept = default;
+        Reservation& operator=(Reservation&&) noexcept = default;
+        Reservation(const Reservation&) = delete;
+        Reservation& operator=(const Reservation&) = delete;
+        [[nodiscard]] bool IsValid() const noexcept;
+        Core::Status Post(std::function<void()> job);
+        void Cancel() noexcept;
+
+    private:
+        friend class JobRunner;
+        friend class SharedState;
+        explicit Reservation(std::shared_ptr<ReservationState> state) noexcept;
+        std::shared_ptr<ReservationState> mState;
+    };
     /// <summary>
     /// 실행자 수명에 묶인 작업 투입 손잡이다.
     /// </summary>
@@ -69,7 +104,9 @@ public:
 
         /// <summary>소유 실행자가 아직 있으면 작업을 넣는다.</summary>
         /// <returns>실행자가 이미 소멸했거나 멈췄으면 Closed다.</returns>
-        Core::Status Post(std::function<void()> job) const;
+        Core::Status Post(std::function<void()> job, std::size_t retainedBytes = 0) const;
+        Core::Status PostControl(std::function<void()> job, std::size_t retainedBytes = 0) const;
+        Core::Result<Reservation> Reserve(std::size_t retainedBytes = 0) const;
 
         /// <summary>소유 실행자가 없거나 더는 새 작업을 받지 않으면 true다.</summary>
         [[nodiscard]] bool IsStopRequested() const noexcept;
@@ -77,11 +114,12 @@ public:
     private:
         friend class JobRunner;
         friend class PeriodicRunner;
-        explicit Lease(std::shared_ptr<SharedState> state) noexcept;
+        explicit Lease(std::shared_ptr<SharedState> state, bool control = false) noexcept;
 
         void RecordSkippedPeriodicPeriods(std::uint64_t count) const noexcept;
 
         std::shared_ptr<SharedState> mState;
+        bool mControl = false;
     };
 
     JobRunner();
@@ -90,9 +128,17 @@ public:
     JobRunner(const JobRunner&) = delete;
     JobRunner& operator=(const JobRunner&) = delete;
 
-    /// <summary>실행할 일을 넣는다.</summary>
-    /// <returns>멈춘 뒤에는 Closed, 빈 작업은 InvalidArgument다.</returns>
-    Core::Status Post(std::function<void()> job);
+    // Configure before the first post/reservation/run. Reapplying identical
+    // options is always a no-op; changing used or closed runners is Closed.
+    Core::Status Configure(const JobRunnerOptions& options);
+    // Empty callback: InvalidArgument. Closed admission: Closed. Oversized
+    // declared bytes: TooLarge. Occupied count/byte capacity: WouldBlock.
+    Core::Status Post(std::function<void()> job, std::size_t retainedBytes = 0);
+    Core::Status PostControl(std::function<void()> job, std::size_t retainedBytes = 0);
+    Core::Result<Reservation> Reserve(std::size_t retainedBytes = 0);
+    // Stop external admission while already accepted completions and bounded
+    // transport/control work continue. Does not stop the execution thread.
+    void CloseAdmission() noexcept;
 
     /// <summary>멈추라는 요청이 올 때까지 이 스레드에서 작업을 계속 실행한다.</summary>
     void RunUntilStopped();
@@ -120,6 +166,9 @@ public:
 
     /// <summary>아직 실행을 시작하지 않은 작업 수다.</summary>
     [[nodiscard]] std::size_t PendingCount() const;
+    [[nodiscard]] std::size_t OutstandingCount() const noexcept;
+    [[nodiscard]] std::size_t RetainedBytes() const noexcept;
+    [[nodiscard]] Observability::JobRunnerMetricsSnapshot GetMetrics() const noexcept;
 
     /// <summary>이 실행자의 Lease로 만든 PeriodicRunner들이 건너뛴 주기 수의 합이다.</summary>
     /// <remarks>
@@ -139,6 +188,10 @@ public:
     /// 없다.
     /// </remarks>
     [[nodiscard]] Lease AcquireLease() const noexcept;
+    // For transport maintenance (for example drain timers). Its Post uses the
+    // control budget and IsStopRequested follows RequestStop, not CloseAdmission.
+    // Reserve always reserves a normal completion, independent of lease kind.
+    [[nodiscard]] Lease AcquireControlLease() const noexcept;
 
 private:
     std::shared_ptr<SharedState> mState;

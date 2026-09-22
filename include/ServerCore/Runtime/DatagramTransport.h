@@ -3,6 +3,7 @@
 #include "ServerCore/Core/Error.h"
 #include "ServerCore/Protocol/DatagramCodec.h"
 #include "ServerCore/Protocol/Message.h"
+#include "ServerCore/Protocol/BinaryMessage.h"
 #include "ServerCore/Session/Session.h"
 
 #include <cstddef>
@@ -21,6 +22,12 @@ struct DatagramPollBudget
     std::size_t maximumBytes = 1024 * 1024;
 };
 
+struct DatagramTransportOptions
+{
+    std::size_t maxRegisteredSessions = 256;
+    Protocol::PayloadMode payloadMode = Protocol::PayloadMode::Json;
+};
+
 /// Nonblocking IPv4 transport for token-addressed JSON messages using DatagramCodec.
 /// The reliable control channel owns session identity and distributes tokens securely.
 /// Call UnregisterSession when that session ends. Tokens are bearer capabilities, not encryption.
@@ -30,6 +37,8 @@ class DatagramTransport final
 public:
     using Admission = std::function<bool(Session::SessionId, const Protocol::Message&)>;
     using Receiver = std::function<void(Session::SessionId, const Protocol::Message&)>;
+    using BinaryAdmission = std::function<bool(Session::SessionId, Protocol::BinaryMessageView)>;
+    using BinaryReceiver = std::function<void(Session::SessionId, Protocol::BinaryMessageView)>;
 
     struct Metrics
     {
@@ -47,6 +56,9 @@ public:
     DatagramTransport(const DatagramTransport&) = delete;
     DatagramTransport& operator=(const DatagramTransport&) = delete;
 
+    /// Before the first successful Bind only. Positive registry cap <= 65,536; exhaustion returns WouldBlock.
+    [[nodiscard]] Core::Status Configure(const DatagramTransportOptions& options);
+
     /// Numeric IPv4 only; port zero asks the OS for an ephemeral port.
     [[nodiscard]] Core::Status Bind(std::string_view address, std::uint16_t port);
     /// Clears registrations; lifetime metrics are retained. Safe to repeat.
@@ -55,6 +67,13 @@ public:
     [[nodiscard]] Core::Result<Protocol::DatagramCodec::Token> RegisterSession(Session::SessionId id);
     void UnregisterSession(Session::SessionId id) noexcept;
     [[nodiscard]] bool IsReady(Session::SessionId id) const noexcept;
+    [[nodiscard]] std::size_t RegisteredSessionCount() const noexcept;
+    [[nodiscard]] Core::Result<Protocol::DatagramCodec::Token> GetToken(Session::SessionId id) const;
+    [[nodiscard]] Core::Status SendBinary(Session::SessionId id, std::uint32_t type,
+        std::span<const std::byte> payload) noexcept;
+    /// Binary mode only. Same token/replay/endpoint admission rules as Poll; views are callback-local.
+    void PollBinary(const BinaryAdmission& admission, const BinaryReceiver& receiver,
+        DatagramPollBudget budget = {}) noexcept;
 
     /// Sends an already serialized UTF-8 JSON envelope without queuing or parsing it again.
     /// Payload excludes the TCP length prefix and UDP header; this transport adds its own header.
@@ -83,6 +102,10 @@ public:
     [[nodiscard]] Metrics SnapshotMetrics() const noexcept;
 
 private:
+    using PayloadAdmission = std::function<bool(Session::SessionId, std::span<const std::byte>)>;
+    using PayloadReceiver = std::function<void(Session::SessionId, std::span<const std::byte>)>;
+    void PollPayload(const PayloadAdmission&, const PayloadReceiver&, DatagramPollBudget) noexcept;
+    [[nodiscard]] Core::Status SendPayload(Session::SessionId, std::span<const std::byte>) noexcept;
     struct Impl;
     std::unique_ptr<Impl> mImpl;
 };

@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.21)
+project(ServerCoreCAbiConsumer LANGUAGES C)
+find_package(ServerCore CONFIG REQUIRED COMPONENTS CAbi PATHS "${SERVERCORE_PACKAGE_PREFIX}" NO_DEFAULT_PATH)
+add_executable(CAbiConsumer main.c)
+target_link_libraries(CAbiConsumer PRIVATE ServerCore::CAbi)
+if (WIN32)
+    add_custom_command(TARGET CAbiConsumer POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:ServerCore::CAbi> $<TARGET_FILE_DIR:CAbiConsumer>)
+endif ()
+enable_testing()
+add_test(NAME CAbiConsumer.Runs COMMAND CAbiConsumer)

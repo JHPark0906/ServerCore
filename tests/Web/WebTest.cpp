@@ -507,6 +507,83 @@ void WebSocketSendValidationSymmetry()
     }
 }
 
+void GlobalSendBudget()
+{
+    using ServerCore::Core::ErrorCode;
+    const std::string payload(256, 'b');
+    for (const std::size_t capacity : {std::size_t{64}, std::size_t{1024}})
+    {
+        std::atomic<unsigned int> requests{0};
+        std::atomic<unsigned int> upgrades{0};
+        std::atomic<unsigned int> opens{0};
+        std::atomic<unsigned int> closes{0};
+        std::atomic<ErrorCode> sent{ErrorCode::WouldBlock};
+        Web::HttpServer server;
+        ExpectTrue(server.RegisterRoute("GET", "/budget", [&](const Web::HttpRequest&)
+        {
+            requests.fetch_add(1);
+            return Web::HttpResponse{200, {}, payload, true};
+        }).IsOk(), "send-budget HTTP route registers");
+        Web::WebSocketCallbacks callbacks;
+        callbacks.accept = [&upgrades](const Web::HttpRequest&)
+        {
+            upgrades.fetch_add(1);
+            return true;
+        };
+        callbacks.onOpen = [&](const std::shared_ptr<Web::WebSocketConnection>& connection)
+        {
+            opens.fetch_add(1);
+            sent.store(connection->SendText(payload).Code());
+        };
+        callbacks.onClose = [&closes](std::uint64_t, std::uint16_t, std::string_view) { closes.fetch_add(1); };
+        ExpectTrue(server.RegisterWebSocket("/ws", std::move(callbacks)).IsOk(), "send-budget WebSocket route registers");
+        Web::HttpServerOptions options;
+        options.port = FreePort();
+        options.maxTotalSendQueueCapacityBytes = 0;
+        ExpectTrue(server.Start(options).Code() == ErrorCode::InvalidArgument,
+            "zero total send budget is invalid");
+        options.maxTotalSendQueueCapacityBytes = std::size_t{512} * 1024 * 1024 + 1;
+        ExpectTrue(server.Start(options).Code() == ErrorCode::InvalidArgument,
+            "total send budget above 512 MiB is invalid");
+        options.maxTotalSendQueueCapacityBytes = capacity;
+        ExpectTrue(server.Start(options).IsOk(), "valid send budget starts after rejected configurations");
+        if (!server.IsRunning()) continue;
+        {
+            Client client(server.Port());
+            client.Send("GET /budget HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            if (capacity == 64)
+                ExpectTrue(client.Closed(), "HTTP wire larger than the total budget is rejected before any bytes are sent");
+            else
+            {
+                const auto response = client.Response();
+                ExpectTrue(response.starts_with("HTTP/1.1 200 ") && response.ends_with(payload),
+                    "HTTP response within the configured total budget is delivered");
+                ExpectTrue(client.Closed(), "successful close response drains normally");
+            }
+        }
+        {
+            Client client(server.Port());
+            client.Send(handshake);
+            if (capacity == 64)
+                ExpectTrue(client.Closed(), "WebSocket handshake also honors the configured total send budget");
+            else
+            {
+                ExpectTrue(client.Response().starts_with("HTTP/1.1 101 "), "WebSocket handshake fits the larger total budget");
+                const auto frame = client.Frame();
+                ExpectTrue(frame.first == 1 && frame.second == payload,
+                    "WebSocket application frame fits the larger total budget");
+            }
+        }
+        ExpectTrue(server.Stop().IsOk(), "send-budget server stops");
+        ExpectTrue(requests.load() == 1 && upgrades.load() == 1,
+            "budget checks run after valid HTTP routing and WebSocket acceptance");
+        ExpectTrue(opens.load() == (capacity == 64 ? 0u : 1u) && closes.load() == opens.load(),
+            "rejected upgrade has no open or close callback, accepted upgrade closes once");
+        ExpectTrue(sent.load() == (capacity == 64 ? ErrorCode::WouldBlock : ErrorCode::Ok),
+            "application WebSocket send only runs after a successful handshake");
+    }
+}
+
 void LimitsAndShutdown()
 {
     ServerCoreTest::SocketRuntime runtime;
@@ -551,6 +628,7 @@ void LimitsAndShutdown()
     ExpectTrue(server.Stop().IsOk(), "bounded server shuts down");
     ExpectTrue(selfStopRejected.load() && closes.load() == 1, "callback self-join is rejected and close is delivered once");
     ExpectTrue(server.Stop().IsOk() && !server.Start(options).IsOk(), "stop is idempotent and host is single-use");
+    GlobalSendBudget();
 }
 
 void WebSocketRejectsProtocolErrors()

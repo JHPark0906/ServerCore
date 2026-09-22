@@ -114,7 +114,8 @@ struct ConnectionSendOutcome
 /// - 관찰자를 걸기 전에 이미 끊긴 연결에 관찰자를 걸면 통지가 그때 간다. 관찰자를 끝내
 ///   걸지 않으면 통지는 갈 곳이 없어 사라진다. "정확히 한 번"은 관찰자가 걸린 연결에 대한
 ///   약속이며, 관찰자가 이미 소멸한 경우는 포함하지 않는다.
-/// - 바이트가 실제로 나갔는지 알려 주지 않는다. 보낼 큐에서 빠졌다는 것을 알리는 창구가 없다.
+/// - 원격 수신 완료를 알려 주지 않는다. 로컬 송신 용량 알림은 선택적
+///   ConnectionFlowControl 인터페이스로 제공한다.
 /// </remarks>
 class Connection
 {
@@ -134,7 +135,7 @@ public:
     /// <returns>
     /// 이미 닫혔거나 CloseAfterSend()가 요청되었으면 Closed. 닫힘을 빈 요청보다 먼저 보므로,
     /// 그 두 상태에서는 비어 있는 것을 보내도 Closed다. 이 연결의 보낼 큐가
-    /// SendQueueLimitBytes를 넘거나 실행 환경이 주입한 공유 송신 예산이 차면 WouldBlock이며,
+    /// 구성된 연결 상한(기본 SendQueueLimitBytes)이나 공유 송신 예산이 차면 WouldBlock이며,
     /// 이때 한 바이트도 담기지 않는다. 절반만 담으면 상대가 받는 바이트 흐름이 깨지기 때문이다.
     /// 소켓 호출이나 큐 할당이 실패하면 PlatformError이며, 소켓 실패의 설명 문자열에는
     /// OS 오류 코드(Windows WSAGetLastError 또는 Linux errno)가 들어간다. 다만 그 설명 문자열을 만들 메모리조차

@@ -10,6 +10,15 @@ endif ()
 
 # NO_DEFAULT_PATH가 없으면 개발기 어딘가에 남은 다른 ServerCore package를 찾을 수 있다.
 # 이 consumer는 바로 앞 단계가 만든 install prefix만으로 패키지가 완결되는지를 본다.
+# Pre-1.0 API changes must not silently satisfy a previous minor's request.
+if (SERVERCORE_PACKAGE_VERSION MATCHES "^0\\.([0-9]+)\\." AND CMAKE_MATCH_1 GREATER 0)
+    math(EXPR previousMinor "${CMAKE_MATCH_1} - 1")
+    find_package(ServerCore "0.${previousMinor}.0" QUIET CONFIG
+            NO_DEFAULT_PATH PATHS "${SERVERCORE_PACKAGE_PREFIX}")
+    if (ServerCore_FOUND)
+        message(FATAL_ERROR "A pre-1.0 package must reject a previous minor version.")
+    endif ()
+endif ()
 find_package(ServerCore "${SERVERCORE_PACKAGE_VERSION}" EXACT CONFIG REQUIRED
         NO_DEFAULT_PATH
         PATHS "${SERVERCORE_PACKAGE_PREFIX}")

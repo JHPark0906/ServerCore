@@ -4,7 +4,6 @@
 
 #include "ServerCore/Core/Assert.h"
 #include "ServerCore/Core/Clock.h"
-#include "ServerCore/Core/JobQueue.h"
 #include "ServerCore/Core/Logging.h"
 #include "ServerCore/Net/Acceptor.h"
 #include "ServerCore/Net/Connection.h"
@@ -12,8 +11,6 @@
 #include "ServerCore/Runtime/JobRunner.h"
 #include "ServerCore/Runtime/PeriodicRunner.h"
 
-#include "Net/AcceptorInternal.h"
-#include "Net/ConnectionInternal.h"
 #include "Runtime/ParseWorkerPoolInternal.h"
 #if defined(SERVERCORE_ENABLE_TEST_HOOKS)
 #include "Runtime/ServerHostTestAccess.h"
@@ -134,10 +131,12 @@ constexpr std::string_view HostConfigMaxTotalPendingParseTasksKey =
 [[nodiscard]] std::chrono::milliseconds SessionTimeoutScanPeriod(
     const ServerHostOptions& options) noexcept
 {
-    const std::chrono::milliseconds timeout = options.idleSessionTimeout.count() == 0
+    std::chrono::milliseconds timeout = options.idleSessionTimeout.count() == 0
                                                  ? options.gracefulCloseTimeout
                                                  : std::min(options.idleSessionTimeout,
                                                        options.gracefulCloseTimeout);
+    for (const auto extra : {options.frameCompletionTimeout, options.authenticationTimeout})
+        if (extra.count() != 0) timeout = std::min(timeout, extra);
     // 유휴 검사가 꺼져 있어도 graceful 종료 기한은 검사한다. 짧은 제한이 긴 제한의 검사 주기를
     // 기다리지 않게 하고, 아주 작은 값에서도 busy loop를 만들지는 않는다.
     return std::clamp(timeout / 4, MinimumSessionTimeoutScanPeriod, MaximumSessionTimeoutScanPeriod);
@@ -145,6 +144,13 @@ constexpr std::string_view HostConfigMaxTotalPendingParseTasksKey =
 
 [[nodiscard]] Core::Status ValidateOptions(const ServerHostOptions& options)
 {
+    if (options.maxPendingReceiveChunks == 0 || options.maxPendingReceiveChunks > 65536)
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+    if (options.frameCompletionTimeout.count() < 0 || options.authenticationTimeout.count() < 0 ||
+        (options.payloadMode != Protocol::PayloadMode::Json && options.payloadMode != Protocol::PayloadMode::Binary) ||
+        (options.payloadMode == Protocol::PayloadMode::Binary && options.parseWorkerThreadCount != 0) ||
+        (options.payloadMode == Protocol::PayloadMode::Binary && options.maxBodySize < Protocol::BinaryMessageHeaderSize))
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
     if (options.port == 0)
     {
         return Core::Status::Fail(
@@ -386,11 +392,6 @@ constexpr std::string_view HostConfigMaxTotalPendingParseTasksKey =
     return Core::Status::Ok();
 }
 
-void LogStatus(const Core::LogLevel level, const Core::Status& status) noexcept
-{
-    Core::GetGlobalLogger().Write(level, status.Message());
-}
-
 #if defined(SERVERCORE_ENABLE_TEST_HOOKS)
 struct BeforeParseGateSlot
 {
@@ -628,11 +629,19 @@ public:
     Core::Status Configure(const Core::Config& config);
     Core::Status Configure(const ServerHostOptions& options);
     void SetLogger(std::shared_ptr<Core::ILogger> logger);
+    Core::Status SetBinaryHandler(ServerHost::BinaryHandler handler);
+    Core::Status AttachDatagramTransport(std::shared_ptr<DatagramTransport> transport);
+    Core::Result<Protocol::DatagramCodec::Token> GetDatagramToken(Session::SessionId id) const;
+    void LogStatus(Core::LogLevel level, const Core::Status& status) const noexcept
+    { if (mLogger) mLogger->Write(level, status.Message()); }
     Dispatch::Dispatcher& GetDispatcher() noexcept;
     const Session::SessionRegistry& GetSessions() const noexcept;
     [[nodiscard]] JobRunner::Lease GetJobRunner() const noexcept;
     void SetSessionObserver(std::weak_ptr<Session::ISessionObserver> observer);
     Core::Status Start();
+    Core::Status BeginDrain();
+    Core::Status DrainStatus() const;
+    Core::Status StopGracefully(std::chrono::steady_clock::time_point deadline);
     void Stop();
     int Run();
     [[nodiscard]] bool IsRunning() const noexcept;
@@ -671,6 +680,7 @@ private:
     void CompleteFailedStart() noexcept;
     void CloseAllSessions() noexcept;
     void CloseExpiredSessionsOnRunner();
+    void AdvanceDrain();
     [[nodiscard]] bool BeginNetworkSession();
 
     mutable std::mutex mLifecycleMutex;
@@ -678,12 +688,16 @@ private:
     Lifecycle mLifecycle = Lifecycle::Ready;
     bool mConfigured = false;
     bool mStopRequestedDuringStart = false;
+    bool mDrainStarting = false;
+    bool mDrainSendsStarted = false;
     std::size_t mOutstandingSessions = 0;
     std::size_t mInFlightCloseNotifications = 0;
     std::vector<std::shared_ptr<NetworkSession>> mSessionSlots;
 
     ServerHostOptions mOptions;
     std::shared_ptr<Core::ILogger> mLogger;
+    std::shared_ptr<DatagramTransport> mDatagrams;
+    ServerHost::BinaryHandler mBinaryHandler;
     std::weak_ptr<Session::ISessionObserver> mSessionObserver;
 
     Dispatch::Dispatcher mDispatcher;
@@ -696,6 +710,7 @@ private:
     std::unique_ptr<Net::Acceptor> mAcceptor;
 
     std::atomic<bool> mAccepting{ false };
+    std::atomic<bool> mDraining{ false };
     std::atomic<bool> mRunning{ false };
     std::atomic<std::uint16_t> mPort{ 0 };
     std::atomic<std::size_t> mPendingReceiveBytes{ 0 };
@@ -917,6 +932,7 @@ private:
 
         ~FinalizationDeferral()
         {
+            mSession.RequestCancellationIfClosing();
             if (mActive)
             {
                 mSession.CompleteLifecycleNotification();
@@ -960,6 +976,33 @@ public:
         return mSessionState.load(std::memory_order_acquire);
     }
 
+    [[nodiscard]] std::stop_token GetCancellationToken() const noexcept override
+    { return mCancellation.get_token(); }
+
+    void RequestCancellationIfClosing() noexcept
+    {
+        const auto state = State();
+        if (state == ServerCore::Session::SessionState::Closing || state == ServerCore::Session::SessionState::Closed)
+            mCancellation.request_stop();
+    }
+
+    Core::Status SendBinary(const std::uint32_t type, const std::span<const std::byte> payload) override
+    {
+        FinalizationDeferral finalization(*this);
+        const std::lock_guard guard(mOutboundMutex);
+        const auto host = mHost.lock();
+        if (!CanSendLocked() || !host) return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+        if (host->mOptions.payloadMode != Protocol::PayloadMode::Binary)
+            return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+        auto encoded = Protocol::EncodeBinaryMessage(type, payload, mMaxBodySize);
+        if (!encoded.IsOk()) return std::move(encoded).TakeStatus();
+        auto framed = Protocol::EncodeFrame(encoded.Value(), mMaxBodySize);
+        if (!framed.IsOk()) return std::move(framed).TakeStatus();
+        auto outcome = mConnection->SendWithOutcome(framed.Value());
+        if (outcome.status.IsOk()) host->RecordQueuedSendFrame();
+        return std::move(outcome.status);
+    }
+
     Core::Status MarkAuthenticated() override
     {
         const std::shared_ptr<ServerHost::State> host = mHost.lock();
@@ -970,6 +1013,13 @@ public:
         if (!host->mJobRunner.IsCurrentThread())
         {
             return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+        }
+        const auto authTimeout = host->mOptions.authenticationTimeout.count();
+        if (State() == ServerCore::Session::SessionState::Connected && authTimeout > 0 &&
+            Core::MillisecondsSinceProcessStart() - mCreatedAt >= static_cast<std::uint64_t>(authTimeout))
+        {
+            Disconnect(Core::Status::FailWithoutMessage(Core::ErrorCode::Timeout));
+            return Core::Status::FailWithoutMessage(Core::ErrorCode::Timeout);
         }
 
         const std::shared_ptr<NetworkSession> self = shared_from_this();
@@ -1065,6 +1115,8 @@ public:
         {
             return RecordAndReturn(Core::Status::FailWithoutMessage(Core::ErrorCode::Closed));
         }
+        if (const auto host = mHost.lock(); host && host->mOptions.payloadMode != Protocol::PayloadMode::Json)
+            return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
 
         // 준비 객체를 이동한 뒤의 빈 저장소는 정상 봉투가 아니다. 프레이머는 범용이라
         // 0길이 body도 인코딩하므로 메시지 계약을 이 경계에서 지킨다.
@@ -1176,13 +1228,6 @@ public:
         WaitBeforeSessionReceiveForTest();
 #endif
 
-        {
-            // 유휴 검사와 이 갱신은 같은 잠금을 쓴다. 검사 쪽이 오래된 시각을 읽은 뒤
-            // SendAndDisconnect()의 drain을 강제로 취소하는 일을 막기 위한 수명 경계다.
-            const std::lock_guard<std::mutex> guard(mIdleMutex);
-            mLastReceivedMilliseconds = Core::MillisecondsSinceProcessStart();
-        }
-
         const ServerCore::Session::SessionState state =
             mSessionState.load(std::memory_order_acquire);
         if (state == ServerCore::Session::SessionState::Closing ||
@@ -1197,10 +1242,27 @@ public:
             mConnection->Close();
             return;
         }
-        if (!host->IsAccepting())
+        if (!host->IsAccepting() || host->mDraining.load(std::memory_order_acquire))
         {
             return;
         }
+
+        bool rateExceeded = false;
+        const auto receivedAt = Core::MillisecondsSinceProcessStart();
+        {
+            const std::lock_guard guard(mIdleMutex);
+            mLastReceivedMilliseconds = receivedAt;
+            if (receivedAt - mByteWindowStarted >= 1000)
+            { mByteWindowStarted = receivedAt; mByteWindowBytes = 0; }
+            const auto limit = host->mOptions.maxInputBytesPerSecond;
+            if (limit != 0)
+            {
+                rateExceeded = bytes.size() > limit || mByteWindowBytes > limit - bytes.size();
+                if (!rateExceeded) mByteWindowBytes += bytes.size();
+            }
+        }
+        if (rateExceeded)
+        { FailAndDisconnect(Core::Status::FailWithoutMessage(Core::ErrorCode::TooLarge)); return; }
 
         bool queueReceiveJob = false;
         bool reservedHostReceiveBytes = false;
@@ -1209,8 +1271,10 @@ public:
         {
             {
                 const std::lock_guard<std::mutex> guard(mReceiveMutex);
+                if (mInputClosed) return;
                 const std::size_t limit = static_cast<std::size_t>(mMaxPendingReceiveBytes);
-                if (bytes.size() > limit || mBufferedReceiveBytes > limit - bytes.size())
+                if (bytes.size() > limit || mBufferedReceiveBytes > limit - bytes.size() ||
+                    mBufferedReceiveChunks >= host->mOptions.maxPendingReceiveChunks)
                 {
                     rejected = Core::Status::Fail(Core::ErrorCode::TooLarge,
                         "the session exceeded its pending receive byte limit");
@@ -1223,9 +1287,18 @@ public:
                 else
                 {
                     reservedHostReceiveBytes = true;
-                    mPendingReceiveBytes.insert(
-                        mPendingReceiveBytes.end(), bytes.begin(), bytes.end());
+                    mPendingReceiveChunks.push_back({bytes.size(), receivedAt});
+                    try
+                    {
+                        mPendingReceiveBytes.insert(mPendingReceiveBytes.end(), bytes.begin(), bytes.end());
+                    }
+                    catch (...)
+                    {
+                        mPendingReceiveChunks.pop_back();
+                        throw;
+                    }
                     mBufferedReceiveBytes += bytes.size();
+                    ++mBufferedReceiveChunks;
                     if (!mReceiveJobQueued)
                     {
                         mReceiveJobQueued = true;
@@ -1265,7 +1338,7 @@ public:
         try
         {
             const std::shared_ptr<NetworkSession> self = shared_from_this();
-            posted = host->mJobRunner.Post([self]() { self->ConsumePendingBytesOnRunner(); });
+            posted = host->mJobRunner.PostControl([self]() { self->ConsumePendingBytesOnRunner(); });
         }
         catch (const std::bad_alloc&)
         {
@@ -1327,7 +1400,7 @@ public:
 
             const std::shared_ptr<NetworkSession> self = shared_from_this();
             const Core::Status posted =
-                host->mJobRunner.Post([self]() { self->FinalizeOnRunner(); });
+                host->mJobRunner.PostControl([self]() { self->FinalizeOnRunner(); });
             if (!posted.IsOk())
             {
                 // 정상 Host 종료 중에는 JobRunner가 이 작업을 drain하므로 여기에 오지 않는다.
@@ -1382,7 +1455,12 @@ public:
                 }
                 else
                 {
-                    registered = host->mRegistry.Register(self);
+                    if (host->mDatagrams)
+                    {
+                        auto token = host->mDatagrams->RegisterSession(mId);
+                        if (!token.IsOk()) registered = std::move(token).TakeStatus();
+                    }
+                    if (registered.IsOk()) registered = host->mRegistry.Register(self);
                     if (registered.IsOk())
                     {
                         mRegistered.store(true, std::memory_order_release);
@@ -1454,7 +1532,7 @@ public:
 
 private:
     void ConsumePendingBytesOnRunner();
-    void CompleteReceiveBatchOnRunner(std::size_t batchSize);
+    void CompleteReceiveBatchOnRunner(std::size_t batchSize, std::size_t chunks);
     void DiscardQueuedReceiveBytes();
     void DiscardUnregisteredId() noexcept;
     void FinalizeAfterRunnerFailure() noexcept;
@@ -1463,6 +1541,20 @@ public:
     [[nodiscard]] std::size_t QueuedSendBytes() const noexcept override
     {
         return mConnection->QueuedSendBytes();
+    }
+
+    void DrainSends()
+    {
+        FinalizationDeferral finalization(*this);
+        const std::lock_guard guard(mOutboundMutex);
+        if (BeginGracefulCloseLocked(Core::Status::FailWithoutMessage(Core::ErrorCode::Closed)))
+            mConnection->CloseAfterSend();
+    }
+
+    void StopReceiving() noexcept
+    {
+        const std::lock_guard guard(mReceiveMutex);
+        mInputClosed = true;
     }
 
     /// <summary>graceful 절대 기한이나 열린 세션의 유휴 제한을 넘겼으면 즉시 닫는다.</summary>
@@ -1495,6 +1587,21 @@ public:
             // OnDisconnected가 세션 슬롯을 반환한다. 새 할당도 필요하지 않다.
             mConnection->Close();
             return true;
+        }
+        const auto host = mHost.lock();
+        if (host)
+        {
+            const auto elapsed = [nowMilliseconds](std::uint64_t start, std::chrono::milliseconds timeout)
+            { return timeout.count() > 0 && nowMilliseconds >= start &&
+                nowMilliseconds - start >= static_cast<std::uint64_t>(timeout.count()); };
+            const auto incomplete = mIncompleteStarted.load(std::memory_order_acquire);
+            if ((state == ServerCore::Session::SessionState::Connected &&
+                    elapsed(mCreatedAt, host->mOptions.authenticationTimeout)) ||
+                (incomplete != 0 && elapsed(incomplete - 1, host->mOptions.frameCompletionTimeout)))
+            {
+                DisconnectLocked(Core::Status::FailWithoutMessage(Core::ErrorCode::Timeout));
+                return true;
+            }
         }
         if (idleTimeoutMilliseconds == 0 || mLastReceivedMilliseconds > nowMilliseconds ||
             nowMilliseconds - mLastReceivedMilliseconds < idleTimeoutMilliseconds)
@@ -1611,6 +1718,9 @@ private:
     [[nodiscard]] Core::Result<std::vector<std::byte>> PrepareOutboundFrame(
         const Protocol::MessageFields& fields) const
     {
+        if (const auto host = mHost.lock(); host && host->mOptions.payloadMode != Protocol::PayloadMode::Json)
+            return Core::Result<std::vector<std::byte>>::FromStatus(
+                Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument));
         Core::Result<std::vector<std::byte>> serialized = Protocol::SerializeMessage(fields);
         if (!serialized.IsOk())
         {
@@ -1627,7 +1737,7 @@ private:
         Disconnect(std::move(failure));
     }
 
-    void ConsumeBytesOnRunner(const std::vector<std::byte>& bytes)
+    void ConsumeBytesOnRunner(const std::span<const std::byte> bytes)
     {
         const std::shared_ptr<ServerHost::State> host = mHost.lock();
         if (host == nullptr || !host->mJobRunner.IsCurrentThread())
@@ -1643,6 +1753,12 @@ private:
             return;
         }
 
+        const auto incomplete = mIncompleteStarted.load(std::memory_order_acquire);
+        const auto timeout = host->mOptions.frameCompletionTimeout.count();
+        if (incomplete != 0 && timeout > 0 && mCurrentBatchReceivedAt >= incomplete - 1 &&
+            mCurrentBatchReceivedAt - (incomplete - 1) >= static_cast<std::uint64_t>(timeout))
+        { FailAndDisconnect(Core::Status::FailWithoutMessage(Core::ErrorCode::Timeout)); return; }
+
         if (mParseAccounting == nullptr)
         {
             ConsumeSynchronouslyOnRunner(host, bytes);
@@ -1652,8 +1768,30 @@ private:
         ConsumeWithParseWorkersOnRunner(bytes);
     }
 
+    static bool AdmitFrame(void* context, std::size_t size) noexcept
+    {
+        auto& self = *static_cast<NetworkSession*>(context);
+        const auto host = self.mHost.lock();
+        if (!host) return false;
+        if (self.mCurrentBatchReceivedAt - self.mFrameWindowStarted >= 1000)
+        { self.mFrameWindowStarted = self.mCurrentBatchReceivedAt; self.mFrameWindowCount = 0; }
+        const auto maximum = host->mOptions.maxInputFramesPerSecond;
+        if (maximum != 0 && self.mFrameWindowCount >= maximum) return false;
+        if (maximum != 0) ++self.mFrameWindowCount;
+        return self.mAppendParseAdmission == nullptr || ParseAdmission::Admit(self.mAppendParseAdmission, size);
+    }
+
+    void UpdateFrameDeadline(std::size_t completedBefore) noexcept
+    {
+        if (!mFrameReader.HasIncompleteFrame())
+            mIncompleteStarted.store(0, std::memory_order_release);
+        else if (mIncompleteStarted.load(std::memory_order_relaxed) == 0 ||
+            mFrameReader.CompletedFrameCount() > completedBefore)
+            mIncompleteStarted.store(mCurrentBatchReceivedAt + 1, std::memory_order_release);
+    }
+
     void ConsumeSynchronouslyOnRunner(
-        const std::shared_ptr<ServerHost::State>& host, const std::vector<std::byte>& bytes)
+        const std::shared_ptr<ServerHost::State>& host, const std::span<const std::byte> bytes)
     {
         Core::Status appended = Core::Status::Ok();
         {
@@ -1666,7 +1804,9 @@ private:
             {
                 return;
             }
-            appended = mFrameReader.Append(bytes);
+            const auto completeBefore = mFrameReader.CompletedFrameCount();
+            appended = mFrameReader.Append(bytes, this, &NetworkSession::AdmitFrame);
+            UpdateFrameDeadline(completeBefore);
         }
         if (!appended.IsOk())
         {
@@ -1693,6 +1833,21 @@ private:
             }
 
             host->RecordReceivedFrame();
+
+            if (host->mOptions.payloadMode == Protocol::PayloadMode::Binary)
+            {
+                auto message = Protocol::DecodeBinaryMessage(frame.Value());
+                if (!message.IsOk()) { FailAndDisconnect(std::move(message).TakeStatus()); return; }
+                if (!BeginMessageDispatch()) return;
+                Core::Status dispatched = Core::Status::Ok();
+                try { dispatched = host->mBinaryHandler(shared_from_this(), message.Value()); }
+                catch (...) { CompleteLifecycleNotification(); throw; }
+                CompleteLifecycleNotification();
+                if (!dispatched.IsOk()) { host->RecordError(dispatched); host->LogStatus(Core::LogLevel::Warn, dispatched); }
+                const auto state = State();
+                if (state == ServerCore::Session::SessionState::Closing || state == ServerCore::Session::SessionState::Closed) return;
+                continue;
+            }
 
             Core::Result<Protocol::Message> message = Protocol::ParseMessage(frame.Value());
             if (!message.IsOk())
@@ -1722,7 +1877,7 @@ private:
                 host->RecordError(dispatched);
                 // L4는 handler 거부, type별 body 상한, body 없는 error 봉투를 연결 종료로
                 // 번역하지 않는다. UnknownType의 Disconnect 정책도 Dispatcher가 이미 처리한다.
-                LogStatus(Core::LogLevel::Warn, dispatched);
+                host->LogStatus(Core::LogLevel::Warn, dispatched);
             }
 
             const ServerCore::Session::SessionState afterDispatch =
@@ -1735,7 +1890,7 @@ private:
         }
     }
 
-    void ConsumeWithParseWorkersOnRunner(const std::vector<std::byte>& bytes)
+    void ConsumeWithParseWorkersOnRunner(const std::span<const std::byte> bytes)
     {
         SERVERCORE_ASSERT(mParseAccounting != nullptr,
             "parse worker consumption requires a NetworkSession parse accounting ledger");
@@ -1754,7 +1909,10 @@ private:
             const std::size_t completedBytesBefore = mFrameReader.CompletedBodyBytes();
             const std::size_t completedFramesBefore = mFrameReader.CompletedFrameCount();
             ParseAdmission admission(*mParseAccounting);
-            appended = mFrameReader.Append(bytes, &admission, &ParseAdmission::Admit);
+            mAppendParseAdmission = &admission;
+            appended = mFrameReader.Append(bytes, this, &NetworkSession::AdmitFrame);
+            mAppendParseAdmission = nullptr;
+            UpdateFrameDeadline(completedFramesBefore);
 
             const std::size_t completedBytesAfter = mFrameReader.CompletedBodyBytes();
             const std::size_t completedFramesAfter = mFrameReader.CompletedFrameCount();
@@ -1898,7 +2056,7 @@ private:
 
                     try
                     {
-                        Core::Status completed = runner.Post(
+                        Core::Status completed = runner.PostControl(
                             [self, work]() mutable
                             {
                                 if (const std::shared_ptr<NetworkSession> session = self.lock())
@@ -2028,7 +2186,7 @@ private:
         if (!dispatched.IsOk())
         {
             host->RecordError(dispatched);
-            LogStatus(Core::LogLevel::Warn, dispatched);
+            host->LogStatus(Core::LogLevel::Warn, dispatched);
         }
 
         const ServerCore::Session::SessionState afterDispatch =
@@ -2062,6 +2220,7 @@ private:
 
     void FinalizeOnRunner()
     {
+        RequestCancellationIfClosing();
         const std::shared_ptr<ServerHost::State> host = mHost.lock();
         if (host == nullptr)
         {
@@ -2093,7 +2252,7 @@ private:
             const Core::Status unregistered = host->mRegistry.Unregister(mId);
             if (!unregistered.IsOk() && unregistered.Code() != Core::ErrorCode::NotFound)
             {
-                LogStatus(Core::LogLevel::Warn, unregistered);
+                host->LogStatus(Core::LogLevel::Warn, unregistered);
             }
         }
         else
@@ -2150,6 +2309,14 @@ private:
     std::weak_ptr<ServerHost::State> mHost;
     ServerCore::Session::SessionId mId;
     std::shared_ptr<Net::Connection> mConnection;
+    std::stop_source mCancellation;
+    const std::uint64_t mCreatedAt = Core::MillisecondsSinceProcessStart();
+    std::atomic<std::uint64_t> mIncompleteStarted{ 0 }; // timestamp + 1, zero means none
+    std::uint64_t mByteWindowStarted = 0;
+    std::size_t mByteWindowBytes = 0;
+    std::uint64_t mFrameWindowStarted = 0;
+    std::size_t mFrameWindowCount = 0;
+    std::uint64_t mCurrentBatchReceivedAt = 0;
     std::uint64_t mLastReceivedMilliseconds = 0;
     // FrameReader는 원래 JobRunner 단일 스레드 전용이다. finalizer Post 실패만 I/O 스레드에서
     // completed payload를 직접 버려야 하므로, 그 fallback과 모든 parser 상태 변경을 직렬화한다.
@@ -2158,16 +2325,21 @@ private:
     std::uint32_t mMaxBodySize;
     std::uint32_t mMaxPendingReceiveBytes;
     std::shared_ptr<ParseAccounting> mParseAccounting;
+    ParseAdmission* mAppendParseAdmission = nullptr;
     std::size_t mUnscheduledParseBytes = 0;
     std::size_t mUnscheduledParseTasks = 0;
     bool mParseInFlight = false;
     std::mutex mIdleMutex;
     std::mutex mReceiveMutex;
     std::vector<std::byte> mPendingReceiveBytes;
+    struct ReceiveChunk { std::size_t bytes; std::uint64_t receivedAt; };
+    std::vector<ReceiveChunk> mPendingReceiveChunks;
+    std::size_t mBufferedReceiveChunks = 0;
     // mPendingReceiveBytes에서 꺼내 처리 중인 batch도 포함한다. vector를 swap했다는 이유로
     // 수신 예산을 먼저 돌려주면 처리 중인 payload와 새 수신이 상한 밖에서 공존할 수 있다.
     std::size_t mBufferedReceiveBytes = 0;
     bool mReceiveJobQueued = false;
+    bool mInputClosed = false;
     std::mutex mOutboundMutex;
     // mOutboundMutex가 보호하며, 시계가 0인 첫 밀리초에도 유효한 시작 시각이므로 optional이다.
     std::optional<std::uint64_t> mGracefulCloseStartedMilliseconds;
@@ -2194,9 +2366,11 @@ void ServerHost::State::NetworkSession::ConsumePendingBytesOnRunner()
     }
 
     std::vector<std::byte> batch;
+    std::vector<ReceiveChunk> chunks;
     {
         const std::lock_guard<std::mutex> guard(mReceiveMutex);
         batch.swap(mPendingReceiveBytes);
+        chunks.swap(mPendingReceiveChunks);
     }
 
     if (batch.empty())
@@ -2211,18 +2385,28 @@ void ServerHost::State::NetworkSession::ConsumePendingBytesOnRunner()
         state == ServerCore::Session::SessionState::Closed)
     {
         const std::size_t batchSize = batch.size();
+        const auto chunkCount = chunks.size();
+        std::vector<ReceiveChunk>().swap(chunks);
         std::vector<std::byte>().swap(batch);
-        CompleteReceiveBatchOnRunner(batchSize);
+        CompleteReceiveBatchOnRunner(batchSize, chunkCount);
         DiscardQueuedReceiveBytes();
         return;
     }
 
     const std::size_t batchSize = batch.size();
-    ConsumeBytesOnRunner(batch);
+    const auto chunkCount = chunks.size();
+    std::size_t offset = 0;
+    for (const auto& chunk : chunks)
+    {
+        mCurrentBatchReceivedAt = chunk.receivedAt;
+        ConsumeBytesOnRunner(std::span(batch).subspan(offset, chunk.bytes));
+        offset += chunk.bytes;
+    }
+    std::vector<ReceiveChunk>().swap(chunks);
     // 다른 I/O thread가 반환된 Host 예산으로 새 수신 vector를 만들기 전에, 이 batch의 실제
     // payload 저장소부터 해제한다.
     std::vector<std::byte>().swap(batch);
-    CompleteReceiveBatchOnRunner(batchSize);
+    CompleteReceiveBatchOnRunner(batchSize, chunkCount);
 
     bool queueContinuation = false;
     bool discardQueuedBytes = false;
@@ -2259,7 +2443,7 @@ void ServerHost::State::NetworkSession::ConsumePendingBytesOnRunner()
         try
         {
             const std::shared_ptr<NetworkSession> self = shared_from_this();
-            posted = host->mJobRunner.Post([self]() { self->ConsumePendingBytesOnRunner(); });
+            posted = host->mJobRunner.PostControl([self]() { self->ConsumePendingBytesOnRunner(); });
         }
         catch (const std::bad_alloc&)
         {
@@ -2276,13 +2460,15 @@ void ServerHost::State::NetworkSession::ConsumePendingBytesOnRunner()
     }
 }
 
-void ServerHost::State::NetworkSession::CompleteReceiveBatchOnRunner(const std::size_t batchSize)
+void ServerHost::State::NetworkSession::CompleteReceiveBatchOnRunner(const std::size_t batchSize,
+    const std::size_t chunks)
 {
     {
         const std::lock_guard<std::mutex> guard(mReceiveMutex);
         SERVERCORE_ASSERT(mBufferedReceiveBytes >= batchSize,
             "completed receive bytes exceeded the NetworkSession budget");
         mBufferedReceiveBytes -= batchSize;
+        mBufferedReceiveChunks -= chunks;
     }
 
     if (const std::shared_ptr<ServerHost::State> host = mHost.lock())
@@ -2300,6 +2486,8 @@ void ServerHost::State::NetworkSession::DiscardQueuedReceiveBytes()
         SERVERCORE_ASSERT(mBufferedReceiveBytes >= queuedBytes,
             "discarded receive bytes exceeded the NetworkSession budget");
         mBufferedReceiveBytes -= queuedBytes;
+        mBufferedReceiveChunks -= mPendingReceiveChunks.size();
+        std::vector<ReceiveChunk>().swap(mPendingReceiveChunks);
         std::vector<std::byte>().swap(mPendingReceiveBytes);
         mReceiveJobQueued = false;
     }
@@ -2336,6 +2524,7 @@ void ServerHost::State::NetworkSession::DiscardUnregisteredId() noexcept
 
 void ServerHost::State::NetworkSession::FinalizeAfterRunnerFailure() noexcept
 {
+    // Deferred callers reach here only after any outbound/notification critical section exits.
     const std::shared_ptr<ServerHost::State> host = mHost.lock();
     if (host == nullptr)
     {
@@ -2368,6 +2557,7 @@ void ServerHost::State::NetworkSession::FinalizeAfterRunnerFailure() noexcept
     // Host aggregate reservation은 finalization 시점에 끝나야 한다. runner와 경합할 수 있으므로
     // FrameReader를 포함한 parser 상태는 전용 잠금 아래 비운다. worker가 가진 한 건은 별도의
     // ParseReservation이 끝날 때 반납된다.
+    RequestCancellationIfClosing();
     DiscardQueuedParseFrames();
 
     // 이 경로는 JobRunner 자체가 더는 정리 작업을 받지 못하는 비정상 경계다. Unregister의
@@ -2380,7 +2570,7 @@ void ServerHost::State::NetworkSession::FinalizeAfterRunnerFailure() noexcept
             const Core::Status unregistered = host->mRegistry.Unregister(mId);
             if (!unregistered.IsOk() && unregistered.Code() != Core::ErrorCode::NotFound)
             {
-                LogStatus(Core::LogLevel::Warn, unregistered);
+                host->LogStatus(Core::LogLevel::Warn, unregistered);
             }
         }
         catch (...)
@@ -2534,6 +2724,28 @@ Core::Status ServerHost::State::Configure(const Core::Config& config)
             return maxTotalPendingParseTasks;
         }
 
+        for (const auto& field : {
+            std::pair{"servercore.host.frame-completion-timeout-ms", &options.frameCompletionTimeout},
+            std::pair{"servercore.host.authentication-timeout-ms", &options.authenticationTimeout}})
+        {
+            const auto value = config.GetInt(field.first);
+            if (value.IsOk()) *field.second = std::chrono::milliseconds(value.Value());
+            else if (value.GetStatus().Code() != Core::ErrorCode::NotFound) return value.GetStatus();
+        }
+        for (const auto& field : {
+            std::pair{"servercore.host.max-input-bytes-per-second", &options.maxInputBytesPerSecond},
+            std::pair{"servercore.host.max-input-frames-per-second", &options.maxInputFramesPerSecond},
+            std::pair{"servercore.host.max-pending-receive-chunks", &options.maxPendingReceiveChunks}})
+        {
+            auto value = ApplyOptionalUint32(config, field.first, *field.second);
+            if (!value.IsOk()) return value;
+        }
+        std::string mode = "json";
+        auto modeStatus = ApplyOptionalString(config, "servercore.host.payload-mode", mode);
+        if (!modeStatus.IsOk()) return modeStatus;
+        if (mode == "binary") options.payloadMode = Protocol::PayloadMode::Binary;
+        else if (mode != "json") return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+
         return Configure(options);
     }
     catch (const std::bad_alloc&)
@@ -2579,6 +2791,8 @@ Core::Status ServerHost::State::Configure(const ServerHostOptions& options)
             Core::ErrorCode::Closed, "ServerHost cannot be configured after startup has begun");
     }
 
+    const auto runnerConfigured = mJobRunner.Configure(options.jobRunner);
+    if (!runnerConfigured.IsOk()) return runnerConfigured;
     mOptions = std::move(*copiedOptions);
     mConfigured = true;
     return Core::Status::Ok();
@@ -2590,6 +2804,35 @@ void ServerHost::State::SetLogger(std::shared_ptr<Core::ILogger> logger)
     SERVERCORE_ASSERT(
         mLifecycle == Lifecycle::Ready, "ServerHost::SetLogger() must be called before Start()");
     mLogger = std::move(logger);
+}
+
+Core::Status ServerHost::State::SetBinaryHandler(ServerHost::BinaryHandler handler)
+{
+    const std::lock_guard guard(mLifecycleMutex);
+    if (mLifecycle != Lifecycle::Ready) return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+    if (!handler) return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+    mBinaryHandler = std::move(handler);
+    return Core::Status::Ok();
+}
+
+Core::Status ServerHost::State::AttachDatagramTransport(std::shared_ptr<DatagramTransport> transport)
+{
+    const std::lock_guard guard(mLifecycleMutex);
+    if (mLifecycle != Lifecycle::Ready) return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+    if (!transport || transport->Port() == 0) return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+    mDatagrams = std::move(transport);
+    return Core::Status::Ok();
+}
+
+Core::Result<Protocol::DatagramCodec::Token> ServerHost::State::GetDatagramToken(Session::SessionId id) const
+{
+    if (!mJobRunner.IsCurrentThread())
+        return Core::Result<Protocol::DatagramCodec::Token>::FromStatus(
+            Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument));
+    if (!mDatagrams)
+        return Core::Result<Protocol::DatagramCodec::Token>::FromStatus(
+            Core::Status::FailWithoutMessage(Core::ErrorCode::NotFound));
+    return mDatagrams->GetToken(id);
 }
 
 Dispatch::Dispatcher& ServerHost::State::GetDispatcher() noexcept
@@ -2691,7 +2934,6 @@ Core::Status ServerHost::State::StartJobRunner()
 Core::Status ServerHost::State::Start()
 {
     std::optional<ServerHostOptions> optionsSnapshot;
-    std::shared_ptr<Core::ILogger> logger;
     {
         const std::lock_guard<std::mutex> guard(mLifecycleMutex);
         if (mLifecycle == Lifecycle::Starting || mLifecycle == Lifecycle::Running)
@@ -2723,13 +2965,14 @@ Core::Status ServerHost::State::Start()
             return PlatformFailureFrom(error);
         }
 
-        logger = mLogger;
+        if (mOptions.payloadMode == Protocol::PayloadMode::Binary && !mBinaryHandler)
+            return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
         mLifecycle = Lifecycle::Starting;
     }
 
     const ServerHostOptions& options = *optionsSnapshot;
 
-    Core::SetGlobalLogger(std::move(logger));
+    mDispatcher.SetLogger(mLogger);
 
     try
     {
@@ -2742,8 +2985,7 @@ Core::Status ServerHost::State::Start()
             mSessionSlots.resize(options.maxConcurrentSessions);
             mIo = std::make_unique<Net::IoContext>();
             mAcceptor = std::make_unique<Net::Acceptor>();
-            Net::AcceptorAccess::SetSendBudget(*mAcceptor,
-                std::make_shared<Net::SendBudget>(options.maxTotalSendQueueCapacityBytes));
+            mAcceptor->SetLogger(mLogger);
             if (options.parseWorkerThreadCount != 0)
             {
                 mParsePool = std::make_unique<ParseWorkerPool>();
@@ -2753,6 +2995,14 @@ Core::Status ServerHost::State::Start()
         {
             CompleteFailedStart();
             return Core::Status::AllocationFailure();
+        }
+
+        Core::Status sendLimitsConfigured = mAcceptor->SetSendQueueLimits(
+            {Net::SendQueueLimitBytes, options.maxTotalSendQueueCapacityBytes});
+        if (!sendLimitsConfigured.IsOk())
+        {
+            CompleteFailedStart();
+            return sendLimitsConfigured;
         }
 
         Core::Status ioStarted = Core::Status::Ok();
@@ -2797,7 +3047,7 @@ Core::Status ServerHost::State::Start()
             try
             {
                 const std::weak_ptr<State> self = weak_from_this();
-                mSessionTimeoutRunner = std::make_unique<PeriodicRunner>(mJobRunner.AcquireLease(),
+                mSessionTimeoutRunner = std::make_unique<PeriodicRunner>(mJobRunner.AcquireControlLease(),
                     SessionTimeoutScanPeriod(options),
                     [self]()
                     {
@@ -2989,6 +3239,92 @@ void ServerHost::State::CompleteFailedStart() noexcept
     mLifecycleChanged.notify_all();
 }
 
+Core::Status ServerHost::State::BeginDrain()
+{
+    Net::Acceptor* acceptor = nullptr;
+    {
+        std::unique_lock guard(mLifecycleMutex);
+        if (mJobRunner.IsCurrentThread() || (mIo && mIo->IsCurrentThreadIoThread()) ||
+            (mParsePool && mParsePool->IsCurrentThread()) || CurrentCloseNotificationDepth(this) != 0)
+            return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+        if (mLifecycle == Lifecycle::Stopped) return Core::Status::Ok();
+        if (mLifecycle != Lifecycle::Running) return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+        if (mDraining.load(std::memory_order_acquire))
+        {
+            mLifecycleChanged.wait(guard, [this] { return !mDrainStarting; });
+            return Core::Status::Ok();
+        }
+        mDrainStarting = true;
+        mDraining.store(true, std::memory_order_release);
+        mRunning.store(false, std::memory_order_release);
+        mPort.store(0, std::memory_order_release);
+        mJobRunner.CloseAdmission();
+        acceptor = mAcceptor.get();
+    }
+    if (acceptor) acceptor->Stop();
+    for (std::size_t index = 0; index < mSessionSlots.size(); ++index)
+    {
+        std::shared_ptr<NetworkSession> session;
+        { const std::lock_guard guard(mLifecycleMutex); session = mSessionSlots[index]; }
+        if (session) session->StopReceiving();
+    }
+    { const std::lock_guard guard(mLifecycleMutex); mDrainStarting = false; }
+    mLifecycleChanged.notify_all();
+    AdvanceDrain();
+    return Core::Status::Ok();
+}
+
+Core::Status ServerHost::State::DrainStatus() const
+{
+    const std::lock_guard guard(mLifecycleMutex);
+    if (mLifecycle == Lifecycle::Stopped) return Core::Status::Ok();
+    if (mLifecycle == Lifecycle::Ready || mLifecycle == Lifecycle::Starting)
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+    if (mDraining.load(std::memory_order_acquire) && mDrainSendsStarted &&
+        mOutstandingSessions == 0 && mInFlightCloseNotifications == 0)
+        return Core::Status::Ok();
+    return Core::Status::FailWithoutMessage(Core::ErrorCode::WouldBlock);
+}
+
+Core::Status ServerHost::State::StopGracefully(const std::chrono::steady_clock::time_point deadline)
+{
+    auto begun = BeginDrain();
+    if (!begun.IsOk()) return begun;
+    bool expired = false;
+    while (!DrainStatus().IsOk())
+    {
+        AdvanceDrain();
+        if (DrainStatus().IsOk()) break;
+        std::unique_lock guard(mLifecycleMutex);
+        if (std::chrono::steady_clock::now() >= deadline) { expired = true; break; }
+        mLifecycleChanged.wait_until(guard, std::min(deadline,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(10)));
+    }
+    Stop();
+    return expired ? Core::Status::FailWithoutMessage(Core::ErrorCode::Timeout) : Core::Status::Ok();
+}
+
+void ServerHost::State::AdvanceDrain()
+{
+    {
+        const std::lock_guard guard(mLifecycleMutex);
+        // The periodic control callback itself occupies one slot; external drain polling does not.
+        if (!mDraining.load(std::memory_order_acquire) || mDrainStarting || mDrainSendsStarted ||
+            mLifecycle != Lifecycle::Running || mPendingReceiveBytes.load(std::memory_order_acquire) != 0 ||
+            mPendingParseTasks.load(std::memory_order_acquire) != 0 ||
+            mJobRunner.OutstandingCount() > (mJobRunner.IsCurrentThread() ? 1u : 0u))
+            return;
+        mDrainSendsStarted = true;
+    }
+    for (std::size_t index = 0; index < mSessionSlots.size(); ++index)
+    {
+        std::shared_ptr<NetworkSession> session;
+        { const std::lock_guard guard(mLifecycleMutex); session = mSessionSlots[index]; }
+        if (session) session->DrainSends();
+    }
+    mLifecycleChanged.notify_all();
+}
+
 void ServerHost::State::Stop()
 {
     Net::Acceptor* acceptor = nullptr;
@@ -3032,6 +3368,7 @@ void ServerHost::State::Stop()
             }
             mLifecycleChanged.wait(guard);
         }
+        mLifecycleChanged.wait(guard, [this] { return !mDrainStarting; });
 
         if (mLifecycle == Lifecycle::Ready)
         {
@@ -3169,6 +3506,7 @@ Core::Result<ServerMetricsSnapshot> ServerHost::State::SnapshotMetrics() const
             static_cast<std::uint32_t>(mOptions.parseWorkerThreadCount);
         snapshot.pendingReceiveBytes = mPendingReceiveBytes.load(std::memory_order_acquire);
         snapshot.pendingJobCount = mJobRunner.PendingCount();
+        snapshot.jobs = mJobRunner.GetMetrics();
         snapshot.pendingParseBytes = mPendingParseBytes.load(std::memory_order_acquire);
         snapshot.pendingParseTaskCount = mPendingParseTasks.load(std::memory_order_acquire);
         snapshot.receivedFrameCount = mReceivedFrameCount.load(std::memory_order_relaxed);
@@ -3272,7 +3610,7 @@ void ServerHost::State::RecordError(const Core::Status& status) noexcept
 bool ServerHost::State::BeginNetworkSession()
 {
     const std::lock_guard<std::mutex> guard(mLifecycleMutex);
-    if (!mAccepting.load(std::memory_order_acquire))
+    if (!mAccepting.load(std::memory_order_acquire) || mDraining.load(std::memory_order_acquire))
     {
         return false;
     }
@@ -3308,6 +3646,7 @@ void ServerHost::State::TrackNetworkSession(const std::shared_ptr<NetworkSession
 void ServerHost::State::FinishNetworkSession(
     const NetworkSession* const session, const bool beginCloseNotification) noexcept
 {
+    if (session != nullptr && mDatagrams) mDatagrams->UnregisterSession(session->Id());
     const std::lock_guard<std::mutex> guard(mLifecycleMutex);
     SERVERCORE_ASSERT(
         mOutstandingSessions != 0, "ServerHost finalized a network session that it did not count");
@@ -3392,6 +3731,7 @@ void ServerHost::State::CloseExpiredSessionsOnRunner()
     {
         return;
     }
+    AdvanceDrain();
 
     const std::uint64_t nowMilliseconds = Core::MillisecondsSinceProcessStart();
     const std::uint64_t idleTimeoutMilliseconds =
@@ -3525,7 +3865,7 @@ void ServerHost::State::OnConnectionAccepted(std::shared_ptr<Net::Connection> co
         TrackNetworkSession(session);
         connection->SetObserver(session);
 
-        Core::Status posted = mJobRunner.Post([session]() { session->OpenOnRunner(); });
+        Core::Status posted = mJobRunner.PostControl([session]() { session->OpenOnRunner(); });
         if (!posted.IsOk())
         {
             session->AbortBeforeOpened(std::move(posted));
@@ -3622,6 +3962,20 @@ void ServerHost::SetLogger(std::shared_ptr<Core::ILogger> logger)
 {
     mState->SetLogger(std::move(logger));
 }
+
+Core::Status ServerHost::SetBinaryHandler(BinaryHandler handler)
+{ return mState->SetBinaryHandler(std::move(handler)); }
+
+Core::Status ServerHost::AttachDatagramTransport(std::shared_ptr<DatagramTransport> transport)
+{ return mState->AttachDatagramTransport(std::move(transport)); }
+
+Core::Result<Protocol::DatagramCodec::Token> ServerHost::GetDatagramToken(Session::SessionId id) const
+{ return mState->GetDatagramToken(id); }
+
+Core::Status ServerHost::BeginDrain() { return mState->BeginDrain(); }
+Core::Status ServerHost::DrainStatus() const { return mState->DrainStatus(); }
+Core::Status ServerHost::StopGracefully(const std::chrono::steady_clock::time_point deadline)
+{ return mState->StopGracefully(deadline); }
 
 Dispatch::Dispatcher& ServerHost::GetDispatcher() noexcept
 {

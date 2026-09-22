@@ -2,6 +2,7 @@
 
 #include "Net/AcceptorInternal.h"
 #include "Net/Ipv4EndpointInternal.h"
+#include "Net/SendBudgetInternal.h"
 #include "Net/Linux/ConnectionInternal.h"
 #include "Net/Linux/EpollInternal.h"
 #include "Net/Linux/PosixInternal.h"
@@ -37,7 +38,8 @@ public:
         bool stopping = false;
         std::size_t activeHandoffs = 0;
         SharedConnectionHandler handler;
-        std::shared_ptr<SendBudget> budget;
+        std::shared_ptr<Core::ILogger> logger;
+        std::shared_ptr<SendBudget> budget = std::make_shared<SendBudget>(SendQueueLimits{}.totalBytes);
     };
     // An epoll batch may retain a callback after Stop returns. It owns this
     // detached state and checks generation/stopping before touching the listener.
@@ -79,14 +81,14 @@ void Acceptor::State::Shared::OnReady(const std::uint64_t expectedGeneration)
             // Re-arming would spin and flood logs. Match an unrecoverable accept
             // failure by closing this listener; established connections survive.
             const auto failure = MakePosixFailure("accept4 resource exhaustion", acceptError);
-            Core::GetGlobalLogger().Write(Core::LogLevel::Warn, failure.Message());
+            if (logger) logger->Write(Core::LogLevel::Warn, failure.Message());
             CloseListenerLocked();
             return;
         }
         auto rearmed = IoContextAccess::Rearm(*context, descriptor, registration, EPOLLIN);
         if (!rearmed.IsOk())
         {
-            Core::GetGlobalLogger().Write(Core::LogLevel::Warn, rearmed.Message());
+            if (logger) logger->Write(Core::LogLevel::Warn, rearmed.Message());
             CloseListenerLocked();
         }
         if (accepted < 0)
@@ -94,7 +96,7 @@ void Acceptor::State::Shared::OnReady(const std::uint64_t expectedGeneration)
             if (!IsWouldBlock(acceptError))
             {
                 const auto failure = MakePosixFailure("accept4", acceptError);
-                Core::GetGlobalLogger().Write(Core::LogLevel::Warn, failure.Message());
+                if (logger) logger->Write(Core::LogLevel::Warn, failure.Message());
             }
             return;
         }
@@ -112,7 +114,7 @@ void Acceptor::State::Shared::OnReady(const std::uint64_t expectedGeneration)
     }
     catch (...)
     {
-        Core::GetGlobalLogger().Write(Core::LogLevel::Warn,
+        if (logger) logger->Write(Core::LogLevel::Warn,
             "an accept handoff threw and the connection was closed");
         if (connection) connection->Close();
         else ::close(accepted);
@@ -160,6 +162,17 @@ Core::Status Acceptor::Listen(const std::string_view address, const std::uint16_
     return Core::Status::Ok();
 }
 
+void Acceptor::SetLogger(std::shared_ptr<Core::ILogger> logger)
+{
+    auto& state = *mState->shared;
+    std::shared_ptr<Core::ILogger> previous;
+    {
+        const std::lock_guard guard(state.mutex);
+        SERVERCORE_ASSERT(state.registration == 0 && state.activeHandoffs == 0,
+            "Acceptor::SetLogger requires an inactive listener");
+        previous = std::exchange(state.logger, std::move(logger));
+    }
+}
 void Acceptor::SetConnectionHandler(std::function<void(std::shared_ptr<Connection>)> handler)
 {
     SharedConnectionHandler registered = handler ?
@@ -227,5 +240,18 @@ void AcceptorAccess::SetSendBudget(Acceptor& acceptor, std::shared_ptr<SendBudge
     SERVERCORE_ASSERT(state.registration == 0 && state.activeHandoffs == 0,
         "send budget must be configured before accepting");
     state.budget = std::move(budget);
+}
+
+Core::Status Acceptor::SetSendQueueLimits(const SendQueueLimits& limits)
+{
+    if (!ValidSendQueueLimits(limits))
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+    auto& state = *mState->shared;
+    const std::lock_guard guard(state.mutex);
+    if (state.registration != 0 || state.activeHandoffs != 0)
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+    try { state.budget = std::make_shared<SendBudget>(limits.totalBytes, limits.connectionBytes); }
+    catch (...) { return Core::Status::AllocationFailure(); }
+    return Core::Status::Ok();
 }
 }

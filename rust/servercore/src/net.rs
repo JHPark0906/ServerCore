@@ -1,0 +1,201 @@
+//! Accepted raw TCP connections. Chunk boundaries are not message boundaries;
+//! applications provide their own framing and serialization.
+use crate::{
+    borrowed_bytes, bytes, check, pointer, reactor, sys, timeout_ms, verify_abi, CapacityWait,
+    Error, Result,
+};
+use std::{
+    mem::{size_of, MaybeUninit},
+    ptr::NonNull,
+    sync::Arc,
+    time::Duration,
+};
+
+#[derive(Clone, Debug)]
+pub struct Options {
+    pub listen_address: String,
+    pub port: u16,
+    pub io_threads: u32,
+    pub max_connections: usize,
+    pub max_event_count: usize,
+    pub max_event_bytes: usize,
+    pub connection_send_bytes: usize,
+    pub total_send_bytes: usize,
+}
+impl Default for Options {
+    fn default() -> Self {
+        let mut raw = MaybeUninit::<sys::sc_tcp_options>::uninit();
+        assert_eq!(
+            unsafe { sys::sc_tcp_options_init(raw.as_mut_ptr(), size_of::<sys::sc_tcp_options>()) },
+            sys::SC_OK
+        );
+        let raw = unsafe { raw.assume_init() };
+        Self {
+            listen_address: String::from_utf8_lossy(unsafe { borrowed_bytes(raw.listen_address) })
+                .into_owned(),
+            port: raw.port,
+            io_threads: raw.io_threads,
+            max_connections: raw.max_connections,
+            max_event_count: raw.max_event_count,
+            max_event_bytes: raw.max_event_bytes,
+            connection_send_bytes: raw.connection_send_bytes,
+            total_send_bytes: raw.total_send_bytes,
+        }
+    }
+}
+impl Options {
+    fn raw(&self) -> sys::sc_tcp_options {
+        sys::sc_tcp_options {
+            abi_version: sys::SC_ABI_VERSION,
+            struct_size: size_of::<sys::sc_tcp_options>() as u32,
+            listen_address: bytes(self.listen_address.as_bytes()),
+            port: self.port,
+            reserved: 0,
+            io_threads: self.io_threads,
+            max_connections: self.max_connections,
+            max_event_count: self.max_event_count,
+            max_event_bytes: self.max_event_bytes,
+            connection_send_bytes: self.connection_send_bytes,
+            total_send_bytes: self.total_send_bytes,
+        }
+    }
+}
+pub struct TcpServer(NonNull<sys::sc_tcp_server>, reactor::Lease);
+// C ABI operations are thread-safe; borrowed Rust methods exclude destruction.
+unsafe impl Send for TcpServer {}
+unsafe impl Sync for TcpServer {}
+impl TcpServer {
+    pub fn new(options: &Options) -> Result<Self> {
+        verify_abi()?;
+        let readiness = reactor::Lease::new()?;
+        let mut out = std::ptr::null_mut();
+        check(unsafe { sys::sc_tcp_server_create(&options.raw(), &mut out) })?;
+        Ok(Self(pointer(out)?, readiness))
+    }
+    pub fn start(&mut self) -> Result<()> {
+        check(unsafe { sys::sc_tcp_server_start(self.0.as_ptr()) })
+    }
+    pub fn port(&self) -> u16 {
+        unsafe { sys::sc_tcp_server_port(self.0.as_ptr()) }
+    }
+    pub fn stop(&self) -> Result<()> {
+        check(unsafe { sys::sc_tcp_server_stop(self.0.as_ptr()) })
+    }
+    pub fn accept_timeout(&self, timeout: Duration) -> Result<Connection> {
+        let mut out = std::ptr::null_mut();
+        check(unsafe {
+            sys::sc_tcp_server_accept(self.0.as_ptr(), timeout_ms(timeout)?, &mut out)
+        })?;
+        Ok(Connection(Arc::new(ConnectionInner {
+            handle: pointer(out)?,
+            _readiness: self.1.clone(),
+        })))
+    }
+    pub async fn accept(&mut self) -> Result<Connection> {
+        reactor::poll_fn(|| self.accept_timeout(Duration::ZERO))?.await
+    }
+}
+impl Drop for TcpServer {
+    fn drop(&mut self) {
+        unsafe { sys::sc_tcp_server_destroy(self.0.as_ptr()) };
+    }
+}
+struct ConnectionInner {
+    handle: NonNull<sys::sc_tcp_connection>,
+    _readiness: reactor::Lease,
+}
+unsafe impl Send for ConnectionInner {}
+unsafe impl Sync for ConnectionInner {}
+impl Drop for ConnectionInner {
+    fn drop(&mut self) {
+        unsafe { sys::sc_tcp_connection_destroy(self.handle.as_ptr()) };
+    }
+}
+/// Last clone closes the connection. Receive overflow closes with TooLarge;
+/// pause/resume controls native reads, with one already-posted read allowed.
+#[derive(Clone)]
+pub struct Connection(Arc<ConnectionInner>);
+impl Connection {
+    pub fn id(&self) -> u64 {
+        unsafe { sys::sc_tcp_connection_id(self.0.handle.as_ptr()) }
+    }
+    pub fn send(&self, data: &[u8]) -> Result<()> {
+        check(unsafe { sys::sc_tcp_connection_send(self.0.handle.as_ptr(), bytes(data)) })
+    }
+    /// Sends this entire slice atomically or waits; an impossible slice returns
+    /// TooLarge. Applications split large transfers according to their framing.
+    pub async fn send_async(&self, data: &[u8]) -> Result<()> {
+        loop {
+            match self.send(data) {
+                Err(Error::WOULD_BLOCK) => self.wait_capacity(data.len())?.wait().await?,
+                result => return result,
+            }
+        }
+    }
+    pub fn close(&self) {
+        unsafe { sys::sc_tcp_connection_close(self.0.handle.as_ptr()) };
+    }
+    pub fn pause_receive(&self) -> Result<()> {
+        check(unsafe { sys::sc_tcp_connection_pause(self.0.handle.as_ptr()) })
+    }
+    pub fn resume_receive(&self) -> Result<()> {
+        check(unsafe { sys::sc_tcp_connection_resume(self.0.handle.as_ptr()) })
+    }
+    pub fn wait_capacity(&self, bytes: usize) -> Result<CapacityWait> {
+        let mut out = std::ptr::null_mut();
+        check(unsafe {
+            sys::sc_tcp_connection_wait_capacity(self.0.handle.as_ptr(), bytes, &mut out)
+        })?;
+        CapacityWait::from_raw(out)
+    }
+    pub fn next_timeout(&self, timeout: Duration) -> Result<Event> {
+        let mut out = std::ptr::null_mut();
+        check(unsafe {
+            sys::sc_tcp_connection_next(self.0.handle.as_ptr(), timeout_ms(timeout)?, &mut out)
+        })?;
+        let mut event = Event {
+            handle: pointer(out)?,
+            view: unsafe { std::mem::zeroed() },
+        };
+        event.view.abi_version = sys::SC_ABI_VERSION;
+        event.view.struct_size = size_of::<sys::sc_tcp_event_view>() as u32;
+        check(unsafe { sys::sc_tcp_event_get_view(event.handle.as_ptr(), &mut event.view) })?;
+        Ok(event)
+    }
+    pub async fn next(&mut self) -> Result<Event> {
+        reactor::poll_fn(|| self.next_timeout(Duration::ZERO))?.await
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    Bytes,
+    Closed,
+}
+pub struct Event {
+    handle: NonNull<sys::sc_tcp_event>,
+    view: sys::sc_tcp_event_view,
+}
+// Views are immutable, point into the native owned event, and are only borrowed
+// through &self. Drop requires exclusive access and returns its queue charge.
+unsafe impl Send for Event {}
+unsafe impl Sync for Event {}
+impl Event {
+    pub fn kind(&self) -> Result<EventKind> {
+        match self.view.kind {
+            sys::SC_TCP_BYTES => Ok(EventKind::Bytes),
+            sys::SC_TCP_CLOSED => Ok(EventKind::Closed),
+            _ => Err(Error::INVALID_FORMAT),
+        }
+    }
+    pub fn bytes(&self) -> &[u8] {
+        unsafe { borrowed_bytes(self.view.bytes) }
+    }
+    pub fn status(&self) -> Result<()> {
+        check(self.view.status)
+    }
+}
+impl Drop for Event {
+    fn drop(&mut self) {
+        unsafe { sys::sc_tcp_event_destroy(self.handle.as_ptr()) };
+    }
+}

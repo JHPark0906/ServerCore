@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ServerCore/Session/Session.h"
+#include "ServerCore/Observability/Metrics.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -52,5 +53,6 @@ struct ServerMetricsSnapshot
     std::uint64_t errorCount = 0;
     std::uint64_t skippedPeriodCount = 0;
     std::vector<SessionSendQueueSnapshot> sessionSendQueues;
+    Observability::JobRunnerMetricsSnapshot jobs;
 };
 }

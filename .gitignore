@@ -5,6 +5,7 @@ build/
 out/
 Builds/
 stage/
+target/
 
 # --- vcpkg 매니페스트 모드 산출물 ---
 vcpkg_installed/

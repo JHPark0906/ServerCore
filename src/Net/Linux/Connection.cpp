@@ -26,6 +26,7 @@ TcpConnection::TcpConnection(CreationKey, const int descriptor,
 
 TcpConnection::~TcpConnection()
 {
+    const SendNotificationScope notifications(mSends.Budget());
     SERVERCORE_ASSERT(!mProcessing, "a connection callback outlived its ownership");
     // Registered callbacks own this connection. Therefore destruction cannot race
     // a worker; only unstarted or already unregistered connections reach here.
@@ -35,6 +36,7 @@ TcpConnection::~TcpConnection()
         ::close(mDescriptor);
         mDescriptor = -1;
     }
+    mSends.CloseCapacityWaits();
     DiscardSendsLocked();
     if (!mClosed.exchange(true))
         mCloseReason = Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
@@ -43,6 +45,7 @@ TcpConnection::~TcpConnection()
 
 Core::Status TcpConnection::Start()
 {
+    const SendNotificationScope notifications(mSends.Budget());
     Core::Status status = Core::Status::Ok();
     {
         const std::lock_guard guard(mMutex);
@@ -51,8 +54,7 @@ Core::Status TcpConnection::Start()
         if (mClosed.load()) return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
         try
         {
-            auto registration = IoContextAccess::Register(mContext, mDescriptor,
-                EPOLLIN | EPOLLRDHUP | (mSends.Empty() ? 0U : static_cast<std::uint32_t>(EPOLLOUT)),
+            auto registration = IoContextAccess::Register(mContext, mDescriptor, InterestLocked(),
                 [self = shared_from_this()](const std::uint32_t events) { self->OnReady(events); });
             if (registration.IsOk()) mRegistration = registration.Value();
             else status = std::move(registration).TakeStatus();
@@ -72,6 +74,7 @@ Core::Status TcpConnection::Send(const std::span<const std::byte> bytes)
 
 ConnectionSendOutcome TcpConnection::SendWithOutcome(const std::span<const std::byte> bytes)
 {
+    const SendNotificationScope notifications(mSends.Budget());
     Core::Status status = Core::Status::Ok();
     bool closedByFailure = false;
     try
@@ -99,10 +102,20 @@ ConnectionSendOutcome TcpConnection::SendWithOutcome(const std::span<const std::
     return {std::move(status), closedByFailure};
 }
 
+std::uint32_t TcpConnection::InterestLocked() const noexcept
+{
+    return (mReceivePaused ? 0U : static_cast<std::uint32_t>(EPOLLIN | EPOLLRDHUP)) |
+        (mSends.Empty() ? 0U : static_cast<std::uint32_t>(EPOLLOUT));
+}
+
 Core::Status TcpConnection::RearmLocked() noexcept
 {
-    return IoContextAccess::Rearm(mContext, mDescriptor, mRegistration,
-        EPOLLIN | EPOLLRDHUP | (mSends.Empty() ? 0U : static_cast<std::uint32_t>(EPOLLOUT)));
+    const auto interests = InterestLocked();
+    // A paused idle connection keeps its registry owner but parks its one-shot
+    // event. EPOLLHUP is reported even with an empty mask; rearming it repeatedly
+    // would busy-loop until the application resumes or closes the connection.
+    if (interests == 0) return Core::Status::Ok();
+    return IoContextAccess::Rearm(mContext, mDescriptor, mRegistration, interests);
 }
 
 void TcpConnection::DiscardSendsLocked() noexcept
@@ -126,6 +139,7 @@ void TcpConnection::CloseWithFailureLocked(Core::Status& failure) noexcept
 void TcpConnection::CloseLocked(Core::Status reason, const bool graceful) noexcept
 {
     if (mClosed.exchange(true, std::memory_order_acq_rel)) return;
+    mSends.CloseCapacityWaits();
     mCloseReason = std::move(reason);
     if (mDescriptor >= 0)
     {
@@ -145,6 +159,7 @@ void TcpConnection::CloseLocked(Core::Status reason, const bool graceful) noexce
 
 void TcpConnection::Close()
 {
+    const SendNotificationScope notifications(mSends.Budget());
     {
         const std::lock_guard guard(mMutex);
         CloseLocked(Core::Status::FailWithoutMessage(Core::ErrorCode::Closed));
@@ -154,11 +169,13 @@ void TcpConnection::Close()
 
 void TcpConnection::CloseAfterSend()
 {
+    const SendNotificationScope notifications(mSends.Budget());
     {
         const std::lock_guard guard(mMutex);
         if (!mClosed.load())
         {
             mCloseAfterSend = true;
+            mSends.CloseCapacityWaits();
             if (mSends.Empty()) CloseLocked(Core::Status::FailWithoutMessage(Core::ErrorCode::Closed), true);
         }
     }
@@ -183,6 +200,70 @@ std::size_t TcpConnection::QueuedSendBytes() const noexcept
     return mSends.QueuedBytes();
 }
 
+Core::Status TcpConnection::PauseReceive()
+{
+    const SendNotificationScope notifications(mSends.Budget());
+    Core::Status status = Core::Status::Ok();
+    {
+        const std::lock_guard guard(mMutex);
+        if (mClosed.load()) return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+        if (mReceivePaused) return status;
+        mReceivePaused = true;
+        // A processing worker will apply the new interests before returning.
+        // Otherwise remove the previously armed read interest now, including
+        // when the resulting mask is empty. A queued event still checks pause.
+        if (mStarted && !mProcessing)
+        {
+            status = IoContextAccess::Rearm(mContext, mDescriptor, mRegistration, InterestLocked());
+            if (!status.IsOk()) CloseWithFailureLocked(status);
+        }
+    }
+    if (!status.IsOk()) NotifyDisconnected();
+    return status;
+}
+
+Core::Status TcpConnection::ResumeReceive()
+{
+    const SendNotificationScope notifications(mSends.Budget());
+    Core::Status status = Core::Status::Ok();
+    {
+        const std::lock_guard guard(mMutex);
+        if (mClosed.load()) return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+        if (!mReceivePaused) return status;
+        mReceivePaused = false;
+        // Acceptor invokes its handler before Start. Resuming there must not
+        // register the descriptor or let received bytes precede the handler.
+        if (mStarted && !mProcessing)
+        {
+            status = RearmLocked();
+            if (!status.IsOk()) CloseWithFailureLocked(status);
+        }
+    }
+    if (!status.IsOk()) NotifyDisconnected();
+    return status;
+}
+
+bool TcpConnection::IsReceivePaused() const noexcept
+{
+    const std::lock_guard guard(mMutex);
+    return mReceivePaused;
+}
+
+std::size_t TcpConnection::RetainedSendBytes() const noexcept
+{
+    const std::lock_guard guard(mMutex);
+    return mSends.RetainedBytes();
+}
+
+Core::Result<SendCapacitySubscription> TcpConnection::WaitForSendCapacity(
+    const std::size_t requiredBytes, std::function<void(Core::Status)> callback,
+    const std::stop_token cancellation)
+{
+    // An already available/closed/cancelled wait can invoke its callback inline.
+    // SendQueue's capacity state synchronizes this operation independently.
+    return mSends.WaitForCapacity(requiredBytes, std::move(callback), cancellation);
+}
+
 void TcpConnection::NotifyDisconnected()
 {
     std::weak_ptr<IConnectionObserver> observer;
@@ -199,6 +280,7 @@ void TcpConnection::NotifyDisconnected()
 
 void TcpConnection::OnReady(const std::uint32_t events)
 {
+    const SendNotificationScope notifications(mSends.Budget());
     std::array<std::byte, ReceiveBufferSize> buffer{};
     {
         const std::lock_guard guard(mMutex);
@@ -215,7 +297,7 @@ void TcpConnection::OnReady(const std::uint32_t events)
             ssize_t count = -1;
             {
                 const std::lock_guard guard(mMutex);
-                if (mClosed.load()) break;
+                if (mClosed.load() || mReceivePaused) break;
                 count = ::recv(mDescriptor, buffer.data(), buffer.size(), 0);
                 if (count < 0)
                 {
@@ -236,7 +318,19 @@ void TcpConnection::OnReady(const std::uint32_t events)
     }
     {
         const std::lock_guard guard(mMutex);
+        // Pause suppresses reads, including EOF detection, but a real socket
+        // error is terminal independently of read admission. Querying SO_ERROR
+        // also clears a stale error indication before a possible rearm.
+        if (!mClosed.load() && mReceivePaused && (events & EPOLLERR) != 0)
+        {
+            int error = 0;
+            socklen_t length = sizeof(error);
+            if (::getsockopt(mDescriptor, SOL_SOCKET, SO_ERROR, &error, &length) < 0)
+                CloseLocked(MakePosixFailure("getsockopt(SO_ERROR)", errno));
+            else if (error != 0) CloseLocked(MakePosixFailure("socket", error));
+        }
         // A receive callback may have just queued a reply even without EPOLLOUT.
+        bool sendBlocked = false;
         for (unsigned int attempt = 0; attempt < 64 && !mClosed.load() && !mSends.Empty(); ++attempt)
         {
             const auto front = mSends.Front();
@@ -245,7 +339,8 @@ void TcpConnection::OnReady(const std::uint32_t events)
             {
                 const int error = errno;
                 if (error == EINTR) continue;
-                if (!IsWouldBlock(error)) CloseLocked(MakePosixFailure("send", error));
+                if (IsWouldBlock(error)) sendBlocked = true;
+                else CloseLocked(MakePosixFailure("send", error));
                 break;
             }
             if (count == 0)
@@ -255,6 +350,11 @@ void TcpConnection::OnReady(const std::uint32_t events)
             }
             mSends.Consume(static_cast<std::size_t>(count));
         }
+        // A hung-up socket that could not drain its writes cannot make progress
+        // by rearming EPOLLOUT: HUP would immediately wake every retry. With no
+        // writes, leave it parked so Resume can still consume buffered input.
+        if (!mClosed.load() && mReceivePaused && (events & EPOLLHUP) != 0 && sendBlocked)
+            CloseLocked(Core::Status::FailWithoutMessage(Core::ErrorCode::Closed));
         if (!mClosed.load() && mCloseAfterSend && mSends.Empty())
             CloseLocked(Core::Status::FailWithoutMessage(Core::ErrorCode::Closed), true);
         mProcessing = false;

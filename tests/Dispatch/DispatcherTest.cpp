@@ -478,9 +478,8 @@ void DispatchAndRegisterAreSafeBeforeFreeze()
 void UnknownTypePolicyControlsDisconnect()
 {
     const std::shared_ptr<CountingLogger> logger = std::make_shared<CountingLogger>();
-    ServerCore::Core::SetGlobalLogger(logger);
-
     Dispatcher dispatcher;
+    dispatcher.SetLogger(logger);
     const std::shared_ptr<TestSession> session = std::make_shared<TestSession>();
     ServerCore::Core::Result<Message> message = Parse(R"({"type":"FutureType","body":{}})");
     ServerCoreTest::ExpectTrue(message.IsOk(), "unknown-type message parses");
@@ -512,7 +511,6 @@ void UnknownTypePolicyControlsDisconnect()
     ServerCoreTest::ExpectEqual(
         2, logger->WriteCount(), "disconnect policy also records the unknown type");
 
-    ServerCore::Core::SetGlobalLogger(std::shared_ptr<ServerCore::Core::ILogger>());
 }
 
 void HandlerStatusIsPropagatedWithoutDisconnect()

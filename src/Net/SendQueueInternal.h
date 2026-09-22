@@ -2,6 +2,7 @@
 
 #include "Net/SendBudgetInternal.h"
 #include "ServerCore/Net/Connection.h"
+#include "ServerCore/Net/ConnectionFlowControl.h"
 
 #include <cstddef>
 #include <deque>
@@ -11,7 +12,9 @@
 
 namespace ServerCore::Net
 {
-// Portable owned payload queue. The connection's mutex serializes every method.
+// Portable owned payload queue. The connection's mutex serializes queue access;
+// WaitForCapacity uses its independent state and runs outside transport locks.
+// Destruction also runs outside transport locks and completes terminal waits.
 // Front() borrows stable storage until that vector is fully consumed or Clear()
 // is called. A backend must finish/cancel any kernel borrow before either action.
 // Retained bytes include already-sent prefixes, and shared reservations are only
@@ -31,9 +34,16 @@ public:
     void Clear() noexcept;
     [[nodiscard]] std::size_t QueuedBytes() const noexcept;
     [[nodiscard]] std::size_t RetainedBytes() const noexcept;
+    [[nodiscard]] std::shared_ptr<SendBudget> Budget() const noexcept;
+    // Mark send admission closed under the transport lock, then use
+    // SendNotificationScope outside the lock to dispatch terminal notifications.
+    void CloseCapacityWaits() noexcept;
+    Core::Result<SendCapacitySubscription> WaitForCapacity(std::size_t requiredBytes,
+        std::function<void(Core::Status)> callback, std::stop_token cancellation);
 
 private:
     std::shared_ptr<SendBudget> mBudget;
+    std::shared_ptr<SendCapacityState> mCapacity;
     std::deque<std::vector<std::byte>> mPayloads;
     std::size_t mOffset = 0;
     std::size_t mQueuedBytes = 0;

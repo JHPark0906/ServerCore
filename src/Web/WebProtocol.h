@@ -15,8 +15,9 @@ namespace ServerCore::Web::Detail
 [[nodiscard]] bool IsToken(std::string_view value) noexcept;
 [[nodiscard]] bool HasToken(const HttpRequest& request, std::string_view header, std::string_view token);
 [[nodiscard]] bool ValidHeaderValue(std::string_view value) noexcept;
+[[nodiscard]] bool ValidUpgradeProtocols(std::string_view value) noexcept;
 
-enum class HttpParseKind { NeedMore, Continue, Complete, Error };
+enum class HttpParseKind { NeedMore, Continue, Complete, Error, Headers, Body };
 struct HttpParseResult
 {
     HttpParseKind kind = HttpParseKind::NeedMore;
@@ -27,8 +28,10 @@ struct HttpParseResult
 class HttpParser
 {
 public:
-    HttpParser(std::size_t maxHeaders, std::size_t maxBody);
+    HttpParser(std::size_t maxHeaders, std::size_t maxBody, bool separateHeaders = false);
     HttpParseResult Parse(std::string& input, HttpRequest& output);
+    bool ConfigureBody(bool streaming, std::size_t maxBody, std::size_t maxChunk) noexcept;
+    bool TakeContinue() noexcept { const auto value = mContinue; mContinue = false; return value; }
     [[nodiscard]] bool Started() const noexcept;
     // Preserved on failure so generated HEAD errors also omit their content.
     [[nodiscard]] bool IsHeadRequest() const noexcept;
@@ -46,6 +49,8 @@ private:
     std::size_t mHeaderSearch = 0;
     bool mContinue = false;
     bool mHeadRequest = false;
+    bool mSeparateHeaders = false, mStreaming = false;
+    std::size_t mBodyBytes = 0, mMaxChunk = 0;
     HttpRequest mRequest;
 };
 

@@ -2,11 +2,13 @@
 
 #include "ServerCore/Core/Error.h"
 #include "ServerCore/Protocol/Message.h"
+#include "ServerCore/Protocol/BinaryMessage.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string_view>
+#include <stop_token>
 #include <utility>
 
 /// <summary>
@@ -82,6 +84,14 @@ public:
     [[nodiscard]] virtual SessionId Id() const noexcept = 0;
 
     [[nodiscard]] virtual SessionState State() const noexcept = 0;
+
+    /// Cancellation follows closing/disconnect. Custom sessions may return a non-stoppable token.
+    /// Stop callbacks must not block or join this session's Host; they may run on its worker thread.
+    [[nodiscard]] virtual std::stop_token GetCancellationToken() const noexcept { return {}; }
+
+    /// Available on explicitly binary-mode Host sessions; copies bytes into the bounded send queue.
+    [[nodiscard]] virtual Core::Status SendBinary(std::uint32_t, std::span<const std::byte>)
+    { return Core::Status::FailWithoutMessage(Core::ErrorCode::Unimplemented); }
 
     /// <summary>검증을 마친 신원이 있음을 세션 수명 상태에 반영한다.</summary>
     /// <remarks>

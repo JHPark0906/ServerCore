@@ -39,15 +39,19 @@ TcpConnection::TcpConnection(CreationKey, SOCKET socket, std::shared_ptr<Winsock
 
 TcpConnection::~TcpConnection()
 {
+    const SendNotificationScope sendNotifications(mSendQueue.Budget());
     SERVERCORE_ASSERT(mPendingOperations == 0,
         "a connection was destroyed while an overlapped request was still pending");
     SERVERCORE_ASSERT(!mReceiveCallbackActive,
         "a connection was destroyed while an observer receive callback was still active");
     SERVERCORE_ASSERT(
         !mSendInFlight, "a connection was destroyed while a send request was still pending");
+    SERVERCORE_ASSERT(
+        !mReceiveInFlight, "a connection was destroyed while a receive request was still pending");
 
     // 정상 경로에서는 마지막 완료나 Close가 이미 큐를 비운다. 그래도 관찰자 없는 미시작 연결
     // 같은 마지막 소유 경계에서 공유 예산이 남지 않도록 소멸자가 최종 회수한다.
+    mSendQueue.CloseCapacityWaits();
     DiscardQueuedSendsLocked();
 
     // 여기까지 왔다는 것은 이 객체를 가리키는 참조가 하나도 없다는 뜻이므로 다른 스레드가
@@ -74,6 +78,7 @@ TcpConnection::~TcpConnection()
 
 Core::Status TcpConnection::Start()
 {
+    const SendNotificationScope sendNotifications(mSendQueue.Budget());
     Core::Status result = Core::Status::Ok();
     {
         const std::lock_guard<std::mutex> guard(mMutex);
@@ -108,6 +113,7 @@ ConnectionSendOutcome TcpConnection::SendWithOutcome(std::span<const std::byte> 
 Core::Status TcpConnection::SendInternal(
     std::span<const std::byte> bytes, bool& connectionClosedByFailure)
 {
+    const SendNotificationScope sendNotifications(mSendQueue.Budget());
     connectionClosedByFailure = false;
     try
     {
@@ -165,6 +171,7 @@ Core::Status TcpConnection::SendInternal(
 
 void TcpConnection::Close()
 {
+    const SendNotificationScope sendNotifications(mSendQueue.Budget());
     {
         const std::lock_guard<std::mutex> guard(mMutex);
         mCloseAfterSendRequested = false;
@@ -179,11 +186,13 @@ void TcpConnection::Close()
 // 필요하면 Close로 중단하므로, 여기서는 송신 순서와 겹침 버퍼 수명만 관리한다.
 void TcpConnection::CloseAfterSend()
 {
+    const SendNotificationScope sendNotifications(mSendQueue.Budget());
     {
         const std::lock_guard<std::mutex> guard(mMutex);
         if (!mClosed.load(std::memory_order_relaxed))
         {
             mCloseAfterSendRequested = true;
+            mSendQueue.CloseCapacityWaits();
             FinishCloseAfterSendLocked();
         }
     }
@@ -216,6 +225,53 @@ std::size_t TcpConnection::QueuedSendBytes() const noexcept
     return mSendQueue.QueuedBytes();
 }
 
+Core::Status TcpConnection::PauseReceive()
+{
+    const std::lock_guard<std::mutex> guard(mMutex);
+    if (mClosed.load(std::memory_order_relaxed))
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+    mReceivePaused.store(true, std::memory_order_release);
+    return Core::Status::Ok();
+}
+
+Core::Status TcpConnection::ResumeReceive()
+{
+    const SendNotificationScope sendNotifications(mSendQueue.Budget());
+    Core::Status result = Core::Status::Ok();
+    {
+        const std::lock_guard<std::mutex> guard(mMutex);
+        if (mClosed.load(std::memory_order_relaxed))
+            return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+        mReceivePaused.store(false, std::memory_order_release);
+        // StartReceiveLocked also checks Start, the current kernel request and
+        // the observer callback. In particular, a reentrant Resume cannot let
+        // Winsock overwrite the buffer still borrowed by OnBytesReceived.
+        result = StartReceiveLocked();
+    }
+    if (!result.IsOk()) MaybeNotifyDisconnected();
+    return result;
+}
+
+bool TcpConnection::IsReceivePaused() const noexcept
+{
+    return mReceivePaused.load(std::memory_order_acquire);
+}
+
+std::size_t TcpConnection::RetainedSendBytes() const noexcept
+{
+    const std::lock_guard<std::mutex> guard(mMutex);
+    return mSendQueue.RetainedBytes();
+}
+
+Core::Result<SendCapacitySubscription> TcpConnection::WaitForSendCapacity(
+    const std::size_t requiredBytes, std::function<void(Core::Status)> callback,
+    const std::stop_token cancellation)
+{
+    // Registration can complete inline and invoke user code. SendQueue keeps
+    // its capacity state separately synchronized from the transport mutex.
+    return mSendQueue.WaitForCapacity(requiredBytes, std::move(callback), cancellation);
+}
+
 void TcpConnection::OnIoCompleted(
     IoOperation& operation, DWORD bytesTransferred, unsigned long errorCode)
 {
@@ -238,13 +294,17 @@ void TcpConnection::OnReceiveCompleted(
     // 자기 몫의 참조를 지역으로 옮긴다. 이 지역이 사라지는 자리가 이 객체의 마지막 참조가
     // 놓이는 자리일 수 있으므로, 잠금이 풀린 뒤여야 한다. 선언 순서가 그것을 정한다.
     std::shared_ptr<TcpConnection> keepAlive;
+    const SendNotificationScope sendNotifications(mSendQueue.Budget());
     std::weak_ptr<IConnectionObserver> observer;
     bool hasBytesToDeliver = false;
 
     {
         const std::lock_guard<std::mutex> guard(mMutex);
 
+        SERVERCORE_ASSERT(mReceiveInFlight,
+            "a receive completion arrived without a submitted receive");
         keepAlive = std::move(operation.owner);
+        mReceiveInFlight = false;
         --mPendingOperations;
 
         // Close()가 먼저 소켓을 닫았다면 이 완료는 취소 정리일 뿐이다. 그 사유를
@@ -308,6 +368,7 @@ void TcpConnection::OnSendCompleted(
     SendOperation& operation, DWORD bytesTransferred, unsigned long errorCode)
 {
     std::shared_ptr<TcpConnection> keepAlive;
+    const SendNotificationScope sendNotifications(mSendQueue.Budget());
 
     {
         const std::lock_guard<std::mutex> guard(mMutex);
@@ -358,6 +419,13 @@ Core::Status TcpConnection::StartReceiveLocked()
         return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
     }
 
+    // Resume is legal before the accept callback returns and while an observer
+    // borrows the receive buffer. Only Start/callback completion can cross those
+    // boundaries; an already submitted receive is allowed to finish when paused.
+    if (!mStarted || mReceivePaused.load(std::memory_order_relaxed) ||
+        mReceiveInFlight || mReceiveCallbackActive)
+        return Core::Status::Ok();
+
     WSABUF buffer{};
     buffer.len = static_cast<ULONG>(mReceiveOperation.buffer.size());
     buffer.buf = reinterpret_cast<CHAR*>(mReceiveOperation.buffer.data());
@@ -394,6 +462,7 @@ Core::Status TcpConnection::StartReceiveLocked()
 
     // 요청이 즉시 끝났더라도 완료 통지는 완료 포트로 온다. 그렇게 두는 설정을 켜지 않았다.
     // 그래서 두 경우 모두 "걸려 있는 요청 하나"로 센다.
+    mReceiveInFlight = true;
     ++mPendingOperations;
     return Core::Status::Ok();
 }
@@ -466,6 +535,7 @@ void TcpConnection::MarkClosedLocked(Core::Status reason)
 
     mCloseReason = std::move(reason);
     mClosed.store(true, std::memory_order_release);
+    mSendQueue.CloseCapacityWaits();
 
     if (!mSendInFlight)
     {

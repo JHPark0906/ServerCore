@@ -58,7 +58,9 @@ enum class ErrorCode
     /// 네트워크 연결의 유휴 만료처럼, 호출자가 설정한 시간 경계가 지나 발생한 예상 가능한
     /// 종료를 나타낸다. 새 값은 기존 오류 코드의 수치를 바꾸지 않도록 끝에만 더한다.
     /// </remarks>
-    Timeout = 11
+    Timeout = 11,
+    /// <summary>A cooperative operation was cancelled before it completed.</summary>
+    Cancelled = 12
 };
 
 /// <summary>

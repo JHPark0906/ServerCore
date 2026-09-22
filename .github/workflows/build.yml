@@ -16,12 +16,25 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Configure
-        run: cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} -DSERVERCORE_BUILD_TESTS=ON
+      - name: Configure without third-party dependencies
+        run: cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} -DSERVERCORE_BUILD_TESTS=ON -DSERVERCORE_BUILD_C_API=ON
       - name: Build
         run: cmake --build build/ci --config ${{ matrix.configuration }} --parallel 4
       - name: Test including source and installed package consumers
         run: ctest --test-dir build/ci -C ${{ matrix.configuration }} --output-on-failure --no-tests=error --parallel 4
+
+  rust-source-consumer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build native component through Cargo and test wrappers
+        working-directory: rust
+        run: cargo test --workspace --all-targets --locked --offline
 
   sanitizers:
     runs-on: ubuntu-24.04
@@ -34,10 +47,11 @@ jobs:
           -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
           -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DSERVERCORE_BUILD_C_API=ON -DSERVERCORE_C_API_SHARED=OFF
       - name: Build
         run: cmake --build build/sanitizers --parallel 4
       - name: Test
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ctest --test-dir build/sanitizers --output-on-failure --no-tests=error --parallel 4 -E CMake.InstallAndSourceTreeConsume
+        run: ctest --test-dir build/sanitizers --output-on-failure --no-tests=error --parallel 4 -E CMake
