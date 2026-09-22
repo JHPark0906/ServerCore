@@ -1,6 +1,6 @@
 # ServerCore
 
-Windows 게임 서버의 구조와 구현을 학습하기 위한 **C++20 서버 코어 라이브러리**입니다. TCP/IOCP와 비차단 UDP 전송, 메시지 프레이밍과 JSON, 세션, 디스패치, 작업 실행과 자원 예산을 제공하며, 게임별 백엔드가 그 위에 자신의 규칙을 구현합니다.
+Windows와 Linux 서버의 구조와 구현을 학습하기 위한 **C++20 서버 코어 라이브러리**입니다. Windows IOCP·Linux epoll 기반 TCP, 비차단 UDP, HTTP/1.1·WebSocket, 메시지 프레이밍과 JSON, 세션, 디스패치, 작업 실행과 자원 예산을 제공하며, 애플리케이션별 백엔드가 그 위에 자신의 규칙을 구현합니다.
 
 개발 과정에서 생성형 AI의 도움을 받은 프로젝트입니다.
 
@@ -12,13 +12,16 @@ Windows 게임 서버의 구조와 구현을 학습하기 위한 **C++20 서버 
 | --- | --- |
 | [아키텍처](docs/ARCHITECTURE.md) | 모듈 경계, 소유권, 부팅·메시지·종료 흐름 |
 | [프로토콜](docs/PROTOCOL.md) | 프레임 형식, JSON 봉투, 디스패치와 오류 계약 |
+| [HTTP·WebSocket](docs/WEB.md) | 웹 서버 API, 사용 예와 지원 범위 |
 | [빌드·테스트·배포](docs/BUILD_TEST_DEPLOY.md) | 요구 사항, CMake, 소스·설치 패키지 소비, 검증 |
 | [지원 범위와 설정](docs/SUPPORT_AND_LIMITS.md) | 기본값, 설정 파일, 자원 상한, 미지원 기능 |
+| [공개 API 이전](docs/API_MIGRATION.md) | Deprecated API, 대체 이름과 종료·직렬화 계약 |
 | [검증 결과](docs/VALIDATION.md) | 검증한 소스·도구 환경, 빌드와 테스트 결과 |
 
 ## 핵심 기능
 
-- **비동기 TCP 전송:** Windows IOCP, AcceptEx, 겹침 수신·송신, 부분 송신 처리와 연결 수명 관리.
+- **비동기 TCP 전송:** Windows IOCP·AcceptEx와 Linux epoll, 부분 수신·송신 처리와 연결 수명 관리.
+- **HTTP·WebSocket:** 별도 `Web::HttpServer`가 HTTP/1.1 요청과 WebSocket 연결을 처리합니다. API와 제약은 [웹 서버 문서](docs/WEB.md)를 따릅니다.
 - **스트림 프레이밍:** 4바이트 길이 머리와 UTF-8 JSON 본문. 나뉘어 도착하거나 연속으로 도착한 프레임을 처리합니다.
 - **공용 메시지 봉투:** `type`, `body`, 선택적 `seq`와 `error`를 파싱·직렬화합니다. UTF-8, JSON 값, 본문 형식과 크기를 검증합니다.
 - **준비된 송신 값:** `PreparedJsonValue`와 `PreparedMessage`를 소유 값으로 만들고 여러 수신자에게 재사용합니다. 실제 NetworkSession의 `SendPrepared`는 JSON을 다시 직렬화하지 않고 기존 프레임·송신 큐에 넣습니다.
@@ -35,18 +38,18 @@ Windows 게임 서버의 구조와 구현을 학습하기 위한 **C++20 서버 
 
 | 위치 | 책임 |
 | --- | --- |
-| [include/ServerCore](include/ServerCore) | 소비자가 포함하는 공개 API. Core·Net·Protocol·Session·Dispatch·Runtime으로 구분 |
-| [src](src) | 공개 API 구현과 내부 전송·파싱 상태. Windows 헤더와 소켓 구현을 내부에 둠 |
-| [tests](tests) | C++ 회귀, 실제 TCP·UDP 통합과 소스/설치 패키지 소비 검사 |
+| [include/ServerCore](include/ServerCore) | 소비자가 포함하는 공개 API. Core·Net·Protocol·Session·Dispatch·Runtime·Web으로 구분 |
+| [src](src) | 공개 API 구현과 내부 전송·파싱 상태. 플랫폼 헤더와 소켓 구현을 내부에 둠 |
+| [tests](tests) | C++ 회귀, 실제 TCP·UDP·HTTP·WebSocket 통합과 소스/설치 패키지 소비 검사 |
 | [cmake](cmake) | 설치 패키지의 Config/Targets 구성 |
 | [scripts](scripts) | 개발 빌드 검증 스크립트 |
 | [docs](docs) | 프로토콜·설정·빌드 계약 |
 
-공개 API에서 실행 계층까지는 `ServerHost → FrameReader/ParseMessage → Dispatcher → 게임 처리기 → Session` 순서로 읽을 수 있습니다. IOCP와 JobRunner의 실제 스레드·수명 관계는 [아키텍처](docs/ARCHITECTURE.md)에 설명합니다.
+공개 API에서 실행 계층까지는 `ServerHost → FrameReader/ParseMessage → Dispatcher → 게임 처리기 → Session` 순서로 읽을 수 있습니다. I/O worker와 JobRunner의 실제 스레드·수명 관계는 [아키텍처](docs/ARCHITECTURE.md)에 설명합니다.
 
 ## 빠른 시작
 
-Windows, C++20을 지원하는 MSVC와 Windows SDK, CMake 3.21 이상, Ninja가 필요합니다. **x64 Native Tools Command Prompt** 또는 같은 도구 환경을 설정한 PowerShell에서 저장소 루트로 이동하여 실행합니다.
+Windows에서는 C++20을 지원하는 MSVC와 Windows SDK, CMake 3.21 이상, Ninja가 필요합니다. **x64 Native Tools Command Prompt** 또는 같은 도구 환경을 설정한 PowerShell에서 저장소 루트로 이동하여 실행합니다.
 
 ```powershell
 cmake --preset msvc-release
@@ -55,6 +58,18 @@ ctest --preset msvc-release
 ```
 
 Debug는 위 세 명령의 preset 이름을 `msvc-debug`로 바꿉니다. 개발 환경 설정, 전체 검증 스크립트, 출력 경로와 패키지 설치는 [빌드 문서](docs/BUILD_TEST_DEPLOY.md)를 참고합니다.
+
+Ubuntu에서는 C++20 컴파일러, CMake 3.21 이상과 Ninja로 빌드합니다.
+
+```bash
+sudo apt update
+sudo apt install build-essential cmake ninja-build
+cmake --preset linux-release
+cmake --build --preset linux-release
+ctest --preset linux-release
+```
+
+Debug는 `linux-debug`를 사용합니다. Linux 구현은 epoll을 사용하며 외부 네트워크 라이브러리를 요구하지 않습니다. 실제 실행 검증 환경과 결과는 [검증 결과](docs/VALIDATION.md)에 별도로 기록하며, 다른 OS에서의 교차 컴파일은 Ubuntu 실행 검증을 대신하지 않습니다.
 
 ## 서버 프로젝트에서 사용하기
 
@@ -140,7 +155,7 @@ int main()
 }
 ```
 
-송신할 JSON은 예를 들어 `{"type":"Echo","seq":1,"body":{"text":"hello"}}`입니다. 실제 TCP 전송에서는 이 문자열 앞에 **JSON 바이트 수를 나타내는 4바이트 little-endian 길이**를 붙입니다. 일반 텍스트나 HTTP 요청을 그대로 보내는 형식이 아닙니다. 세부 규격과 인코딩 API는 [프로토콜 문서](docs/PROTOCOL.md)에 있습니다.
+송신할 JSON은 예를 들어 `{"type":"Echo","seq":1,"body":{"text":"hello"}}`입니다. 실제 TCP 전송에서는 이 문자열 앞에 **JSON 바이트 수를 나타내는 4바이트 little-endian 길이**를 붙입니다. 이 예제의 `ServerHost`는 길이 프레임 프로토콜을 사용합니다. HTTP·WebSocket 서버는 [Web::HttpServer](docs/WEB.md)로 별도 구성합니다. 세부 규격과 인코딩 API는 [프로토콜 문서](docs/PROTOCOL.md)에 있습니다.
 
 처리기는 Start 전에 등록합니다. 이 예제의 `4096`은 Echo의 **raw body** 상한이고, `8192`는 봉투 전체 JSON의 상한입니다. 등록된 처리기에 들어오는 `Body()`는 객체이며, 요청에서 빌린 참조는 처리기 호출을 넘어 보관하지 않습니다. `Send` 성공은 송신 큐 수락을 뜻하며 상대의 수신 확인을 뜻하지 않습니다.
 
@@ -162,7 +177,7 @@ CTest는 기반 자료형, 설정, JSON·프레이밍, 세션, 디스패치, 작
 
 ## TCP와 UDP의 책임 경계
 
-ServerHost의 네트워크 세션은 **Windows IPv4 TCP/IOCP**입니다. 별도의 [Runtime::DatagramTransport](include/ServerCore/Runtime/DatagramTransport.h)는 비차단 IPv4 UDP 소켓과 세션별 토큰·순번·endpoint를 관리합니다. `Protocol/DatagramCodec.h`의 magic·128비트 토큰·big-endian 순번으로 된 28바이트 머리를 그대로 사용합니다.
+ServerHost의 네트워크 세션은 **Windows IOCP·Linux epoll 기반 IPv4 TCP**입니다. 별도의 [Runtime::DatagramTransport](include/ServerCore/Runtime/DatagramTransport.h)는 비차단 IPv4 UDP 소켓과 세션별 토큰·순번·endpoint를 관리합니다. `Protocol/DatagramCodec.h`의 magic·128비트 토큰·big-endian 순번으로 된 28바이트 머리를 그대로 사용합니다.
 
 소비자는 신뢰 가능한 제어 채널에서 `RegisterSession`의 토큰을 전달하고 세션 종료 시 `UnregisterSession`을 호출합니다. `Poll(admission, receiver)`는 JSON 봉투를 한 번 파싱하고 게임의 admission이 허용한 뒤에만 순번·endpoint·준비 상태를 갱신합니다. 콜백은 내부 잠금 밖에서 실행됩니다. 수신 호출은 소비자의 실행 문맥에서 직렬화하며 기본 한도는 호출당 4,096회 수신 시도와 약 1 MiB입니다. heartbeat, 유실 복구, AOI와 틱별 송신 예산은 게임이 정합니다.
 
@@ -170,9 +185,9 @@ ServerHost의 네트워크 세션은 **Windows IPv4 TCP/IOCP**입니다. 별도�
 
 ## 지원 범위
 
-현재 라이브러리는 TLS/DTLS, IPv6, DNS 연결, 자동 재접속, 계정 인증, DB, 매치메이킹, 서버 권위 물리, 방·관심 영역 분할을 제공하지 않습니다. 인증 상태 전이 API는 자격 증명을 검증하지 않습니다.
+현재 라이브러리는 HTTP/2·HTTP/3, TLS/DTLS, IPv6, DNS 연결, 자동 재접속, 계정 인증, DB, 매치메이킹, 서버 권위 물리, 방·관심 영역 분할을 제공하지 않습니다. 인증 상태 전이 API는 자격 증명을 검증하지 않습니다.
 
-공개 헤더는 WinSock 구조체를 노출하지 않지만, 라이브러리 전체가 다른 운영체제에서 빌드되는 것은 아닙니다. MSVC에서는 라이브러리와 소비 실행 파일이 동일한 `/MD` 또는 `/MDd` CRT 계약을 따라야 합니다. 자세한 계약과 제약은 [지원 범위와 설정](docs/SUPPORT_AND_LIMITS.md)을 기준으로 확인합니다.
+공개 헤더는 OS 소켓 구조체를 노출하지 않으며 CMake가 Windows와 Linux 구현을 선택합니다. macOS 백엔드는 제공하지 않습니다. MSVC에서는 라이브러리와 소비 실행 파일이 동일한 `/MD` 또는 `/MDd` CRT 계약을 따라야 합니다. 자세한 계약과 제약은 [지원 범위와 설정](docs/SUPPORT_AND_LIMITS.md)을 기준으로 확인합니다.
 
 ## 라이선스
 

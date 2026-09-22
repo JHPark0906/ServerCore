@@ -29,6 +29,24 @@ endif ()
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+find_package(Threads REQUIRED)
+
+if (WIN32)
+    set(ServerCorePlatformSources
+            src/Net/Acceptor.cpp
+            src/Net/Connection.cpp
+            src/Net/DatagramSocket.cpp
+            src/Net/IoContext.cpp
+            src/Net/WinsockInternal.cpp)
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(ServerCorePlatformSources
+            src/Net/Linux/Acceptor.cpp
+            src/Net/Linux/Connection.cpp
+            src/Net/Linux/DatagramSocket.cpp
+            src/Net/Linux/IoContext.cpp)
+else ()
+    message(FATAL_ERROR "ServerCore supports Windows and Linux.")
+endif ()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,11 +72,9 @@ add_library(ServerCore STATIC
         src/Core/Utf8.cpp
         src/Core/Version.cpp
         src/Dispatch/Dispatcher.cpp
-        src/Net/Acceptor.cpp
-        src/Net/Connection.cpp
-        src/Net/DatagramSocket.cpp
-        src/Net/IoContext.cpp
-        src/Net/WinsockInternal.cpp
+        ${ServerCorePlatformSources}
+        src/Net/SendBudgetInternal.cpp
+        src/Net/SendQueueInternal.cpp
         src/Protocol/Framing.cpp
         src/Protocol/Json.cpp
         src/Protocol/Message.cpp
@@ -68,6 +84,8 @@ add_library(ServerCore STATIC
         src/Runtime/PeriodicRunner.cpp
         src/Runtime/ServerHost.cpp
         src/Session/SessionRegistry.cpp
+        src/Web/HttpServer.cpp
+        src/Web/WebProtocol.cpp
         src/PublicHeaderCompileCheck.cpp)
 
 add_library(ServerCore::ServerCore ALIAS ServerCore)
@@ -81,9 +99,13 @@ target_include_directories(ServerCore
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-# 전송 층이 Winsock을 쓴다. 정적 라이브러리라 이 의존은 우리를 링크하는 쪽까지 따라가야
-# 하므로 PRIVATE이 아니라 PUBLIC이다.
-target_link_libraries(ServerCore PUBLIC ws2_32 PRIVATE bcrypt)
+target_link_libraries(ServerCore PUBLIC Threads::Threads)
+if (WIN32)
+    target_link_libraries(ServerCore PUBLIC ws2_32 PRIVATE bcrypt)
+endif ()
+
+# Allow the static core to be embedded in shared application libraries.
+set_property(TARGET ServerCore PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 target_compile_features(ServerCore PUBLIC cxx_std_20)
 

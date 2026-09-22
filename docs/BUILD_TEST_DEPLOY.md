@@ -1,6 +1,6 @@
 # 빌드·테스트·배포
 
-ServerCore는 게임 서버가 링크하는 **Windows용 C++20 정적 라이브러리**다. 이 저장소를 빌드하면 `ServerCore.lib`와 선택적인 검사 실행 파일이 만들어진다. 실제 게임의 메시지 처리, 실행 진입점과 운영 설정은 ServerCore를 소비하는 서버 프로젝트가 제공한다.
+ServerCore는 게임 서버가 링크하는 **Windows·Linux용 C++20 정적 라이브러리**다. 이 저장소를 빌드하면 Windows의 `ServerCore.lib` 또는 Linux의 `libServerCore.a`와 선택적인 검사 실행 파일이 만들어진다. 실제 게임의 메시지 처리, 실행 진입점과 운영 설정은 ServerCore를 소비하는 서버 프로젝트가 제공한다.
 
 아래 명령은 별도 설명이 없으면 저장소 루트에서 실행한다. 빌드 설정의 원본은 [CMakeLists.txt](../CMakeLists.txt), 프리셋은 [CMakePresets.json](../CMakePresets.json)이다. 런타임 구조와 지원 범위는 [아키텍처](ARCHITECTURE.md), [지원 범위와 제한](SUPPORT_AND_LIMITS.md)을 참고한다.
 
@@ -8,20 +8,52 @@ ServerCore는 게임 서버가 링크하는 **Windows용 C++20 정적 라이브�
 
 | 항목 | 현재 요구 사항 |
 | --- | --- |
-| 운영체제 | Windows. 네트워크 구현은 Winsock/IOCP를 사용하며 설치 패키지도 Windows 밖의 소비를 거절한다. |
-| 컴파일러 | C++20을 지원하는 MSVC와 Windows SDK. Visual Studio 또는 Build Tools의 C++ 빌드 도구가 필요하다. |
+| 운영체제 | Windows는 Winsock/IOCP, Linux는 epoll/POSIX 소켓을 사용한다. macOS 백엔드는 제공하지 않는다. |
+| 컴파일러 | Windows: C++20 MSVC와 Windows SDK. Linux: C++20을 지원하는 GCC 또는 Clang과 표준 라이브러리. |
 | 아키텍처 | 이 문서와 검증 스크립트는 x64 환경을 사용한다. 프리셋 자체가 `-A x64`를 지정하는 것은 아니다. |
 | CMake | 3.21 이상. `PROJECT_IS_TOP_LEVEL`과 버전 3 프리셋을 사용한다. |
-| Ninja | 기본 `msvc-debug`, `msvc-release` 프리셋의 생성기다. |
+| Ninja | `msvc-debug`, `msvc-release`, `linux-debug`, `linux-release` 프리셋의 생성기다. |
 | PowerShell | `scripts/VerifyBuild.ps1` 사용 시 5.1 이상. 직접 CMake 명령만 사용하는 빌드에는 필요하지 않다. |
 
-서드파티 패키지 설치 단계는 없다. CMake에서 vcpkg·Conan·FetchContent를 사용하지 않으며, 검사도 저장소의 작은 C++ 하네스를 사용한다. Windows 시스템 라이브러리 `ws2_32`와 UDP 토큰 생성에 쓰는 `bcrypt`는 `ServerCore::ServerCore`를 통해 최종 실행 파일에 전이된다. 다른 엔진·게임 소스 트리는 빌드 입력으로 요구하지 않는다.
+서드파티 패키지 설치 단계는 없다. CMake에서 vcpkg·Conan·FetchContent를 사용하지 않으며, 검사도 저장소의 작은 C++ 하네스를 사용한다. Windows 시스템 라이브러리 `ws2_32`와 UDP 토큰 생성에 쓰는 `bcrypt`는 `ServerCore::ServerCore`를 통해 최종 실행 파일에 전이된다. Linux에서는 `Threads::Threads`를 통해 스레드 사용 조건을 전달하며 epoll과 getrandom 등 OS 기능을 사용한다. 다른 엔진·게임 소스 트리는 빌드 입력으로 요구하지 않는다.
 
-직접 프리셋을 쓸 때는 **x64 Native Tools Command Prompt** 또는 같은 MSVC x64 환경을 가져온 PowerShell에서 시작한다. Ninja 프리셋은 `CMAKE_CXX_COMPILER=cl`만 지정하므로 일반 터미널에서 `cl.exe`나 SDK 도구를 찾지 못할 수 있다. 현재 터미널의 `cl`, `cmake --version`, `ninja --version`으로 선택한 도구를 확인한다.
+Windows에서 직접 프리셋을 쓸 때는 **x64 Native Tools Command Prompt** 또는 같은 MSVC x64 환경을 가져온 PowerShell에서 시작한다. Ninja 프리셋은 `CMAKE_CXX_COMPILER=cl`만 지정하므로 일반 터미널에서 `cl.exe`나 SDK 도구를 찾지 못할 수 있다. 현재 터미널의 `cl`, `cmake --version`, `ninja --version`으로 선택한 도구를 확인한다.
 
 라이브러리는 MSVC에서 `/W4 /WX /permissive- /utf-8 /EHsc`로 컴파일한다. `/WX`는 라이브러리의 경고를 빌드 실패로 취급한다. 테스트도 `/W4 /permissive- /utf-8 /EHsc`를 사용하지만 현재 각 대상에 `/WX`를 직접 설정하지는 않는다.
 
 ## 2. 기본 빌드: Ninja Debug·Release
+
+### Ubuntu에서 빌드·검사
+
+Ubuntu에서 저장소 루트로 이동한 뒤 실행한다. 표준 C++ 런타임과 운영체제 기능 외에 별도 네트워크·암호 라이브러리를 설치하지 않는다. TLS는 이 라이브러리의 기능에 포함되지 않는다.
+
+```bash
+sudo apt update
+sudo apt install build-essential cmake ninja-build
+cmake --version
+c++ --version
+
+cmake --preset linux-debug
+cmake --build --preset linux-debug
+ctest --preset linux-debug
+
+cmake --preset linux-release
+cmake --build --preset linux-release
+ctest --preset linux-release
+```
+
+Linux 프리셋은 `CMAKE_CXX_COMPILER`를 고정하지 않는다. 기본 C++ 컴파일러를 사용하고, 다른 컴파일러를 지정하려면 새 빌드 트리에서 `-DCMAKE_CXX_COMPILER=clang++`처럼 지정한다. CMake 3.21 이상과 C++20 표준 라이브러리가 필요하다.
+
+출력은 `build/linux-debug/libServerCore.a`, `build/linux-debug/tests/ServerCoreTests`이며 Release는 `build/linux-release` 아래에 생긴다. 테스트를 켠 Linux 빌드에서도 기존 TCP·UDP·설정·Host 검사를 동일하게 등록한다. 예를 들어 다음 명령으로 실제 전송과 웹 검사만 선택할 수 있다.
+
+```bash
+ctest --preset linux-debug -R '^ServerCore\.(Transport\.|Runtime\.Datagram|Runtime\.ServerHost|Web\.)'
+./build/linux-debug/tests/ServerCoreTests --list
+```
+
+Linux 구현과 빌드 명령의 제공은 모든 Ubuntu 환경에서 테스트를 실행했다는 뜻이 아니다. 네이티브 테스트·교차 컴파일 여부와 실제 결과는 [검증 결과](VALIDATION.md)를 확인한다. 교차 컴파일 성공으로 연결 종료·동시성·실제 소켓 동작의 검증을 대신하지 않는다.
+
+### Windows에서 빌드·검사
 
 ```powershell
 cmake --preset msvc-debug
@@ -99,10 +131,11 @@ ctest --preset msvc-debug -R '^ServerCore\.CMake\.InstallAndSourceTreeConsume$'
 | Core | 오류·결과 값, 버퍼 경계, 설정 파일과 UTF-8, 로깅, 단조 시각, 작업 큐 |
 | Protocol | 공유 프레이밍 벡터, 부분 프레임과 크기 제한, JSON/UTF-8 오류, 64비트 정수, 봉투 검증 |
 | Session·Dispatch | ID 발급·등록·해제, 관찰 중 제거, 등록 동결, 라우팅과 본문 제한, 알 수 없는 타입 정책 |
-| Transport | 실제 loopback 통신, 분할 수신, 동시 송신, 송신 예산, close-after-send, IOCP worker와 종료 순서 |
+| Transport | 실제 loopback 통신, 분할 수신, 동시 송신, 송신 예산, close-after-send, 플랫폼 I/O worker와 종료 순서 |
 | Runtime | JobRunner·PeriodicRunner, ServerHost 조립, 유휴·종료 기한, 파싱 순서, 공유 수신·파싱·송신 예산, 종료 fallback |
 | DatagramTransport | 실제 UDP 왕복, 토큰·순번·endpoint, 잘못된 패킷 거절, 콜백 수명, 수신 시도·바이트 예산 |
-| CMake 소비 | 소스 트리 소비, 설치·이동한 패키지 소비, CRT와 CMP0091 계약 |
+| Web | HTTP/1.1·WebSocket 파싱과 실제 연결 동작. 지원 범위는 [웹 서버 문서](WEB.md) 참조 |
+| CMake 소비 | 소스 트리 소비, 설치·이동한 패키지 소비, MSVC에서 CRT와 CMP0091 계약 |
 
 [PublicHeaderCompileCheck.cpp](../src/PublicHeaderCompileCheck.cpp)는 라이브러리에 항상 포함된다. 목록에 있는 공개 헤더를 한 번역 단위에서 함께 컴파일하므로 테스트를 끈 빌드에도 공개 선언 컴파일 확인이 남는다. 각 헤더를 독립된 번역 단위로 하나씩 검사하는 방식은 아니며, 새 공개 헤더는 이 파일의 목록에도 추가해야 한다.
 
@@ -142,13 +175,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/VerifyBuild.ps1 -Ski
 
 ### 설치·소스 소비 회귀의 내용
 
-`ServerCore.CMake.InstallAndSourceTreeConsume`은 [CMakePackageTest.cmake](../tests/CMakePackageTest.cmake)를 실행하며 180초 제한이 있다. 일반 C++ 검사와 달리 이 검사는 내부에서 작은 별도 프로젝트를 구성·빌드·실행한다.
+`ServerCore.CMake.InstallAndSourceTreeConsume`은 [CMakePackageTest.cmake](../tests/CMakePackageTest.cmake)를 실행하며 600초 제한이 있다. 일반 C++ 검사와 달리 이 검사는 내부에서 작은 별도 프로젝트를 구성·빌드·실행한다.
 
 1. `add_subdirectory()`로 ServerCore를 포함한 소비자를 구성·빌드·실행한다. 테스트가 부모에 기본으로 딸려오지 않는지도 확인한다.
 2. 현재 빌드의 설치 결과를 전용 prefix에 만들고 다른 경로로 이동한다.
 3. 이동한 prefix만 `find_package(... NO_DEFAULT_PATH)`로 찾아 소비자를 구성·빌드·실행한다. 개발기에 남아 있는 다른 설치본으로 우연히 통과하는 것을 방지한다.
 4. MSVC에서는 CXX 활성화 이전에 CMP0091을 NEW로 선택하지 않은 오래된 부모가 명확한 오류로 거절되는지 검사한다.
-5. producer의 전역 CRT 기본값을 `/MT[d]`로 주어도 ServerCore 대상이 `/MD[d]`를 유지하는지 확인한다. 일치하는 소비자는 실행하고, 불일치하는 소비자는 단순 실패뿐 아니라 `LNK2038`와 `RuntimeLibrary` 진단까지 확인한다.
+5. MSVC에서는 producer의 전역 CRT 기본값을 `/MT[d]`로 주어도 ServerCore 대상이 `/MD[d]`를 유지하는지 확인한다. 일치하는 소비자는 실행하고, 불일치하는 소비자는 단순 실패뿐 아니라 `LNK2038`와 `RuntimeLibrary` 진단까지 확인한다.
+
+소스 트리와 설치 패키지 소비자 모두 모든 공개 헤더와 새 API를 경고를 오류로 취급하여 컴파일한다. 별도 호환성 소비자는 deprecation 경고만 억제하고 기존 API의 링크와 동작을 확인한다. 네 deprecated API는 각각 독립된 컴파일 실패 검사로 경고 종류와 대체 API 이름까지 확인한다. 이동 방법은 [API_MIGRATION.md](API_MIGRATION.md)를 참고한다.
 
 중간 파일은 현재 빌드 트리의 `tests/PackageConsumer` 아래에 두며 매회 해당 전용 디렉터리를 다시 준비한다. 같은 트리에서 이 검사를 중복 실행하지 않는다. 검사 소비자의 C++20 코드, 공개 헤더, 버전 함수와 잘못된 endpoint의 오류 반환을 통해 target의 사용 요구 사항과 실제 링크를 확인한다. 설치 압축 파일이나 운영 서버 설치 프로그램을 생성하는 검사는 아니다.
 
@@ -205,7 +240,15 @@ cmake --build build/debug
 .\build\debug\MyServer.exe
 ```
 
-`ServerCore::ServerCore`를 링크하면 공개 include 경로, C++20 기능 요구, `ws2_32`·`bcrypt` 링크 의존성, MSVC `/utf-8`이 전이된다. `src` 내부 include 경로와 내부 테스트 hook 정의는 전이되지 않는다. 소스 트리 포함 시 테스트의 기본값은 OFF지만 기존 CMake 캐시에 이미 다른 값이 있으면 그 값이 유지된다. 예제의 `CACHE` 설정도 사용자의 기존 값을 강제로 덮어쓰지 않는다.
+Ubuntu의 같은 소스 소비 프로젝트에서는 다음처럼 빌드한다.
+
+```bash
+cmake -S . -B build/linux-release -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build/linux-release
+./build/linux-release/MyServer
+```
+
+`ServerCore::ServerCore`를 링크하면 공개 include 경로와 C++20 기능 요구가 전이된다. Windows는 `ws2_32`·`bcrypt`와 MSVC `/utf-8`, Linux는 `Threads::Threads` 사용 조건이 추가된다. `src` 내부 include 경로와 내부 테스트 hook 정의는 전이되지 않는다. 소스 트리 포함 시 테스트의 기본값은 OFF지만 기존 CMake 캐시에 이미 다른 값이 있으면 그 값이 유지된다. 예제의 `CACHE` 설정도 사용자의 기존 값을 강제로 덮어쓰지 않는다.
 
 ## 6. 설치 패키지로 소비하기
 
@@ -214,7 +257,7 @@ cmake --build build/debug
 ```text
 <prefix>/
   include/ServerCore/...
-  lib/ServerCore.lib
+  lib/ServerCore.lib              # Linux: libServerCore.a
   lib/cmake/ServerCore/
     ServerCoreConfig.cmake
     ServerCoreConfigVersion.cmake
@@ -237,7 +280,23 @@ $serverCoreInstallDebug = Join-Path (Get-Location).Path out/install-debug
 cmake --install build/package-debug --prefix "$serverCoreInstallDebug"
 ```
 
-Debug와 Release는 **다른 prefix에 설치한다.** 현재 라이브러리에 Debug 접미사나 구성별 `lib` 하위 경로가 없어 둘 다 `lib/ServerCore.lib`로 설치된다. 같은 prefix에 순서대로 설치하면 라이브러리가 덮어써져 구성별 export 파일과 실제 바이너리가 맞지 않을 수 있다.
+Ubuntu에서는 tests를 끈 별도 트리에서 정적 라이브러리를 만들고 설치한다.
+
+```bash
+cmake -S . -B build/linux-package-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DSERVERCORE_BUILD_TESTS=OFF
+cmake --build build/linux-package-release --target ServerCore
+cmake --install build/linux-package-release --prefix "$PWD/out/linux-install-release"
+```
+
+Linux 설치본의 라이브러리 이름은 `libServerCore.a`다. 아래의 동일한 `find_package` 소비 프로젝트에서 설치 prefix를 전달한다. 예를 들어 이웃 `MyServer` 디렉터리에서:
+
+```bash
+cmake -S . -B build/linux-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(realpath ../ServerCore/out/linux-install-release)"
+cmake --build build/linux-release
+./build/linux-release/MyServer
+```
+
+Debug와 Release는 **다른 prefix에 설치한다.** 현재 라이브러리에 Debug 접미사나 구성별 `lib` 하위 경로가 없어 Windows에서는 둘 다 `lib/ServerCore.lib`, Linux에서는 둘 다 `lib/libServerCore.a`로 설치된다. 같은 prefix에 순서대로 설치하면 라이브러리가 덮어써져 구성별 export 파일과 실제 바이너리가 맞지 않을 수 있다.
 
 앞 절과 같은 `MyServer/main.cpp`를 두고, 이번에는 `MyServer/CMakeLists.txt`를 다음으로 사용한다.
 
@@ -264,19 +323,21 @@ cmake --build build/release
 .\build\release\MyServer.exe
 ```
 
-`CMAKE_PREFIX_PATH`에는 `include`나 `.lib`가 아닌 설치 prefix를 넘긴다. 대안으로 `ServerCore_DIR`에 `lib/cmake/ServerCore`를 지정할 수 있다. Debug 소비자는 Debug 빌드와 `out/install-debug`를 짝지어 사용한다.
+`CMAKE_PREFIX_PATH`에는 `include`나 `.lib`/`.a` 파일이 아닌 설치 prefix를 넘긴다. 대안으로 `ServerCore_DIR`에 `lib/cmake/ServerCore`를 지정할 수 있다. Debug 소비자는 Debug 빌드와 `out/install-debug`를 짝지어 사용한다.
 
 현재 package 버전은 CMake 프로젝트의 `0.1.0`이며 버전 파일은 `SameMajorVersion` 규칙을 사용한다. 특정 산출물이 필요하면 `find_package(ServerCore 0.1.0 EXACT CONFIG REQUIRED)`로 고정할 수 있다. 이 버전 선택 규칙이 임의의 컴파일러·CRT·표준 라이브러리 ABI 호환을 보증하는 것은 아니다.
 
 ## 7. CRT·ABI와 실제 배포 경계
 
-ServerCore는 정적 라이브러리이지만 MSVC CRT는 Debug에서 `/MDd`, 그 밖의 구성에서 `/MD`를 선택한다. **정적 라이브러리와 정적 CRT는 다른 선택**이다. 기본 빌드에서 `ServerCore.dll`은 만들어지지 않으며 ServerCore 코드는 소비 실행 파일에 링크된다. 그래도 `/MD` 실행 파일에는 그 도구 집합에 맞는 동적 MSVC 런타임이 실행 환경에 있어야 한다.
+Windows에서 ServerCore는 정적 라이브러리이지만 MSVC CRT는 Debug에서 `/MDd`, 그 밖의 구성에서 `/MD`를 선택한다. **정적 라이브러리와 정적 CRT는 다른 선택**이다. 기본 빌드에서 `ServerCore.dll`은 만들어지지 않으며 ServerCore 코드는 소비 실행 파일에 링크된다. 그래도 `/MD` 실행 파일에는 그 도구 집합에 맞는 동적 MSVC 런타임이 실행 환경에 있어야 한다.
 
 공개 API에서 `std::string`, `std::function`, `std::shared_ptr`와 컨테이너 등 C++ 객체를 주고받는다. 소비자와 라이브러리는 아키텍처, Debug/Release, CRT, 컴파일러·표준 라이브러리 ABI를 일치시켜 사용한다. 임의의 바이너리 ABI 호환 계층이나 C API가 있는 패키지는 아니다. 소비자를 `/MT[d]`로 바꿔 연결하면 현재 MSVC 소비 회귀가 기대하는 `LNK2038 RuntimeLibrary` 불일치 대상이 된다. 오류를 링크 옵션으로 감추기보다 양쪽 빌드 설정을 맞춘다.
 
 `MSVC_RUNTIME_LIBRARY`가 작동하려면 MSVC ABI 언어를 처음 활성화하는 `project()` 또는 `enable_language()` **이전**에 CMP0091이 NEW여야 한다. ServerCore 하위 디렉터리에 들어온 뒤 정책을 바꾸는 것만으로 이미 활성화된 부모 언어 설정을 되돌릴 수 없다. 소스 소비 예제에서 정책 줄을 부모의 `project()` 위에 둔 이유다. ServerCore는 자기 대상의 CRT를 정하지만 소비 실행 파일의 CRT까지 자동으로 강제하지는 않는다.
 
-개발용으로 설치 패키지를 전달할 때는 `include`, `lib`, `lib/cmake/ServerCore`를 함께 보관한다. 실행 사용자에게 배포할 때는 소비 프로젝트가 만든 Release 실행 파일과 그 프로젝트의 필요한 설정·데이터 및 런타임 의존성을 기준으로 구성한다. CMake의 `cmake --install`은 ServerCore 개발 패키지를 설치할 뿐 게임 서버 실행 파일, Windows 서비스 등록, 방화벽 규칙, 인증서, 런타임 설치 프로그램을 함께 만들지 않는다. 현재 저장소에는 CPack 기반 배포 압축/설치 프로그램 생성 단계도 없다.
+Linux 소비자는 CPU 아키텍처와 컴파일러·표준 라이브러리 ABI 및 배포 대상의 libc 버전을 맞춘다. 정적 ServerCore 링크가 실행 파일 전체의 정적 링크를 뜻하지 않으며, 기본 빌드에는 별도 `libServerCore.so`가 없다. OS 표준 런타임 외의 서드파티 실행 의존성을 추가하지 않는다.
+
+개발용으로 설치 패키지를 전달할 때는 `include`, `lib`, `lib/cmake/ServerCore`를 함께 보관한다. 실행 사용자에게 배포할 때는 소비 프로젝트가 만든 Release 실행 파일과 그 프로젝트의 필요한 설정·데이터 및 런타임 의존성을 기준으로 구성한다. CMake의 `cmake --install`은 ServerCore 개발 패키지를 설치할 뿐 게임 서버 실행 파일, Windows 서비스·Linux systemd 등록, 방화벽 규칙, 인증서, 런타임 설치 프로그램을 함께 만들지 않는다. 현재 저장소에는 CPack 기반 배포 압축/설치 프로그램 생성 단계도 없다.
 
 `build/`, `out/`, `cmake-build-*` 및 일반 바이너리·로그는 [.gitignore](../.gitignore)에 제외되어 있다. Git에 소스를 올리는 것과 빌드 산출물을 배포하는 것은 별도 작업이다. 검증 기록에는 구성·툴체인·소스 상태와 실제 실행한 검사 범위를 남긴다.
 
@@ -290,7 +351,7 @@ ServerCore는 정적 라이브러리이지만 MSVC CRT는 Debug에서 `/MDd`, �
 | 기존 캐시와 생성기·컴파일러가 다름 | 같은 build 디렉터리에 Ninja와 Visual Studio 설정을 섞지 않는다. 별도 디렉터리에서 새로 구성한다. |
 | `ServerCore requires CMP0091 NEW` | 부모의 첫 CXX 활성화 이전으로 정책 설정을 옮긴다. ServerCore 아래에서만 설정하지 않는다. |
 | `LNK2038`의 `RuntimeLibrary` 불일치 | `/MDd`·`/MD`와 Debug·Release 조합을 확인한다. 같은 prefix에 다른 구성의 `.lib`를 덮어쓰지 않았는지도 확인한다. |
-| `find_package`가 실패하거나 예상 밖 설치본을 찾음 | 설치 prefix와 `ServerCore_DIR`, 캐시의 기존 탐색 결과를 확인한다. 설치 패키지는 Windows용이며 헤더만 복사한 디렉터리는 완전한 패키지가 아니다. |
+| `find_package`가 실패하거나 예상 밖 설치본을 찾음 | 설치 prefix와 `ServerCore_DIR`, 캐시의 기존 탐색 결과를 확인한다. 설치본의 OS·아키텍처·툴체인이 소비자와 맞아야 하며 헤더만 복사한 디렉터리는 완전한 패키지가 아니다. |
 | CTest 목록이 비어 있음 | `SERVERCORE_BUILD_TESTS=ON`으로 구성했는지 확인한다. 최상위가 아닌 소비 프로젝트에서는 기본 OFF다. |
 | 검사 이름을 직접 실행했는데 찾지 못함 | `ServerCoreTests.exe --list`의 내부 이름을 사용한다. CTest 접두사 `ServerCore.`는 직접 실행 인수에서 제외한다. |
 | TCP 검사의 bind 실패·시간 초과 | 다른 프로세스의 포트 점유와 중복 CTest 실행을 확인한다. 다중 구성의 Debug·Release는 기본 포트 기준값을 공유한다. |

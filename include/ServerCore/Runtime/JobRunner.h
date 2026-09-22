@@ -36,9 +36,10 @@ class PeriodicRunner;
 /// 약속하지 않는 것:
 /// - 작업이 언제 실행되는지 약속하지 않는다. 앞선 작업이 오래 걸리면 그만큼 밀린다.
 /// - 공평함을 약속하지 않는다. 넣은 순서대로 실행되지만 넣는 쪽들 사이의 균형은 보지 않는다.
-/// - Stop은 새 작업 수락을 먼저 닫고, 그 전에 수락한 작업을 전부 실행한 뒤 돌아온다.
-///   따라서 Stop 뒤 Post는 Closed를 돌려주며, 이미 들어 있던 작업은 버리지 않는다.
-/// - Stop 뒤에 다시 시작하는 것은 지원하지 않는다. 서버 수명 하나에 실행자 하나를 쓴다.
+/// - RequestStop은 새 작업 수락을 닫고 즉시 돌아온다. 그 전에 수락한 작업은
+///   RunUntilStopped가 전부 실행한 뒤 반환한다. 완료를 기다리려면 그 실행 스레드를 join한다.
+///   RequestStop 뒤 Post는 Closed를 돌려주며, 이미 들어 있던 작업은 버리지 않는다.
+/// - 종료 요청 뒤에 다시 시작하는 것은 지원하지 않는다. 서버 수명 하나에 실행자 하나를 쓴다.
 /// </remarks>
 class JobRunner
 {
@@ -96,7 +97,18 @@ public:
     /// <summary>멈추라는 요청이 올 때까지 이 스레드에서 작업을 계속 실행한다.</summary>
     void RunUntilStopped();
 
-    /// <summary>RunUntilStopped에서 빠져나오게 한다. 스레드 안전하다.</summary>
+    /// <summary>새 작업 수락을 닫고 실행 루프에 종료를 요청한다. 스레드 안전하다.</summary>
+    /// <remarks>
+    /// 진행 중인 작업이나 실행 스레드를 기다리지 않고 돌아온다. 실행 중인 작업 안에서도
+    /// 부를 수 있고 여러 번 불러도 된다. 이미 수락한 작업은 RunUntilStopped가 모두 실행한 뒤
+    /// 반환하므로, 완료와 객체 수명을 동기화하려면 호출자가 그 실행 스레드를 join해야 한다.
+    /// RunUntilStopped를 아직 시작하지 않았어도 요청할 수 있으며, 그 뒤 실행 루프를 시작하면
+    /// 앞서 수락한 작업을 비운 다음 반환한다.
+    /// </remarks>
+    void RequestStop();
+
+    /// <summary>RequestStop으로 위임하는 호환 API다. 작업 완료를 기다리지 않는다.</summary>
+    [[deprecated("Use RequestStop(); join the RunUntilStopped thread to wait for completion")]]
     void Stop();
 
     /// <summary>현재 호출자가 이 실행자의 작업을 실제로 실행 중인 스레드인지 답한다.</summary>
@@ -122,7 +134,7 @@ public:
     /// </summary>
     /// <remarks>
     /// 생성 시점에는 이 JobRunner가 살아 있어야 한다. 그 뒤에는 Lease가 큐 상태를 붙들고,
-    /// JobRunner 소멸자가 정지를 요청한 뒤에는 Closed만 돌려준다. Lease에는 Stop이나
+    /// JobRunner 소멸자가 정지를 요청한 뒤에는 Closed만 돌려준다. Lease에는 RequestStop이나
     /// RunUntilStopped가 없으므로, ServerHost가 소유한 실행자의 종료 순서를 호출자가 바꿀 수
     /// 없다.
     /// </remarks>

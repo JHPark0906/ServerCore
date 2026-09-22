@@ -41,26 +41,27 @@ namespace
     return code != nullptr && code->TryString() != nullptr;
 }
 
-[[nodiscard]] Core::Status ValidateFields(const MessageFields& fields)
+[[nodiscard]] Core::Status ValidateFields(
+    const MessageFields& fields, const Core::ErrorCode failureCode)
 {
     if (fields.type.empty())
     {
         return Core::Status::Fail(
-            Core::ErrorCode::InvalidArgument, "a message type must not be empty");
+            failureCode, "a message type must not be empty");
     }
     if (fields.body == nullptr && fields.error == nullptr)
     {
         return Core::Status::Fail(
-            Core::ErrorCode::InvalidArgument, "a message requires body or error");
+            failureCode, "a message requires body or error");
     }
     if (fields.body != nullptr && !fields.body->IsObject())
     {
         return Core::Status::Fail(
-            Core::ErrorCode::InvalidArgument, "a message body must be a JSON object");
+            failureCode, "a message body must be a JSON object");
     }
     if (fields.error != nullptr && !IsErrorEnvelope(*fields.error))
     {
-        return Core::Status::Fail(Core::ErrorCode::InvalidArgument,
+        return Core::Status::Fail(failureCode,
             "a message error requires an object with string code");
     }
     return Core::Status::Ok();
@@ -111,7 +112,7 @@ Core::Result<Message> ParseMessage(const std::span<const std::byte> jsonBody)
         }
 
         const JsonValue* const type = document.value.Find("type");
-        if (type == nullptr || type->TryString() == nullptr || type->TryString()->empty())
+        if (type == nullptr || type->TryString() == nullptr)
         {
             return Core::Result<Message>::FromStatus(
                 InvalidEnvelope("the message envelope requires a non-empty string type"));
@@ -119,20 +120,13 @@ Core::Result<Message> ParseMessage(const std::span<const std::byte> jsonBody)
 
         const JsonValue* const body = document.value.Find("body");
         const JsonValue* const error = document.value.Find("error");
-        if (body == nullptr && error == nullptr)
+        // Incoming wire data and outgoing fields obey the same envelope grammar;
+        // their error codes distinguish malformed input from caller misuse.
+        Core::Status fieldsStatus = ValidateFields(
+            MessageFields{ *type->TryString(), body, nullptr, error }, Core::ErrorCode::InvalidFormat);
+        if (!fieldsStatus.IsOk())
         {
-            return Core::Result<Message>::FromStatus(
-                InvalidEnvelope("the message envelope requires body or error"));
-        }
-        if (body != nullptr && !body->IsObject())
-        {
-            return Core::Result<Message>::FromStatus(
-                InvalidEnvelope("the message body must be a JSON object"));
-        }
-        if (error != nullptr && !IsErrorEnvelope(*error))
-        {
-            return Core::Result<Message>::FromStatus(
-                InvalidEnvelope("the message error requires an object with string code"));
+            return Core::Result<Message>::FromStatus(std::move(fieldsStatus));
         }
 
         // 파서 문서와 수신 버퍼의 수명은 여기서 끝날 수 있다. 반환 메시지는 봉투 필드들을
@@ -141,16 +135,16 @@ Core::Result<Message> ParseMessage(const std::span<const std::byte> jsonBody)
         message.mType = *type->TryString();
         if (body != nullptr)
         {
-            message.mBody = *body;
+            message.mBody.emplace(*body);
             message.mRawBodySize = document.rawBodySize;
         }
         if (const JsonValue* const sequence = document.value.Find("seq"))
         {
-            message.mSequence = *sequence;
+            message.mSequence.emplace(*sequence);
         }
         if (error != nullptr)
         {
-            message.mError = *error;
+            message.mError.emplace(*error);
         }
         return Core::Result<Message>::FromValue(std::move(message));
     }
@@ -168,7 +162,7 @@ Core::Result<std::vector<std::byte>> SerializeMessage(const MessageFields& field
 {
     try
     {
-        Core::Status fieldsStatus = ValidateFields(fields);
+        Core::Status fieldsStatus = ValidateFields(fields, Core::ErrorCode::InvalidArgument);
         if (!fieldsStatus.IsOk())
         {
             return Core::Result<std::vector<std::byte>>::FromStatus(std::move(fieldsStatus));

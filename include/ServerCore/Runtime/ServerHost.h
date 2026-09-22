@@ -38,7 +38,7 @@ struct ServerHostOptions
     /// <summary>들을 TCP 포트. 0은 미구성 값이며 Configure에서 거절한다.</summary>
     std::uint16_t port = 0;
 
-    /// <summary>IOCP 완료를 처리할 I/O 스레드 수.</summary>
+    /// <summary>네트워크 I/O 이벤트를 처리할 스레드 수.</summary>
     /// <remarks>MaximumServerHostWorkerThreadCount를 넘을 수 없다.</remarks>
     int ioWorkerThreadCount = 1;
 

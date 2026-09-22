@@ -2,7 +2,11 @@
 
 #include "TestHarness.h"
 
+#ifdef _WIN32
 #include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <atomic>
 #include <filesystem>
@@ -24,9 +28,18 @@ namespace ServerCoreTest
 {
 inline std::atomic<unsigned long> gConfigTestFileSequence{ 0 };
 
+[[nodiscard]] inline unsigned long ConfigTestProcessId() noexcept
+{
+#ifdef _WIN32
+    return static_cast<unsigned long>(::_getpid());
+#else
+    return static_cast<unsigned long>(::getpid());
+#endif
+}
+
 [[nodiscard]] inline std::string MakeTemporaryConfigPath()
 {
-    const unsigned long processId = static_cast<unsigned long>(::_getpid());
+    const unsigned long processId = ConfigTestProcessId();
 
     std::string path("ServerCoreConfigTest-");
     path.append(std::to_string(processId));
@@ -44,7 +57,7 @@ struct NativeConfigPath
 
 [[nodiscard]] inline NativeConfigPath MakeUtf8TemporaryConfigPath()
 {
-    const unsigned long processId = static_cast<unsigned long>(::_getpid());
+    const unsigned long processId = ConfigTestProcessId();
     const unsigned long sequence = gConfigTestFileSequence.fetch_add(1);
 
     std::string utf8("ServerCoreConfigTest-");
@@ -53,12 +66,17 @@ struct NativeConfigPath
     utf8.append(std::to_string(sequence));
     utf8.append("-경로.cfg");
 
+#ifdef _WIN32
     std::wstring native(L"ServerCoreConfigTest-");
     native.append(std::to_wstring(processId));
     native.push_back(L'-');
     native.append(std::to_wstring(sequence));
     native.append(L"-경로.cfg");
     return NativeConfigPath{ std::move(utf8), std::filesystem::path(std::move(native)) };
+#else
+    const std::filesystem::path native(utf8);
+    return NativeConfigPath{ std::move(utf8), native };
+#endif
 }
 
 class ScopedConfigFile final

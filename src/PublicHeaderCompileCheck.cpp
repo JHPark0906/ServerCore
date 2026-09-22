@@ -35,3 +35,4 @@
 #include "ServerCore/Runtime/ServerHost.h"
 #include "ServerCore/Session/Session.h"
 #include "ServerCore/Session/SessionRegistry.h"
+#include "ServerCore/Web/HttpServer.h"

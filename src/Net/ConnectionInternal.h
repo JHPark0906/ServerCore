@@ -1,6 +1,12 @@
 #pragma once
 
 #include "ServerCore/Net/Connection.h"
+#include "Net/SendBudgetInternal.h"
+#include "Net/SendQueueInternal.h"
+
+#ifndef _WIN32
+#include "Net/Linux/ConnectionInternal.h"
+#else
 
 #include "Net/IoOperationInternal.h"
 #include "Net/WinsockInternal.h"
@@ -8,37 +14,13 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <span>
-#include <vector>
 
 namespace ServerCore::Net
 {
 class TcpConnection;
-
-/// <summary>여러 Connection이 함께 쓰는 보관 송신 payload 바이트 예산이다.</summary>
-/// <remarks>
-/// ServerHost가 만든 연결들에만 같은 인스턴스를 주입한다. Acceptor를 직접 쓰는 소비자는 기존의
-/// Connection별 SendQueueLimitBytes만 적용받는다. 예약과 반납은 여러 I/O·게임 스레드에서 동시에
-/// 일어나므로 원자적으로 직렬화한다.
-/// </remarks>
-class SendBudget
-{
-public:
-    explicit SendBudget(std::size_t limitBytes) noexcept;
-
-    [[nodiscard]] bool TryReserve(std::size_t byteCount) noexcept;
-    void Release(std::size_t byteCount) noexcept;
-
-    [[nodiscard]] std::size_t LimitBytes() const noexcept;
-    [[nodiscard]] std::size_t UsedBytes() const noexcept;
-
-private:
-    std::size_t mLimitBytes;
-    std::atomic<std::size_t> mUsedBytes{ 0 };
-};
 
 /// <summary>수신 요청 하나가 한 번에 받아 둘 수 있는 바이트 수다.</summary>
 /// <remarks>
@@ -184,7 +166,7 @@ private:
     /// <summary>더 보내지 않을 큐 바이트를 버린다. mMutex를 쥔 채 부른다.</summary>
     /// <remarks>
     /// 진행 중인 WSASend는 mSendQueue의 맨 앞 vector를 직접 가리킨다. 그래서 그 요청이 끝나기
-    /// 전에는 clear()하면 안 된다. mSendInFlight가 거짓이 된 뒤에만 이 함수를 불러야 버퍼 수명과
+    /// 전에는 Clear()하면 안 된다. mSendInFlight가 거짓이 된 뒤에만 이 함수를 불러야 버퍼 수명과
     /// Close()의 "남은 바이트를 버린다"는 공개 계약을 함께 지킨다.
     /// </remarks>
     void DiscardQueuedSendsLocked() noexcept;
@@ -209,7 +191,6 @@ private:
 
     mutable std::mutex mMutex;
     std::shared_ptr<WinsockScope> mWinsock;
-    std::shared_ptr<SendBudget> mSendBudget;
     SOCKET mSocket = INVALID_SOCKET;
 
     std::weak_ptr<IConnectionObserver> mObserver;
@@ -220,20 +201,7 @@ private:
     SendOperation mSendOperation;
 
     /// <summary>아직 보내지 못한 바이트. 맨 앞이 지금 보내는 중인 것이다.</summary>
-    std::deque<std::vector<std::byte>> mSendQueue;
-
-    /// <summary>맨 앞 원소에서 이미 보낸 바이트 수. 부분 전송이 있어 필요하다.</summary>
-    std::size_t mSendOffset = 0;
-
-    /// <summary>아직 보내지 못한 전체 바이트 수. QueuedSendBytes()가 공개하는 값이다.</summary>
-    std::size_t mQueuedSendBytes = 0;
-
-    /// <summary>큐 vector가 아직 보관하는 payload 바이트 수. SendQueueLimitBytes와 견준다.</summary>
-    /// <remarks>
-    /// 부분 전송된 맨 앞 vector는 WSASend가 끝날 때까지 보낸 prefix도 메모리에 남긴다. 그 prefix를
-    /// 빼고 입장을 받으면 실제 보관 payload가 상한의 두 배 가까이 늘 수 있어 별도로 센다.
-    /// </remarks>
-    std::size_t mRetainedSendBytes = 0;
+    SendQueue mSendQueue;
 
     bool mSendInFlight = false;
 
@@ -261,3 +229,5 @@ private:
     std::atomic<bool> mDisconnectNotified{ false };
 };
 }
+
+#endif

@@ -18,6 +18,35 @@ function(RunOrFail stage)
     endif ()
 endfunction()
 
+# These targets are excluded from the normal consumer build because each must
+# fail for one deprecated declaration. Require the compiler's warning category
+# and the replacement name; a missing header or compiler must never count.
+include("${CMAKE_CURRENT_LIST_DIR}/ApiConsumer/DeprecatedApis.cmake")
+function(RunConsumerDeprecationChecks stage buildDirectory)
+    foreach (probe IN LISTS SERVERCORE_DEPRECATED_API_PROBES)
+        string(REPLACE "|" ";" fields "${probe}")
+        list(GET fields 0 suffix)
+        list(GET fields 2 replacement)
+        execute_process(
+                COMMAND "${CMAKE_COMMAND}" --build "${buildDirectory}"
+                --config "${SERVERCORE_PACKAGE_CONFIGURATION}"
+                --target "ServerCoreDeprecated${suffix}"
+                RESULT_VARIABLE result
+                OUTPUT_VARIABLE output
+                ERROR_VARIABLE error)
+        string(CONCAT diagnostic "${output}" "\n" "${error}")
+        file(WRITE "${buildDirectory}/deprecation-${suffix}.log" "${diagnostic}")
+        string(FIND "${diagnostic}" "${replacement}" replacementPosition)
+        if (result STREQUAL "0" OR
+                NOT diagnostic MATCHES "C4996|deprecated-declarations" OR
+                replacementPosition EQUAL -1)
+            message(FATAL_ERROR
+                    "${stage}: ${suffix} must fail with a deprecation diagnostic naming ${replacement}.\n"
+                    "Exit code: ${result}\n${diagnostic}")
+        endif ()
+    endforeach ()
+endfunction()
+
 # /MT[d] 소비자는 /MD[d] ServerCore 정적 라이브러리를 링크할 수 없어야 한다. 단순히
 # "빌드가 실패했다"만 보면 컴파일러 탐색 실패도 통과할 수 있으므로 MSVC의 CRT 불일치
 # 진단(LNK2038/RuntimeLibrary)까지 확인한다.
@@ -94,9 +123,13 @@ function(CreatePackageConsumerConfigureCommand outputVariable buildDirectory pac
                 "-DCMAKE_BUILD_TYPE=${SERVERCORE_PACKAGE_CONFIGURATION}")
     endif ()
 
+    if (SERVERCORE_PACKAGE_IS_MSVC)
+        list(APPEND command
+                "-DCMAKE_RC_COMPILER=${SERVERCORE_PACKAGE_RC_COMPILER}"
+                "-DCMAKE_MT=${SERVERCORE_PACKAGE_MT}")
+    endif ()
+
     list(APPEND command
-            "-DCMAKE_RC_COMPILER=${SERVERCORE_PACKAGE_RC_COMPILER}"
-            "-DCMAKE_MT=${SERVERCORE_PACKAGE_MT}"
             "-DSERVERCORE_PACKAGE_PREFIX=${packagePrefix}"
             "-DSERVERCORE_PACKAGE_VERSION=${SERVERCORE_PACKAGE_VERSION}")
 
@@ -129,10 +162,13 @@ function(CreateSourceTreeConsumerConfigureCommand outputVariable buildDirectory)
                 "-DCMAKE_BUILD_TYPE=${SERVERCORE_PACKAGE_CONFIGURATION}")
     endif ()
 
-    list(APPEND command
-            "-DCMAKE_RC_COMPILER=${SERVERCORE_PACKAGE_RC_COMPILER}"
-            "-DCMAKE_MT=${SERVERCORE_PACKAGE_MT}"
-            "-DSERVERCORE_SOURCE_DIR=${SERVERCORE_PACKAGE_SOURCE_DIR}")
+    if (SERVERCORE_PACKAGE_IS_MSVC)
+        list(APPEND command
+                "-DCMAKE_RC_COMPILER=${SERVERCORE_PACKAGE_RC_COMPILER}"
+                "-DCMAKE_MT=${SERVERCORE_PACKAGE_MT}")
+    endif ()
+
+    list(APPEND command "-DSERVERCORE_SOURCE_DIR=${SERVERCORE_PACKAGE_SOURCE_DIR}")
 
     set("${outputVariable}" "${command}" PARENT_SCOPE)
 endfunction()
@@ -144,8 +180,6 @@ foreach (requiredVariable IN ITEMS
         SERVERCORE_PACKAGE_GENERATOR
         SERVERCORE_PACKAGE_MAKE_PROGRAM
         SERVERCORE_PACKAGE_CXX_COMPILER
-        SERVERCORE_PACKAGE_RC_COMPILER
-        SERVERCORE_PACKAGE_MT
         SERVERCORE_PACKAGE_CONFIGURATION
         SERVERCORE_PACKAGE_MULTI_CONFIG
         SERVERCORE_PACKAGE_IS_MSVC
@@ -155,6 +189,14 @@ foreach (requiredVariable IN ITEMS
         message(FATAL_ERROR "${requiredVariable} was not provided to the CMake consumer test.")
     endif ()
 endforeach ()
+
+if (SERVERCORE_PACKAGE_IS_MSVC)
+    foreach (requiredVariable IN ITEMS SERVERCORE_PACKAGE_RC_COMPILER SERVERCORE_PACKAGE_MT)
+        if (NOT DEFINED ${requiredVariable} OR "${${requiredVariable}}" STREQUAL "")
+            message(FATAL_ERROR "${requiredVariable} was not provided to the MSVC consumer test.")
+        endif ()
+    endforeach ()
+endif ()
 
 # 매 회차의 install·source tree·package consumer build를 지우는 대상은 현재 build tree 아래의 이
 # 전용 디렉터리만이다. CMake의 경로 정규화 뒤에도 그 관계가 성립하는지 확인하고 나서만 재귀
@@ -213,6 +255,8 @@ RunOrFail("Running ServerCore source-tree consumer"
         -C "${SERVERCORE_PACKAGE_CONFIGURATION}"
         --output-on-failure)
 
+RunConsumerDeprecationChecks("ServerCore source-tree consumer" "${sourceTreeConsumerBuildDirectory}")
+
 RunOrFail("Installing ServerCore package"
         "${CMAKE_COMMAND}"
         --install "${packageBinaryDirectory}"
@@ -240,6 +284,8 @@ RunOrFail("Running ServerCore package consumer"
         --test-dir "${consumerBuildDirectory}"
         -C "${SERVERCORE_PACKAGE_CONFIGURATION}"
         --output-on-failure)
+
+RunConsumerDeprecationChecks("ServerCore installed-package consumer" "${consumerBuildDirectory}")
 
 if (SERVERCORE_PACKAGE_IS_MSVC)
     # target 속성이 최초 CXX enable 이후에는 무시된다는 CMake 정책 제약을 명시적으로

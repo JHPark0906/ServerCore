@@ -21,3 +21,5 @@ target_link_libraries(ServerCorePackageConsumer PRIVATE ServerCore::ServerCore)
 
 enable_testing()
 add_test(NAME ServerCorePackageConsumer.Runs COMMAND ServerCorePackageConsumer)
+include("${CMAKE_CURRENT_LIST_DIR}/../ApiConsumerChecks.cmake")
+ServerCoreAddConsumerApiChecks(ServerCorePackageConsumer)

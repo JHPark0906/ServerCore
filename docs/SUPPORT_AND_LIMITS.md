@@ -6,8 +6,9 @@
 
 | 영역 | 제공하는 기능 | 제공하지 않는 기능 |
 | --- | --- | --- |
-| 플랫폼 | Windows, WinSock2, IOCP, MSVC 기반 빌드 | Linux/macOS 백엔드, 다른 플랫폼의 동등 동작 보장 |
-| 네트워크 | IPv4 TCP 수락, 부분 수신·송신, 연결별 송신 큐, 비차단 UDP와 토큰·endpoint·순번 관리 | IPv6, TLS/DTLS, HTTP/WebSocket, DNS 해석·TCP outbound connect API |
+| 플랫폼 | Windows WinSock2·IOCP, Linux epoll·POSIX 소켓, CMake 기반 빌드 | macOS 백엔드, 서로 다른 플랫폼·툴체인의 바이너리 호환 보장 |
+| 네트워크 | IPv4 TCP 수락, 부분 수신·송신, 연결별 송신 큐, 비차단 UDP와 토큰·endpoint·순번 관리 | IPv6, TLS/DTLS, DNS 해석·TCP outbound connect API |
+| 웹 | 별도 `Web::HttpServer`의 HTTP/1.1·WebSocket | HTTP/2·HTTP/3, 내장 TLS |
 | 프로토콜 | 길이 프레임, UTF-8 JSON, 준비된 봉투 재사용, 타입별 디스패치, 헤더 전용 DatagramCodec | 게임 스키마 자동 생성, 압축, 암호화, 큰 메시지 분할·스트리밍 |
 | 세션 | ID 발급, 연결 상태, 인증 완료 상태 표시, 목록, UDP 토큰 등록·폐기 | 계정 인증과 자격 증명 검증, 자동 재접속, 세션 이관·복구 |
 | 실행 | 직렬 JobRunner, 주기 작업 예약, 선택적 JSON 파싱 병렬화 | 게임 처리기의 병렬 실행 보장, 고정 시간 내 완료 보장 |
@@ -15,6 +16,8 @@
 | 관측 | 주입형 ILogger, 고정 지표 스냅숏 | 기본 파일 로거, 로그 회전, 시계열 저장, HTTP 관리 서버 |
 
 구체 게임의 채팅·프로필 검증·접속 제한 정책은 소비 프로젝트의 기능입니다. ServerCore의 `MarkAuthenticated()`는 검증이 끝났음을 표시하는 상태 전이이며, 그 호출만으로 사용자가 인증되었다는 근거를 만들지 않습니다.
+
+`Runtime::ServerHost`의 길이 프레임 프로토콜과 `Web::HttpServer`의 HTTP·WebSocket 프로토콜은 별도 API입니다. 웹 API의 입력 크기·시간 제한과 지원 범위는 [HTTP·WebSocket](WEB.md)을 따릅니다. 플랫폼 구현의 제공 여부와 실행 검증 결과는 구분하며, 실제 검증 환경은 [검증 결과](VALIDATION.md)에 기록합니다.
 
 ### UDP 전송의 별도 한도
 
@@ -54,7 +57,7 @@
 3. **파싱 예산:** `parseWorkerThreadCount > 0`일 때 바이트 예산은 각각 최소 한 개의 최대 본문을 담아야 합니다. 전체 바이트·태스크 한도는 각각 연결별 한도 이상이어야 합니다. worker가 0이면 파싱 전용 값은 현재 ValidateOptions에서 검사하지 않고 사용하지 않습니다.
 4. **수신 예산:** 수신 예산에는 파싱 예산과 같은 전체≥개별 검사가 없습니다. 전체 예산이 작으면 여러 연결이 이를 먼저 소진할 수 있습니다. Configure 성공을 충분한 처리량의 증거로 삼지 않습니다.
 
-`acceptBacklog`, 현재 outstanding AcceptEx 요청 수, `maxConcurrentSessions`는 다른 값입니다. 구현은 수락 요청 4개를 미리 걸지만 이것이 동시 접속자를 4명으로 제한하지는 않습니다. TCP 연결 한도와 게임 가입자 한도를 같은 값으로 사용할지도 게임 서버가 정합니다.
+`acceptBacklog`, 현재 처리 중인 수락 작업 수, `maxConcurrentSessions`는 다른 값입니다. Windows 구현은 AcceptEx 요청 4개를 미리 걸지만 이것이 동시 접속자를 4명으로 제한하지는 않습니다. Linux는 비차단 수락 소켓의 epoll 이벤트를 처리합니다. TCP 연결 한도와 게임 가입자 한도를 같은 값으로 사용할지도 게임 서버가 정합니다.
 
 ### 큰 연결 상한 구성 예
 

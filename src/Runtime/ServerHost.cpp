@@ -1,5 +1,7 @@
 #include "ServerCore/Runtime/ServerHost.h"
 
+#include "Core/AtomicBudgetInternal.h"
+
 #include "ServerCore/Core/Assert.h"
 #include "ServerCore/Core/Clock.h"
 #include "ServerCore/Core/JobQueue.h"
@@ -775,45 +777,14 @@ private:
         [[nodiscard]] static bool TryReserveLocal(std::atomic<std::size_t>& pending,
             const std::size_t limit, const std::size_t amount) noexcept
         {
-            if (amount == 0)
-            {
-                return true;
-            }
-
-            std::size_t current = pending.load(std::memory_order_acquire);
-            for (;;)
-            {
-                if (current > limit || amount > limit - current)
-                {
-                    return false;
-                }
-                if (pending.compare_exchange_weak(current, current + amount,
-                        std::memory_order_acq_rel, std::memory_order_acquire))
-                {
-                    return true;
-                }
-            }
+            return Core::Detail::TryReserveBudget(pending, limit, amount);
         }
 
         static void ReleaseLocal(
             std::atomic<std::size_t>& pending, const std::size_t amount) noexcept
         {
-            if (amount == 0)
-            {
-                return;
-            }
-
-            std::size_t current = pending.load(std::memory_order_acquire);
-            for (;;)
-            {
-                SERVERCORE_ASSERT(
-                    current >= amount, "released parse work exceeded the NetworkSession budget");
-                if (pending.compare_exchange_weak(current, current - amount,
-                        std::memory_order_acq_rel, std::memory_order_acquire))
-                {
-                    return;
-                }
-            }
+            Core::Detail::ReleaseBudget(pending, amount,
+                "released parse work exceeded the NetworkSession budget");
         }
 
         std::weak_ptr<ServerHost::State> mHost;
@@ -2465,25 +2436,25 @@ Core::Status ServerHost::State::Configure(const Core::Config& config)
             ApplyOptionalString(config, HostConfigListenAddressKey, options.listenAddress);
         if (!listenAddress.IsOk())
         {
-            return std::move(listenAddress);
+            return listenAddress;
         }
         Core::Status ioWorkers =
             ApplyOptionalInt(config, HostConfigIoWorkerThreadCountKey, options.ioWorkerThreadCount);
         if (!ioWorkers.IsOk())
         {
-            return std::move(ioWorkers);
+            return ioWorkers;
         }
         Core::Status parseWorkers = ApplyOptionalInt(
             config, HostConfigParseWorkerThreadCountKey, options.parseWorkerThreadCount);
         if (!parseWorkers.IsOk())
         {
-            return std::move(parseWorkers);
+            return parseWorkers;
         }
         Core::Status acceptBacklog =
             ApplyOptionalInt(config, HostConfigAcceptBacklogKey, options.acceptBacklog);
         if (!acceptBacklog.IsOk())
         {
-            return std::move(acceptBacklog);
+            return acceptBacklog;
         }
 
         const Core::Result<int> idleSessionTimeout = config.GetInt(HostConfigIdleSessionTimeoutKey);
@@ -2512,55 +2483,55 @@ Core::Status ServerHost::State::Configure(const Core::Config& config)
             ApplyOptionalUint32(config, HostConfigMaxBodySizeKey, options.maxBodySize);
         if (!maxBodySize.IsOk())
         {
-            return std::move(maxBodySize);
+            return maxBodySize;
         }
         Core::Status maxConcurrentSessions = ApplyOptionalUint32(
             config, HostConfigMaxConcurrentSessionsKey, options.maxConcurrentSessions);
         if (!maxConcurrentSessions.IsOk())
         {
-            return std::move(maxConcurrentSessions);
+            return maxConcurrentSessions;
         }
         Core::Status maxTotalSendQueueCapacityBytes = ApplyOptionalUint32(config,
             HostConfigMaxTotalSendQueueCapacityBytesKey, options.maxTotalSendQueueCapacityBytes);
         if (!maxTotalSendQueueCapacityBytes.IsOk())
         {
-            return std::move(maxTotalSendQueueCapacityBytes);
+            return maxTotalSendQueueCapacityBytes;
         }
         Core::Status maxPendingReceiveBytes = ApplyOptionalUint32(
             config, HostConfigMaxPendingReceiveBytesKey, options.maxPendingReceiveBytes);
         if (!maxPendingReceiveBytes.IsOk())
         {
-            return std::move(maxPendingReceiveBytes);
+            return maxPendingReceiveBytes;
         }
         Core::Status maxTotalPendingReceiveBytes = ApplyOptionalUint32(
             config, HostConfigMaxTotalPendingReceiveBytesKey, options.maxTotalPendingReceiveBytes);
         if (!maxTotalPendingReceiveBytes.IsOk())
         {
-            return std::move(maxTotalPendingReceiveBytes);
+            return maxTotalPendingReceiveBytes;
         }
         Core::Status maxPendingParseBytes = ApplyOptionalUint32(
             config, HostConfigMaxPendingParseBytesKey, options.maxPendingParseBytes);
         if (!maxPendingParseBytes.IsOk())
         {
-            return std::move(maxPendingParseBytes);
+            return maxPendingParseBytes;
         }
         Core::Status maxTotalPendingParseBytes = ApplyOptionalUint32(
             config, HostConfigMaxTotalPendingParseBytesKey, options.maxTotalPendingParseBytes);
         if (!maxTotalPendingParseBytes.IsOk())
         {
-            return std::move(maxTotalPendingParseBytes);
+            return maxTotalPendingParseBytes;
         }
         Core::Status maxPendingParseTasks = ApplyOptionalUint32(
             config, HostConfigMaxPendingParseTasksKey, options.maxPendingParseTasks);
         if (!maxPendingParseTasks.IsOk())
         {
-            return std::move(maxPendingParseTasks);
+            return maxPendingParseTasks;
         }
         Core::Status maxTotalPendingParseTasks = ApplyOptionalUint32(
             config, HostConfigMaxTotalPendingParseTasksKey, options.maxTotalPendingParseTasks);
         if (!maxTotalPendingParseTasks.IsOk())
         {
-            return std::move(maxTotalPendingParseTasks);
+            return maxTotalPendingParseTasks;
         }
 
         return Configure(options);
@@ -2584,7 +2555,7 @@ Core::Status ServerHost::State::Configure(const ServerHostOptions& options)
     Core::Status valid = ValidateOptions(options);
     if (!valid.IsOk())
     {
-        return std::move(valid);
+        return valid;
     }
 
     std::optional<ServerHostOptions> copiedOptions;
@@ -2679,7 +2650,7 @@ Core::Status ServerHost::State::StartJobRunner()
                     bound->set_value(std::move(boundStatus));
                     if (!boundSuccessfully)
                     {
-                        self->mJobRunner.Stop();
+                        self->mJobRunner.RequestStop();
                         return;
                     }
 
@@ -2688,13 +2659,13 @@ Core::Status ServerHost::State::StartJobRunner()
                 catch (const std::bad_alloc&)
                 {
                     publishFailure(Core::Status::AllocationFailure());
-                    self->mJobRunner.Stop();
+                    self->mJobRunner.RequestStop();
                 }
                 catch (...)
                 {
                     publishFailure(
                         Core::Status::FailWithoutMessage(Core::ErrorCode::PlatformError));
-                    self->mJobRunner.Stop();
+                    self->mJobRunner.RequestStop();
                 }
             });
 
@@ -2802,14 +2773,14 @@ Core::Status ServerHost::State::Start()
         if (!ioStarted.IsOk())
         {
             CompleteFailedStart();
-            return std::move(ioStarted);
+            return ioStarted;
         }
 
         Core::Status runnerStarted = StartJobRunner();
         if (!runnerStarted.IsOk())
         {
             CompleteFailedStart();
-            return std::move(runnerStarted);
+            return runnerStarted;
         }
 
         if (mParsePool != nullptr)
@@ -2818,7 +2789,7 @@ Core::Status ServerHost::State::Start()
             if (!parseStarted.IsOk())
             {
                 CompleteFailedStart();
-                return std::move(parseStarted);
+                return parseStarted;
             }
         }
 
@@ -2851,7 +2822,7 @@ Core::Status ServerHost::State::Start()
             if (!timeoutTimerStarted.IsOk())
             {
                 CompleteFailedStart();
-                return std::move(timeoutTimerStarted);
+                return timeoutTimerStarted;
             }
         }
 
@@ -2883,7 +2854,7 @@ Core::Status ServerHost::State::Start()
             if (!listened.IsOk())
             {
                 CompleteFailedStart();
-                return std::move(listened);
+                return listened;
             }
 
             // 이 시점부터 등록표는 읽기 전용이다. 수락 전이므로 첫 메시지가 등록 중인 표를 볼 수 없다.
@@ -2895,7 +2866,7 @@ Core::Status ServerHost::State::Start()
             {
                 mAccepting.store(false, std::memory_order_release);
                 CompleteFailedStart();
-                return std::move(accepting);
+                return accepting;
             }
         }
         catch (const std::bad_alloc&)
@@ -2996,7 +2967,7 @@ void ServerHost::State::CompleteFailedStart() noexcept
         mIo->Stop();
     }
 
-    mJobRunner.Stop();
+    mJobRunner.RequestStop();
     if (mJobThread.joinable())
     {
         mJobThread.join();
@@ -3140,7 +3111,7 @@ void ServerHost::State::Stop()
         io->Stop();
     }
 
-    mJobRunner.Stop();
+    mJobRunner.RequestStop();
     if (mJobThread.joinable())
     {
         mJobThread.join();
@@ -3245,132 +3216,36 @@ bool ServerHost::State::IsAccepting() const noexcept
 
 bool ServerHost::State::TryReservePendingReceiveBytes(const std::size_t byteCount) noexcept
 {
-    if (byteCount == 0)
-    {
-        return true;
-    }
-
-    const std::size_t limit = static_cast<std::size_t>(mOptions.maxTotalPendingReceiveBytes);
-    std::size_t current = mPendingReceiveBytes.load(std::memory_order_acquire);
-    for (;;)
-    {
-        if (current > limit || byteCount > limit - current)
-        {
-            return false;
-        }
-        if (mPendingReceiveBytes.compare_exchange_weak(
-                current, current + byteCount, std::memory_order_acq_rel, std::memory_order_acquire))
-        {
-            return true;
-        }
-    }
+    return Core::Detail::TryReserveBudget(
+        mPendingReceiveBytes, mOptions.maxTotalPendingReceiveBytes, byteCount);
 }
 
 void ServerHost::State::ReleasePendingReceiveBytes(const std::size_t byteCount) noexcept
 {
-    if (byteCount == 0)
-    {
-        return;
-    }
-
-    std::size_t current = mPendingReceiveBytes.load(std::memory_order_acquire);
-    for (;;)
-    {
-        SERVERCORE_ASSERT(current >= byteCount,
-            "released receive bytes exceeded the ServerHost aggregate budget");
-        if (mPendingReceiveBytes.compare_exchange_weak(
-                current, current - byteCount, std::memory_order_acq_rel, std::memory_order_acquire))
-        {
-            return;
-        }
-    }
+    Core::Detail::ReleaseBudget(mPendingReceiveBytes, byteCount,
+        "released receive bytes exceeded the ServerHost aggregate budget");
 }
 
 bool ServerHost::State::TryReservePendingParseWork(
     const std::size_t byteCount, const std::size_t taskCount) noexcept
 {
-    const auto reserve = [](std::atomic<std::size_t>& pending, const std::size_t limit,
-                             const std::size_t amount) noexcept
-    {
-        if (amount == 0)
-        {
-            return true;
-        }
-
-        std::size_t current = pending.load(std::memory_order_acquire);
-        for (;;)
-        {
-            if (current > limit || amount > limit - current)
-            {
-                return false;
-            }
-            if (pending.compare_exchange_weak(current, current + amount, std::memory_order_acq_rel,
-                    std::memory_order_acquire))
-            {
-                return true;
-            }
-        }
-    };
-    const auto release = [](std::atomic<std::size_t>& pending, const std::size_t amount) noexcept
-    {
-        if (amount == 0)
-        {
-            return;
-        }
-
-        std::size_t current = pending.load(std::memory_order_acquire);
-        for (;;)
-        {
-            SERVERCORE_ASSERT(
-                current >= amount, "released parse work exceeded the ServerHost aggregate budget");
-            if (pending.compare_exchange_weak(current, current - amount, std::memory_order_acq_rel,
-                    std::memory_order_acquire))
-            {
-                return;
-            }
-        }
-    };
-
-    const std::size_t byteLimit = static_cast<std::size_t>(mOptions.maxTotalPendingParseBytes);
-    const std::size_t taskLimit = static_cast<std::size_t>(mOptions.maxTotalPendingParseTasks);
-    if (!reserve(mPendingParseBytes, byteLimit, byteCount))
-    {
+    if (!Core::Detail::TryReserveBudget(mPendingParseBytes, mOptions.maxTotalPendingParseBytes, byteCount))
         return false;
-    }
-    if (reserve(mPendingParseTasks, taskLimit, taskCount))
-    {
+    if (Core::Detail::TryReserveBudget(mPendingParseTasks, mOptions.maxTotalPendingParseTasks, taskCount))
         return true;
-    }
 
-    release(mPendingParseBytes, byteCount);
+    Core::Detail::ReleaseBudget(mPendingParseBytes, byteCount,
+        "released parse work exceeded the ServerHost aggregate budget");
     return false;
 }
 
 void ServerHost::State::ReleasePendingParseWork(
     const std::size_t byteCount, const std::size_t taskCount) noexcept
 {
-    const auto release = [](std::atomic<std::size_t>& pending, const std::size_t amount) noexcept
-    {
-        if (amount == 0)
-        {
-            return;
-        }
-
-        std::size_t current = pending.load(std::memory_order_acquire);
-        for (;;)
-        {
-            SERVERCORE_ASSERT(
-                current >= amount, "released parse work exceeded the ServerHost aggregate budget");
-            if (pending.compare_exchange_weak(current, current - amount, std::memory_order_acq_rel,
-                    std::memory_order_acquire))
-            {
-                return;
-            }
-        }
-    };
-
-    release(mPendingParseBytes, byteCount);
-    release(mPendingParseTasks, taskCount);
+    Core::Detail::ReleaseBudget(mPendingParseBytes, byteCount,
+        "released parse work exceeded the ServerHost aggregate budget");
+    Core::Detail::ReleaseBudget(mPendingParseTasks, taskCount,
+        "released parse work exceeded the ServerHost aggregate budget");
 }
 
 void ServerHost::State::RecordReceivedFrame() noexcept

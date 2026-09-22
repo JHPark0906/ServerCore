@@ -9,15 +9,15 @@ namespace ServerCore::Net
 class IoContextAccess;
 
 /// <summary>
-/// 완료 포트와 그 위에서 도는 I/O 스레드 풀을 소유한다. 전송 층의 심장이다.
+/// 운영체제의 I/O 이벤트 처리 기반과 그 위에서 도는 스레드 풀을 소유한다.
 /// </summary>
 /// <remarks>
 /// 왜 이 자리에 있는가:
-/// 이 층이 플랫폼을 아는 유일한 층이다. Winsock과 IOCP를 아는 코드가 여기 밖으로 새지 않아야
-/// 나중에 다른 플랫폼 백엔드를 이 층 옆에 세울 수 있고, 그때 위층은 바뀌지 않는다.
+/// 전송 층의 운영체제별 구현을 숨긴다. Windows IOCP와 Linux epoll의 OS 타입을 노출하지 않아야
+/// 플랫폼을 바꿔도 위층의 공개 계약을 유지할 수 있다.
 ///
-/// 소유한다: 완료 포트 핸들 하나와 I/O 스레드 전부.
-/// 소유하지 않는다: 소켓. 소켓은 수락기와 연결이 소유한다. 이 객체는 소켓을 완료 포트에
+/// 소유한다: 플랫폼 이벤트 처리 자원과 I/O 스레드 전부.
+/// 소유하지 않는다: 소켓. 소켓은 수락기와 연결이 소유한다. 이 객체는 소켓을 이벤트 처리 기반에
 /// 이어 붙이기만 하고 닫지 않는다.
 ///
 /// 소유권과 수명:
@@ -25,7 +25,7 @@ class IoContextAccess;
 /// 모두 빠져나올 때까지 기다린다. 그 "반드시"를 지키는 것은 소멸자다. 소멸자가 Stop()을
 /// 부르므로 호출자가 잊어도 스레드가 도는 채로 이 객체가 사라지지 않는다.
 ///
-/// 복사와 이동을 지운 것이 같은 약속의 나머지 절반이다. 완료 포트와 스레드를 소유하는 것이
+/// 복사와 이동을 지운 것이 같은 약속의 나머지 절반이다. 이벤트 자원과 스레드를 소유하는 것이
 /// 복사되면 같은 핸들을 두 번 닫고 같은 스레드를 두 번 join한다. 컴파일러가 만들어 주는
 /// 복사는 그것을 막지 않고 /W4 /WX도 잡지 않으므로, 막는 수단은 아래의 = delete뿐이다.
 ///
@@ -36,8 +36,8 @@ class IoContextAccess;
 /// 수락기를 먼저 멈추고, 연결을 전부 닫고, 각 연결의 OnDisconnected를 확인한 뒤 마지막에
 /// 이것을 멈춘다. Connection::Close()는 커널 요청의 취소 완료를 기다리지 않고 돌아오므로,
 /// Close() 직후 곧바로 Stop()을 부르는 것으로는 충분하지 않다. OnDisconnected는 그 연결의
-/// 진행 중인 겹침 요청이 전부 완료 포트를 지나 정리되었다는 경계다. 순서를 뒤집으면 수락기나
-/// 연결이 기다리는 완료를 처리할 스레드가 이미 없다. 수락기의 어김은 Acceptor::Stop()이 두는
+/// 진행 중인 I/O 작업과 수신 콜백이 정리되었다는 경계다. 순서를 뒤집으면 수락기나
+/// 연결이 기다리는 완료를 처리할 스레드가 이미 없다. Windows 수락기의 어김은 Acceptor::Stop()이 두는
 /// 시간 제한과 단언으로 잡지만, 연결에는 그 대기가 없으므로 호출자가 이 순서를 지켜야 한다.
 ///
 /// 약속하지 않는 것:
@@ -67,13 +67,13 @@ public:
     IoContext(IoContext&&) = delete;
     IoContext& operator=(IoContext&&) = delete;
 
-    /// <summary>완료 포트를 만들고 I/O 스레드를 띄운다.</summary>
+    /// <summary>플랫폼 이벤트 처리 기반을 만들고 I/O 스레드를 띄운다.</summary>
     /// <param name="workerThreadCount">
     /// 완료를 처리할 스레드 수. 0 이하를 넘기는 것은 계약 위반이며 단언으로 끊는다.
     /// </param>
     /// <returns>
-    /// 이미 돌고 있는데 다시 부르면 AlreadyExists. 완료 포트를 만들지 못하면 PlatformError이며
-    /// 설명 문자열에 GetLastError()의 값이 숫자 그대로 들어간다.
+    /// 이미 돌고 있는데 다시 부르면 AlreadyExists. 이벤트 자원을 만들지 못하면 PlatformError이며
+    /// 설명 문자열에 OS 오류 코드(Windows GetLastError 또는 Linux errno)가 들어간다.
     /// </returns>
     Core::Status Start(int workerThreadCount);
 
@@ -100,17 +100,17 @@ public:
     [[nodiscard]] bool IsCurrentThreadIoThread() const noexcept;
 
 private:
-    /// <summary>전송 층 구현이 완료 포트에 닿는 통로다. src/Net 안에서만 정의된다.</summary>
+    /// <summary>전송 층 구현이 이벤트 처리 기반에 닿는 통로다. src/Net 안에서만 정의된다.</summary>
     /// <remarks>
-    /// 왜 friend인가: 완료 포트 핸들은 Windows 타입이라 공개 헤더에 나올 수 없고, 공개
+    /// 왜 friend인가: 이벤트 자원은 플랫폼 타입이라 공개 헤더에 나올 수 없고, 공개
     /// 메서드로 열면 소비자가 만질 수 있는 것이 된다. 이름 하나만 friend로 두고 정의를
     /// 구현 쪽에 두면 공개 계약은 그대로다.
     /// </remarks>
     friend class IoContextAccess;
 
-    /// <summary>구현 상태. 정의는 src/Net/IoContext.cpp에 있다.</summary>
+    /// <summary>구현 상태. 정의는 src/Net 아래의 플랫폼별 구현에 있다.</summary>
     /// <remarks>
-    /// 왜 감추는가: 완료 포트 핸들과 스레드 목록을 여기 두면 이 헤더가 Windows 타입과 스레드
+    /// 왜 감추는가: 이벤트 자원과 스레드 목록을 여기 두면 이 헤더가 플랫폼 타입과 스레드
     /// 헤더를 소비자에게 딸려 보낸다. 코드 규약이 그것을 막는다.
     /// </remarks>
     class State;

@@ -334,6 +334,8 @@ void FramingConformanceVectors()
     std::size_t executed = 0;
     while (std::getline(file, line))
     {
+        // getline removes LF; retain the same vectors for a CRLF checkout on Linux.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#')
         {
             continue;
@@ -889,6 +891,84 @@ void MessageRejectsInvalidUtf8()
         "invalid UTF-8 does not escape as an exception");
 }
 
+void JsonEntryPointsShareValidation()
+{
+    const std::array<std::string, 8> invalidDocuments{
+        R"({"type":"Probe","body":{})",
+        R"({"type":"Probe","body":{}} false)",
+        R"({"type":"Probe","body":{},"body":{}})",
+        R"({"type":"Probe","body":{"value":1,}})",
+        R"({"type":"Probe","body":{"value":"\uD800"}})",
+        R"({"type":"Probe","body":{"value":18446744073709551616}})",
+        std::string(R"({"type":"Probe","body":{"value":")") + "\xC3\"}}",
+        std::string(R"({"type":"Probe","body":{"value":)") +
+            std::string(256, '[') + "0" + std::string(256, ']') + "}}"
+    };
+    for (const auto& text : invalidDocuments)
+    {
+        const auto json = JsonValue::Parse(text);
+        const auto bytes = ToBytes(text);
+        const auto byteJson = JsonValue::ParseBytes(bytes);
+        const auto envelope = ServerCore::Protocol::ParseMessage(bytes);
+        ServerCoreTest::ExpectTrue(!json.IsOk() && !byteJson.IsOk() && !envelope.IsOk() &&
+            json.GetStatus().Code() == ErrorCode::InvalidFormat &&
+            byteJson.GetStatus().Code() == ErrorCode::InvalidFormat &&
+            envelope.GetStatus().Code() == ErrorCode::InvalidFormat,
+            "JSON and message entry points reject the same malformed document");
+        ServerCoreTest::ExpectEqual(json.GetStatus().Message(), envelope.GetStatus().Message(),
+            "both entry points preserve the same JSON error location and cause");
+        ServerCoreTest::ExpectEqual(json.GetStatus().Message(), byteJson.GetStatus().Message(),
+            "the byte-oriented JSON entry point preserves the same diagnostic");
+    }
+
+    const std::string text = "\xEF\xBB\xBF \n{\"type\":\"Probe\",\"body\":{ \"x\" : 1 }}\r\n";
+    const auto json = JsonValue::Parse(text);
+    const auto envelope = ServerCore::Protocol::ParseMessage(ToBytes(text));
+    ServerCoreTest::ExpectTrue(json.IsOk() && envelope.IsOk(),
+        "both entry points accept BOM and surrounding JSON whitespace");
+    if (envelope.IsOk())
+        ServerCoreTest::ExpectEqual(std::size_t{11}, envelope.Value().RawBodySize(),
+            "shared document parsing retains original body bytes including whitespace");
+}
+
+void MessageEnvelopeValidationIsSymmetric()
+{
+    const JsonValue object(JsonValue::Object{});
+    const JsonValue scalar(1.0);
+    const JsonValue nullValue(nullptr);
+    const JsonValue error(JsonValue::Object{{"code", JsonValue(std::string("test"))}});
+    struct Example { MessageFields fields; bool valid; };
+    const std::array<Example, 8> examples{{
+        {{"Probe", &object, nullptr, nullptr}, true},
+        {{"Probe", nullptr, &scalar, &error}, true},
+        {{"Probe", &object, &nullValue, &error}, true},
+        {{"", &object, nullptr, nullptr}, false},
+        {{"Probe", nullptr, nullptr, nullptr}, false},
+        {{"Probe", &scalar, nullptr, &error}, false},
+        {{"Probe", &object, nullptr, &object}, false},
+        {{"Probe", &object, nullptr, &nullValue}, false}
+    }};
+    for (const auto& example : examples)
+    {
+        const auto& fields = example.fields;
+        JsonValue::Object raw{{"type", JsonValue(std::string(fields.type))}};
+        if (fields.body) raw.emplace("body", *fields.body);
+        if (fields.sequence) raw.emplace("seq", *fields.sequence);
+        if (fields.error) raw.emplace("error", *fields.error);
+        const auto wire = JsonValue(std::move(raw)).Dump();
+        ServerCoreTest::ExpectTrue(wire.IsOk(), "envelope examples contain valid JSON values");
+        if (!wire.IsOk()) continue;
+        const auto incoming = ServerCore::Protocol::ParseMessage(ToBytes(wire.Value()));
+        const auto outgoing = ServerCore::Protocol::SerializeMessage(fields);
+        ServerCoreTest::ExpectTrue(incoming.IsOk() == example.valid && outgoing.IsOk() == example.valid,
+            "incoming and outgoing envelopes enforce the same field rules");
+        if (!example.valid)
+            ServerCoreTest::ExpectTrue(incoming.GetStatus().Code() == ErrorCode::InvalidFormat &&
+                outgoing.GetStatus().Code() == ErrorCode::InvalidArgument,
+                "wire format errors remain distinct from invalid caller arguments");
+    }
+}
+
 void JsonDumpRejectsUnsafeValues()
 {
     JsonValue::Object validObject;
@@ -1271,6 +1351,10 @@ ServerCoreTest::CheckRegistration gJsonRejectsUnrepresentableNumbers(
     "Protocol.JsonRejectsUnrepresentableNumbers", &JsonRejectsUnrepresentableNumbers);
 ServerCoreTest::CheckRegistration gMessageRejectsInvalidUtf8(
     "Protocol.MessageRejectsInvalidUtf8", &MessageRejectsInvalidUtf8);
+ServerCoreTest::CheckRegistration gJsonEntryPointsShareValidation(
+    "Protocol.JsonEntryPointsShareValidation", &JsonEntryPointsShareValidation);
+ServerCoreTest::CheckRegistration gMessageEnvelopeValidationIsSymmetric(
+    "Protocol.MessageEnvelopeValidationIsSymmetric", &MessageEnvelopeValidationIsSymmetric);
 ServerCoreTest::CheckRegistration gJsonDumpRejectsUnsafeValues(
     "Protocol.JsonDumpRejectsUnsafeValues", &JsonDumpRejectsUnsafeValues);
 ServerCoreTest::CheckRegistration gMessageRejectsUnsafeOutboundJson(

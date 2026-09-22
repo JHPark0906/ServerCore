@@ -28,6 +28,9 @@ CMakeUserPresets.json
 *.dll
 *.exp
 *.idb
+*.a
+*.so
+*.so.*
 
 # --- 기타 ---
 *.log

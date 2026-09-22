@@ -19,10 +19,10 @@ public:
             if (mStopRequested)
             {
                 return Core::Status::Fail(
-                    Core::ErrorCode::Closed, "JobRunner no longer accepts jobs after Stop");
+                    Core::ErrorCode::Closed, "JobRunner no longer accepts jobs after RequestStop");
             }
 
-            // Stop 판정과 큐 수락을 같은 잠금에 묶는다. 정지 요청 직전에 수락한 작업이
+            // 종료 요청 판정과 큐 수락을 같은 잠금에 묶는다. 정지 요청 직전에 수락한 작업이
             // 실행자의 마지막 빈 큐 검사 뒤로 밀려 남는 틈을 만들지 않는다.
             queued = mQueue.Post(std::move(job));
         }
@@ -84,7 +84,7 @@ public:
         }
     }
 
-    void Stop()
+    void RequestStop()
     {
         {
             const std::lock_guard<std::mutex> guard(mMutex);
@@ -170,7 +170,7 @@ JobRunner::~JobRunner()
 {
     // RunUntilStopped와 Lease는 모두 SharedState의 자기 소유 복사본을 잡고 실행한다. 따라서
     // 여기서 정지를 요청한 뒤 JobRunner 외피가 사라져도 그 경로들이 this를 다시 읽지 않는다.
-    mState->Stop();
+    mState->RequestStop();
 }
 
 JobRunner::Lease JobRunner::AcquireLease() const noexcept
@@ -189,9 +189,14 @@ void JobRunner::RunUntilStopped()
     state->RunUntilStopped();
 }
 
+void JobRunner::RequestStop()
+{
+    mState->RequestStop();
+}
+
 void JobRunner::Stop()
 {
-    mState->Stop();
+    RequestStop();
 }
 
 bool JobRunner::IsCurrentThread() const noexcept

@@ -2,7 +2,13 @@
 
 #include "Core/Utf8Internal.h"
 
+#ifdef _WIN32
 #include <Windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include <array>
 #include <charconv>
@@ -25,6 +31,7 @@ using Values = std::map<std::string, std::string, std::less<>>;
 constexpr std::string_view Utf8ByteOrderMark = "\xEF\xBB\xBF";
 constexpr std::size_t ConfigReadBufferBytes = 64 * 1024;
 
+#ifdef _WIN32
 class FileHandle final
 {
 public:
@@ -51,6 +58,7 @@ public:
 private:
     HANDLE mHandle = INVALID_HANDLE_VALUE;
 };
+#endif
 
 [[nodiscard]] bool IsHorizontalWhitespace(const char character) noexcept
 {
@@ -111,6 +119,7 @@ private:
     return Status::Fail(ErrorCode::InvalidFormat, std::move(message));
 }
 
+#ifdef _WIN32
 [[nodiscard]] Status Win32Failure(const std::string_view operation, const unsigned long error)
 {
     std::string message(operation);
@@ -121,11 +130,6 @@ private:
 
 [[nodiscard]] Result<std::wstring> ToWidePath(const std::string_view path)
 {
-    if (path.empty() || path.find('\0') != std::string_view::npos || !Detail::IsValidUtf8(path))
-    {
-        return Result<std::wstring>::FromStatus(
-            Status::Fail(ErrorCode::InvalidArgument, "config path must be non-empty UTF-8 text"));
-    }
     if (path.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
     {
         return Result<std::wstring>::FromStatus(
@@ -192,6 +196,46 @@ private:
     }
     return Result<std::string>::FromValue(std::move(text));
 }
+#else
+[[nodiscard]] Result<std::string> ReadConfigText(const std::string_view path)
+{
+    const std::string nativePath(path);
+    int descriptor;
+    do
+    {
+        descriptor = ::open(nativePath.c_str(), O_RDONLY | O_CLOEXEC);
+    } while (descriptor < 0 && errno == EINTR);
+    if (descriptor < 0)
+    {
+        const int error = errno;
+        return Result<std::string>::FromStatus(Status::Fail(
+            error == ENOENT || error == ENOTDIR ? ErrorCode::NotFound : ErrorCode::PlatformError,
+            "open(config file) failed, errno=" + std::to_string(error)));
+    }
+    // A local owner also closes the descriptor when string allocation throws.
+    struct File final
+    {
+        int descriptor;
+        ~File() { (void)::close(descriptor); }
+    } file{ descriptor };
+    std::array<char, ConfigReadBufferBytes> buffer{};
+    std::string text;
+    for (;;)
+    {
+        const auto count = ::read(file.descriptor, buffer.data(), buffer.size());
+        if (count < 0)
+        {
+            const int error = errno;
+            if (error == EINTR) continue;
+            return Result<std::string>::FromStatus(Status::Fail(ErrorCode::PlatformError,
+                "read(config file) failed, errno=" + std::to_string(error)));
+        }
+        if (count == 0) break;
+        text.append(buffer.data(), static_cast<std::size_t>(count));
+    }
+    return Result<std::string>::FromValue(std::move(text));
+}
+#endif
 
 [[nodiscard]] Result<Values> ParseConfigText(std::string_view text)
 {
@@ -284,6 +328,12 @@ Result<Config> Config::LoadFromFile(const std::string_view path)
 {
     try
     {
+        // Validate once before either platform converts or opens the path.
+        if (path.empty() || path.find('\0') != std::string_view::npos || !Detail::IsValidUtf8(path))
+        {
+            return Result<Config>::FromStatus(
+                Status::Fail(ErrorCode::InvalidArgument, "config path must be non-empty UTF-8 text"));
+        }
         Result<std::string> text = ReadConfigText(path);
         if (!text.IsOk())
         {

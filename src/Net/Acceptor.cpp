@@ -4,6 +4,7 @@
 #include "Net/ConnectionInternal.h"
 #include "Net/IoContextInternal.h"
 #include "Net/IoOperationInternal.h"
+#include "Net/Ipv4EndpointInternal.h"
 #include "Net/WinsockInternal.h"
 #include "ServerCore/Core/Assert.h"
 #include "ServerCore/Core/Logging.h"
@@ -15,7 +16,6 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -31,9 +31,6 @@ namespace
 /// 여럿 걸면 그 틈이 줄어든다. 값의 근거는 없다(미정). 이것은 backlog를 대신하지 않는다.
 /// </remarks>
 constexpr std::size_t PendingAcceptCount = 4;
-
-/// <summary>IPv4 주소 문자열과 끝 NUL을 함께 담는 Winsock 버퍼 크기다.</summary>
-constexpr std::size_t Ipv4AddressTextCapacity = INET_ADDRSTRLEN;
 
 /// <summary>AcceptEx가 주소 하나를 적는 데 필요한 자리다.</summary>
 /// <remarks>
@@ -116,7 +113,7 @@ public:
 
     IoContext* io = nullptr;
     LPFN_ACCEPTEX acceptEx = nullptr;
-    std::function<void(std::shared_ptr<Connection>)> connectionHandler;
+    SharedConnectionHandler connectionHandler;
     std::shared_ptr<SendBudget> sendBudget;
 
     std::array<AcceptOperation, PendingAcceptCount> acceptOperations;
@@ -321,7 +318,7 @@ void Acceptor::State::OnIoCompleted(IoOperation& operation, DWORD, unsigned long
     SOCKET accepted = INVALID_SOCKET;
     SOCKET listenSocketAtAccept = INVALID_SOCKET;
     IoContext* context = nullptr;
-    std::function<void(std::shared_ptr<Connection>)> handler;
+    SharedConnectionHandler handler;
     std::shared_ptr<WinsockScope> winsockScope;
     std::shared_ptr<SendBudget> sendBudgetValue;
     bool isStopping = false;
@@ -363,7 +360,7 @@ void Acceptor::State::OnIoCompleted(IoOperation& operation, DWORD, unsigned long
         if (canHandOver)
         {
             HandleAcceptedSocket(
-                accepted, listenSocketAtAccept, *context, handler, winsockScope, sendBudgetValue);
+                accepted, listenSocketAtAccept, *context, *handler, winsockScope, sendBudgetValue);
         }
         else if (accepted != INVALID_SOCKET)
         {
@@ -386,7 +383,7 @@ void Acceptor::State::OnIoCompleted(IoOperation& operation, DWORD, unsigned long
                 __LINE__, "an accept completion could not claim its accounting state");
         }
 
-        // handler 복사 같은 handoff 준비의 예외도 완료 루프를 죽여서는 안 된다. 아직 Connection이
+        // handoff 준비나 오류 보고의 예외도 완료 루프를 죽여서는 안 된다. 아직 Connection이
         // 소유하지 않은 소켓만 이 자리에서 닫는다.
         if (accepted != INVALID_SOCKET)
         {
@@ -398,6 +395,9 @@ void Acceptor::State::OnIoCompleted(IoOperation& operation, DWORD, unsigned long
 
     if (handoffActive)
     {
+        // Stop may release the registered handler as soon as the handoff count
+        // reaches zero. Release this invocation's snapshot before that boundary.
+        handler.reset();
         CompleteHandoff(acceptOperation);
     }
 }
@@ -438,29 +438,14 @@ Core::Status Acceptor::Listen(
         return Core::Status::Fail(Core::ErrorCode::InvalidArgument, "listen port must not be zero");
     }
 
-    if (listenAddress.empty() || listenAddress.size() >= Ipv4AddressTextCapacity ||
-        listenAddress.find('\0') != std::string_view::npos)
-    {
-        return Core::Status::Fail(
-            Core::ErrorCode::InvalidArgument, "listen address must be a non-empty IPv4 address");
-    }
+    sockaddr_in address{};
+    if (!TryParseIpv4Endpoint(listenAddress, port, address))
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
 
     Core::Result<std::shared_ptr<WinsockScope>> winsock = AcquireWinsock();
     if (!winsock.IsOk())
     {
         return std::move(winsock).TakeStatus();
-    }
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = ::htons(port);
-
-    std::array<char, Ipv4AddressTextCapacity> addressText{};
-    std::memcpy(addressText.data(), listenAddress.data(), listenAddress.size());
-    if (::InetPtonA(AF_INET, addressText.data(), &address.sin_addr) != 1)
-    {
-        return Core::Status::Fail(
-            Core::ErrorCode::InvalidArgument, "listen address must be a valid IPv4 address");
     }
 
     const SOCKET listenSocket =
@@ -508,8 +493,12 @@ Core::Status Acceptor::Listen(
 
 void Acceptor::SetConnectionHandler(std::function<void(std::shared_ptr<Connection>)> handler)
 {
+    SharedConnectionHandler registered = handler ?
+        std::make_shared<const std::function<void(std::shared_ptr<Connection>)>>(std::move(handler)) : nullptr;
     const std::lock_guard<std::mutex> guard(mState->mutex);
-    mState->connectionHandler = std::move(handler);
+    SERVERCORE_ASSERT(!mState->started && mState->activeCompletionHandoffs == 0,
+        "the connection handler must be configured before accepting");
+    mState->connectionHandler.swap(registered);
 }
 
 Core::Status Acceptor::Start(IoContext& io)
@@ -581,6 +570,7 @@ Core::Status Acceptor::Start(IoContext& io)
 
 void Acceptor::Stop()
 {
+    SharedConnectionHandler retiredHandler;
     std::unique_lock<std::mutex> guard(mState->mutex);
 
     if (mState->io != nullptr)
@@ -615,7 +605,7 @@ void Acceptor::Stop()
     mState->io = nullptr;
     mState->acceptEx = nullptr;
     mState->started = false;
-    mState->connectionHandler = nullptr;
+    retiredHandler = std::move(mState->connectionHandler);
     mState->winsock.reset();
 
     // 다시 Listen()할 수 있게 되돌린다. 이 객체는 한 번 쓰고 버리는 것이 아니다.

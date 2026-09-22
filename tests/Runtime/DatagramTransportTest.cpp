@@ -1,7 +1,8 @@
 #include "ServerCore/Runtime/DatagramTransport.h"
 
 #include "TestHarness.h"
-#include "Net/WinsockInternal.h"
+#include "Net/DatagramSocket.h"
+#include "SocketTestSupport.h"
 
 #include <array>
 #include <chrono>
@@ -39,7 +40,7 @@ constexpr std::string_view Denied = R"({"type":"DeniedByApplication","body":{}})
 static_assert(!std::is_copy_constructible_v<DatagramTransport>);
 static_assert(!std::is_copy_assignable_v<DatagramTransport>);
 static_assert(noexcept(std::declval<DatagramTransport&>().Close()));
-static_assert(noexcept(std::declval<DatagramTransport&>().Send(FirstId, {})));
+static_assert(noexcept(std::declval<DatagramTransport&>().SendSerialized(FirstId, {})));
 
 std::span<const std::byte> Bytes(const std::string_view text)
 {
@@ -76,11 +77,10 @@ class RawPeer
 public:
     RawPeer()
     {
-        auto winsock = ServerCore::Net::AcquireWinsock();
-        if (!ExpectOk(winsock.GetStatus(), "raw peer acquires Winsock")) return;
-        mWinsock = winsock.Value();
+        ExpectTrue(mSockets.IsReady(), "raw peer initializes its socket runtime");
+        if (!mSockets.IsReady()) return;
         mSocket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (mSocket == INVALID_SOCKET)
+        if (mSocket == ServerCoreTest::InvalidSocket)
         {
             ExpectTrue(false, "raw peer creates its UDP socket");
             return;
@@ -88,15 +88,14 @@ public:
         sockaddr_in endpoint{};
         endpoint.sin_family = AF_INET;
         endpoint.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        u_long nonblocking = 1;
         mReady = ::bind(mSocket, reinterpret_cast<const sockaddr*>(&endpoint), sizeof(endpoint)) == 0 &&
-            ::ioctlsocket(mSocket, FIONBIO, &nonblocking) == 0;
+            ServerCoreTest::SetSocketNonblocking(mSocket);
         ExpectTrue(mReady, "raw peer binds an ephemeral nonblocking loopback socket");
     }
 
     ~RawPeer()
     {
-        if (mSocket != INVALID_SOCKET) ::closesocket(mSocket);
+        if (mSocket != ServerCoreTest::InvalidSocket) ServerCoreTest::CloseSocket(mSocket);
     }
     RawPeer(const RawPeer&) = delete;
     RawPeer& operator=(const RawPeer&) = delete;
@@ -112,7 +111,7 @@ public:
         endpoint.sin_port = htons(port);
         const char* const data = bytes.empty() ? "" : reinterpret_cast<const char*>(bytes.data());
         const auto length = static_cast<int>(bytes.size());
-        const int sent = ::sendto(mSocket, data, length, 0,
+        const int sent = ServerCoreTest::SendTo(mSocket, data, length, 0,
             reinterpret_cast<const sockaddr*>(&endpoint), sizeof(endpoint));
         ExpectTrue(sent == length, "raw peer sends the complete local datagram");
         return sent == length;
@@ -122,12 +121,12 @@ public:
     {
         std::array<std::byte, 65536> buffer{};
         sockaddr_in endpoint{};
-        int endpointLength = sizeof(endpoint);
-        const int count = ::recvfrom(mSocket, reinterpret_cast<char*>(buffer.data()),
+        ServerCoreTest::SocketLength endpointLength = sizeof(endpoint);
+        const int count = ServerCoreTest::ReceiveFrom(mSocket, reinterpret_cast<char*>(buffer.data()),
             static_cast<int>(buffer.size()), 0, reinterpret_cast<sockaddr*>(&endpoint), &endpointLength);
-        if (count == SOCKET_ERROR)
+        if (count == ServerCoreTest::SocketError)
         {
-            ExpectTrue(::WSAGetLastError() == WSAEWOULDBLOCK,
+            ExpectTrue(ServerCoreTest::SocketWouldBlock(ServerCoreTest::LastSocketError()),
                 "raw peer empty receive has no unexpected socket failure");
             return false;
         }
@@ -139,8 +138,8 @@ public:
     std::uint16_t LastSourcePort() const noexcept { return mLastSourcePort; }
 
 private:
-    std::shared_ptr<ServerCore::Net::WinsockScope> mWinsock;
-    SOCKET mSocket = INVALID_SOCKET;
+    ServerCoreTest::SocketRuntime mSockets;
+    ServerCoreTest::Socket mSocket = ServerCoreTest::InvalidSocket;
     bool mReady = false;
     std::uint16_t mLastSourcePort = 0;
 };
@@ -204,13 +203,101 @@ void BindLifecycleAndWinsockIsolation()
     ExpectTrue(live.IsReady(FirstId), "another transport's destruction leaves the live socket usable");
 }
 
+void SocketEndpointBoundaryConformance()
+{
+    ServerCore::Net::DatagramSocket socket;
+    sockaddr_in endpoint{};
+    ExpectTrue(socket.Receive({}).status.Code() == ErrorCode::Closed &&
+        socket.Send(endpoint, {}).Code() == ErrorCode::Closed,
+        "closed socket status precedes buffer and endpoint validation");
+
+    constexpr char embeddedNul[] = "127.0.0.1\0ignored";
+    const std::array invalidAddresses{
+        std::string_view{}, std::string_view{"localhost"}, std::string_view{"::1"},
+        std::string_view{"127.1"}, std::string_view{"127.000.0.1"},
+        std::string_view{"256.0.0.1"}, std::string_view{"127.0.0.1 "},
+        std::string_view{" 127.0.0.1"},
+        std::string_view{embeddedNul, sizeof(embeddedNul) - 1},
+        std::string_view{"1234567890123456"}};
+    for (const auto address : invalidAddresses)
+    {
+        ExpectTrue(socket.Bind(address, 0).Code() == ErrorCode::InvalidArgument,
+            "numeric IPv4 validation rejects malformed or embedded-NUL addresses");
+        ExpectTrue(!socket.IsOpen() && socket.Port() == 0,
+            "an invalid endpoint publishes neither a socket nor a port");
+    }
+
+    const std::string adjacent = "127.0.0.1not-part-of-the-address";
+    if (!ExpectOk(socket.Bind(std::string_view(adjacent).substr(0, 9), 0),
+        "a non-NUL-terminated IPv4 view binds using exactly its declared bytes")) return;
+    ExpectTrue(socket.Bind({}, 0).Code() == ErrorCode::AlreadyExists,
+        "an already bound socket takes precedence over a new invalid address");
+    ExpectTrue(socket.Send(endpoint, {}).Code() == ErrorCode::InvalidArgument,
+        "a bound IPv4 socket rejects an incompatible endpoint family");
+    const auto port = socket.Port();
+    socket.Close();
+    socket.Close();
+    ExpectTrue(!socket.IsOpen() && socket.Port() == 0, "close resets the raw socket and port");
+    ExpectOk(socket.Bind("127.0.0.1", port), "closed endpoint can bind again after invalid operations");
+}
+
+void SocketEmptyAndTruncatedDatagrams()
+{
+    ServerCore::Net::DatagramSocket socket;
+    if (!ExpectOk(socket.Bind("127.0.0.1", 0), "raw receive boundary socket binds")) return;
+    RawPeer peer;
+    if (!peer.IsReady()) return;
+    ServerCore::Net::DatagramReceiveResult received{Status::Ok()};
+    const auto receive = [&](const std::span<std::byte> storage) {
+        return WaitFor([&] {
+            received = socket.Receive(storage);
+            return received.status.Code() != ErrorCode::WouldBlock;
+        }, "raw receive completes within its deadline");
+    };
+
+    if (!peer.Send(socket.Port(), {}) || !receive({})) return;
+    ExpectTrue(received.status.IsOk() && received.bytes == 0 && !received.retryable,
+        "empty datagram succeeds even with an empty receive buffer");
+    ExpectTrue(received.endpoint.sin_family == AF_INET && received.endpoint.sin_port != 0,
+        "an empty datagram still identifies its reply endpoint");
+    if (!received.status.IsOk()) return;
+    if (!ExpectOk(socket.Send(received.endpoint, {}), "raw UDP permits an empty reply")) return;
+    std::vector<std::byte> reply;
+    if (!WaitFor([&] { return peer.Receive(reply); }, "peer receives an empty reply")) return;
+    ExpectTrue(reply.empty(), "an empty reply contains no synthesized byte");
+
+    const std::array oversized{std::byte{'A'}, std::byte{'B'}};
+    const std::array marker{std::byte{'R'}};
+    std::array<std::byte, 1> buffer{};
+    if (!peer.Send(socket.Port(), oversized) || !peer.Send(socket.Port(), marker) ||
+        !receive(buffer)) return;
+    ExpectTrue(received.status.Code() == ErrorCode::TooLarge && received.bytes == 0 && !received.retryable,
+        "truncation is a consumed size error, not a successful prefix or retryable socket failure");
+    if (!receive(buffer)) return;
+    ExpectTrue(received.status.IsOk() && received.bytes == marker.size() && buffer == marker,
+        "receiving after truncation starts at the next whole datagram");
+
+    if (!peer.Send(socket.Port(), marker) || !receive({})) return;
+    ExpectTrue(received.status.Code() == ErrorCode::TooLarge && received.bytes == 0,
+        "nonempty datagram cannot masquerade as empty when the receive buffer is empty");
+    if (!peer.Send(socket.Port(), {}) || !peer.Send(socket.Port(), marker) || !receive(buffer)) return;
+    ExpectTrue(received.status.IsOk() && received.bytes == 0,
+        "empty input remains a complete datagram when the receive buffer has storage");
+    if (!receive(buffer)) return;
+    ExpectTrue(received.status.IsOk() && received.bytes == marker.size() && buffer == marker,
+        "empty and truncated receives preserve the next payload boundary");
+    ExpectTrue(socket.Receive(buffer).status.Code() == ErrorCode::WouldBlock,
+        "the datagram queue is empty after each packet has been consumed once");
+    ExpectOk(ServerCore::Net::GenerateDatagramSecret({}), "empty secret generation succeeds without output");
+}
+
 void RegistrationLifecycle()
 {
     DatagramTransport transport;
     auto closed = transport.RegisterSession(FirstId);
     ExpectTrue(closed.GetStatus().Code() == ErrorCode::Closed,
         "closed transport rejects session registration");
-    ExpectTrue(transport.Send(FirstId, Bytes(Reply)).Code() == ErrorCode::Closed,
+    ExpectTrue(transport.SendSerialized(FirstId, Bytes(Reply)).Code() == ErrorCode::Closed,
         "unknown session send is closed");
     if (!ExpectOk(transport.Bind("127.0.0.1", 0), "registration listener binds")) return;
     auto invalid = transport.RegisterSession(SessionId::Invalid);
@@ -223,13 +310,13 @@ void RegistrationLifecycle()
     auto duplicate = transport.RegisterSession(FirstId);
     ExpectTrue(duplicate.GetStatus().Code() == ErrorCode::InvalidArgument,
         "duplicate session identity is rejected");
-    ExpectTrue(!transport.IsReady(FirstId) && transport.Send(FirstId, Bytes(Reply)).Code() == ErrorCode::WouldBlock,
+    ExpectTrue(!transport.IsReady(FirstId) && transport.SendSerialized(FirstId, Bytes(Reply)).Code() == ErrorCode::WouldBlock,
         "registration does not invent a return endpoint");
     RawPeer peer;
     if (!peer.IsReady() || !MakeReady(transport, peer, first)) return;
     transport.UnregisterSession(FirstId);
     transport.UnregisterSession(FirstId);
-    ExpectTrue(!transport.IsReady(FirstId) && transport.Send(FirstId, Bytes(Reply)).Code() == ErrorCode::Closed,
+    ExpectTrue(!transport.IsReady(FirstId) && transport.SendSerialized(FirstId, Bytes(Reply)).Code() == ErrorCode::Closed,
         "unregistration clears readiness and is safe to repeat");
     Codec::Token replacement{};
     if (!Register(transport, FirstId, replacement)) return;
@@ -271,15 +358,15 @@ void GenericRoundTripAndSendSequence()
         return received == 1;
     }, "generic message reaches its receiver")) return;
     std::array<std::byte, Codec::MaximumPayloadBytes + 1> tooLarge{};
-    ExpectTrue(transport.Send(FirstId, {}).Code() == ErrorCode::TooLarge,
+    ExpectTrue(transport.SendSerialized(FirstId, {}).Code() == ErrorCode::TooLarge,
         "ready session rejects empty payload");
-    ExpectTrue(transport.Send(FirstId, tooLarge).Code() == ErrorCode::TooLarge,
+    ExpectTrue(transport.SendSerialized(FirstId, tooLarge).Code() == ErrorCode::TooLarge,
         "ready session rejects payload over its datagram limit");
     ExpectTrue(transport.SnapshotMetrics().sentDatagrams == 0,
         "rejected sends are not successful datagrams");
     for (std::uint64_t expectedSequence = 1; expectedSequence <= 2; ++expectedSequence)
     {
-        if (!ExpectOk(transport.Send(FirstId, Bytes(Reply)), "valid reply is accepted by the OS")) return;
+        if (!ExpectOk(transport.SendSerialized(FirstId, Bytes(Reply)), "valid reply is accepted by the OS")) return;
         std::vector<std::byte> response;
         if (!WaitFor([&] { return peer.Receive(response); }, "raw peer receives transport reply")) return;
         const auto packet = Codec::Decode(response);
@@ -321,7 +408,7 @@ void InvalidPacketsCannotRebindOrPoisonSequence()
         return transport.SnapshotMetrics().rejectedDatagrams >= before.rejectedDatagrams + 4;
     }, "unknown, replayed, malformed and application-denied datagrams are rejected")) return;
     ExpectTrue(delivered == 0, "rejected input never reaches the application receiver");
-    if (!ExpectOk(transport.Send(FirstId, Bytes(Reply)), "established return path remains sendable")) return;
+    if (!ExpectOk(transport.SendSerialized(FirstId, Bytes(Reply)), "established return path remains sendable")) return;
     std::vector<std::byte> response;
     if (!WaitFor([&] { return original.Receive(response); }, "rejection preserves the original return endpoint")) return;
     ExpectTrue(!attacker.Receive(response), "rejected packets receive no reply and cannot steal the return endpoint");
@@ -335,7 +422,7 @@ void InvalidPacketsCannotRebindOrPoisonSequence()
         transport.Poll(admit, [&](SessionId, const Message&) { ++delivered; });
         return delivered == 2;
     }, "valid newer packet can replace the return endpoint")) return;
-    if (!ExpectOk(transport.Send(FirstId, Bytes(Reply)), "replacement return path is sendable")) return;
+    if (!ExpectOk(transport.SendSerialized(FirstId, Bytes(Reply)), "replacement return path is sendable")) return;
     if (!WaitFor([&] { return attacker.Receive(response); }, "new authenticated endpoint receives the reply")) return;
     ExpectTrue(!original.Receive(response), "obsolete endpoint does not receive the replacement reply");
 }
@@ -351,9 +438,9 @@ void ReceiverCallbacksCanSendUnregisterAndClose()
     if (!WaitFor([&] {
         transport.Poll(Allow, [&](SessionId id, const Message&) {
             ExpectTrue(transport.IsReady(id), "receiver observes committed readiness");
-            ExpectOk(transport.Send(id, Bytes(Reply)), "receiver may send through the same transport");
+            ExpectOk(transport.SendSerialized(id, Bytes(Reply)), "receiver may send through the same transport");
             transport.UnregisterSession(id);
-            ExpectTrue(transport.Send(id, Bytes(Reply)).Code() == ErrorCode::Closed,
+            ExpectTrue(transport.SendSerialized(id, Bytes(Reply)).Code() == ErrorCode::Closed,
                 "receiver unregistration immediately closes the session's send path");
             transport.Close();
             ++calls;
@@ -379,7 +466,7 @@ void AdmissionCallbacksRespectRegistrationLifetime()
     std::size_t delivered = 0;
     if (!WaitFor([&] {
         transport.Poll([&](SessionId id, const Message&) {
-            ExpectOk(transport.Send(id, Bytes(Reply)), "admission callback may use an existing return path");
+            ExpectOk(transport.SendSerialized(id, Bytes(Reply)), "admission callback may use an existing return path");
             transport.UnregisterSession(id);
             Register(transport, id, replacement);
             ++admitted;
@@ -534,6 +621,10 @@ void TruncatedDatagramsRecover()
 
 const ServerCoreTest::CheckRegistration gBindLifecycleAndWinsockIsolation{
     "Runtime.DatagramBindLifecycleAndWinsockIsolation", &BindLifecycleAndWinsockIsolation};
+const ServerCoreTest::CheckRegistration gSocketEndpointBoundaryConformance{
+    "Runtime.DatagramSocketEndpointBoundaryConformance", &SocketEndpointBoundaryConformance};
+const ServerCoreTest::CheckRegistration gSocketEmptyAndTruncatedDatagrams{
+    "Runtime.DatagramSocketEmptyAndTruncatedDatagrams", &SocketEmptyAndTruncatedDatagrams};
 const ServerCoreTest::CheckRegistration gRegistrationLifecycle{
     "Runtime.DatagramRegistrationLifecycle", &RegistrationLifecycle};
 const ServerCoreTest::CheckRegistration gGenericRoundTripAndSendSequence{

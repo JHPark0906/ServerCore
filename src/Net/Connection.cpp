@@ -14,64 +14,6 @@
 
 namespace ServerCore::Net
 {
-SendBudget::SendBudget(const std::size_t limitBytes) noexcept
-    : mLimitBytes(limitBytes)
-{
-    SERVERCORE_ASSERT(limitBytes != 0, "SendBudget requires a positive byte limit");
-}
-
-bool SendBudget::TryReserve(const std::size_t byteCount) noexcept
-{
-    if (byteCount == 0)
-    {
-        return true;
-    }
-
-    std::size_t current = mUsedBytes.load(std::memory_order_acquire);
-    for (;;)
-    {
-        if (current > mLimitBytes || byteCount > mLimitBytes - current)
-        {
-            return false;
-        }
-        if (mUsedBytes.compare_exchange_weak(
-                current, current + byteCount, std::memory_order_acq_rel, std::memory_order_acquire))
-        {
-            return true;
-        }
-    }
-}
-
-void SendBudget::Release(const std::size_t byteCount) noexcept
-{
-    if (byteCount == 0)
-    {
-        return;
-    }
-
-    std::size_t current = mUsedBytes.load(std::memory_order_acquire);
-    for (;;)
-    {
-        SERVERCORE_ASSERT(
-            current >= byteCount, "released send payload exceeded the shared Connection budget");
-        if (mUsedBytes.compare_exchange_weak(
-                current, current - byteCount, std::memory_order_acq_rel, std::memory_order_acquire))
-        {
-            return;
-        }
-    }
-}
-
-std::size_t SendBudget::LimitBytes() const noexcept
-{
-    return mLimitBytes;
-}
-
-std::size_t SendBudget::UsedBytes() const noexcept
-{
-    return mUsedBytes.load(std::memory_order_acquire);
-}
-
 std::shared_ptr<TcpConnection> TcpConnection::Create(
     SOCKET socket, std::shared_ptr<WinsockScope> winsock, std::shared_ptr<SendBudget> sendBudget)
 {
@@ -85,8 +27,8 @@ std::shared_ptr<TcpConnection> TcpConnection::Create(
 TcpConnection::TcpConnection(CreationKey, SOCKET socket, std::shared_ptr<WinsockScope> winsock,
     std::shared_ptr<SendBudget> sendBudget)
     : mWinsock(std::move(winsock))
-    , mSendBudget(std::move(sendBudget))
     , mSocket(socket)
+    , mSendQueue(std::move(sendBudget))
 {
     mReceiveOperation.kind = IoOperationKind::Receive;
     mReceiveOperation.target = this;
@@ -192,44 +134,8 @@ Core::Status TcpConnection::SendInternal(
                 return Core::Status::Ok();
             }
 
-            // 덧셈으로 검사하면 아주 큰 span에서 size_t가 감겨 상한을 우회할 수 있다. 먼저
-            // 남은 자리를 빼서 비교하면 그 경로도 요청 전체 거절이라는 Send 계약을 지킨다.
-            if (mRetainedSendBytes > SendQueueLimitBytes ||
-                bytes.size() > SendQueueLimitBytes - mRetainedSendBytes)
-            {
-                // 절반만 담으면 상대가 받는 바이트 흐름이 조용히 깨진다. 그래서 통째로 거절한다.
-                std::string message = "the send queue retains ";
-                message.append(std::to_string(mRetainedSendBytes));
-                message.append(" payload bytes and the request adds ");
-                message.append(std::to_string(bytes.size()));
-                message.append(", which exceeds SendQueueLimitBytes=");
-                message.append(std::to_string(SendQueueLimitBytes));
-                message.append("; nothing was queued");
-                return Core::Status::Fail(Core::ErrorCode::WouldBlock, std::move(message));
-            }
-
-            const bool sharedBudgetReserved =
-                mSendBudget != nullptr && mSendBudget->TryReserve(bytes.size());
-            if (mSendBudget != nullptr && !sharedBudgetReserved)
-            {
-                return Core::Status::Fail(Core::ErrorCode::WouldBlock,
-                    "the shared Connection send queue budget is full; nothing was queued");
-            }
-
-            try
-            {
-                mSendQueue.emplace_back(bytes.begin(), bytes.end());
-            }
-            catch (...)
-            {
-                if (sharedBudgetReserved)
-                {
-                    mSendBudget->Release(bytes.size());
-                }
-                throw;
-            }
-            mQueuedSendBytes += bytes.size();
-            mRetainedSendBytes += bytes.size();
+            result = mSendQueue.Enqueue(bytes);
+            if (!result.IsOk()) return result;
 
             if (mSendInFlight)
             {
@@ -307,7 +213,7 @@ bool TcpConnection::IsOpen() const noexcept
 std::size_t TcpConnection::QueuedSendBytes() const noexcept
 {
     const std::lock_guard<std::mutex> guard(mMutex);
-    return mQueuedSendBytes;
+    return mSendQueue.QueuedBytes();
 }
 
 void TcpConnection::OnIoCompleted(
@@ -430,29 +336,9 @@ void TcpConnection::OnSendCompleted(
         }
         else
         {
-            SERVERCORE_ASSERT(
-                !mSendQueue.empty(), "a send completed while the send queue was empty");
+            mSendQueue.Consume(bytesTransferred);
 
-            mSendOffset += bytesTransferred;
-            mQueuedSendBytes -= bytesTransferred;
-
-            if (mSendOffset >= mSendQueue.front().size())
-            {
-                SERVERCORE_ASSERT(mRetainedSendBytes >= mSendQueue.front().size(),
-                    "completed send payload exceeded the retained send-byte budget");
-                const std::size_t completedPayloadBytes = mSendQueue.front().size();
-                mRetainedSendBytes -= completedPayloadBytes;
-                mSendOffset = 0;
-                mSendQueue.pop_front();
-                if (mSendBudget != nullptr)
-                {
-                    // 실제 payload 저장소를 먼저 놓은 뒤 공유 예산을 반환한다. 반대로 하면 다른
-                    // Connection이 그 예산으로 새 vector를 만드는 짧은 동안 Host 상한을 넘는다.
-                    mSendBudget->Release(completedPayloadBytes);
-                }
-            }
-
-            if (!mSendQueue.empty())
+            if (!mSendQueue.Empty())
             {
                 // 실패는 이미 닫힘 사유로 기록된다. 위 수신 쪽과 같은 이유로 버린다.
                 (void)StartSendLocked();
@@ -519,16 +405,14 @@ Core::Status TcpConnection::StartSendLocked()
         return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
     }
 
-    SERVERCORE_ASSERT(!mSendQueue.empty(), "StartSendLocked() was called with an empty send queue");
+    SERVERCORE_ASSERT(!mSendQueue.Empty(), "StartSendLocked() was called with an empty send queue");
     SERVERCORE_ASSERT(!mSendInFlight, "StartSendLocked() was called while a send was in flight");
 
-    std::vector<std::byte>& front = mSendQueue.front();
-    SERVERCORE_ASSERT(
-        mSendOffset < front.size(), "the send offset is not inside the front of the send queue");
+    const std::span<std::byte> front = mSendQueue.Front();
 
     WSABUF buffer{};
-    buffer.len = static_cast<ULONG>(front.size() - mSendOffset);
-    buffer.buf = reinterpret_cast<CHAR*>(front.data() + mSendOffset);
+    buffer.len = static_cast<ULONG>(front.size());
+    buffer.buf = reinterpret_cast<CHAR*>(front.data());
 
     mSendOperation.overlapped = OVERLAPPED{};
     mSendOperation.owner = shared_from_this();
@@ -569,17 +453,7 @@ void TcpConnection::DiscardQueuedSendsLocked() noexcept
     SERVERCORE_ASSERT(!mSendInFlight,
         "DiscardQueuedSendsLocked() was called while WSASend still borrowed the queue front");
 
-    const std::size_t discardedPayloadBytes = mRetainedSendBytes;
-    mSendQueue.clear();
-    mSendOffset = 0;
-    mQueuedSendBytes = 0;
-    mRetainedSendBytes = 0;
-    if (mSendBudget != nullptr)
-    {
-        // 완료 경로와 마찬가지로 payload를 먼저 해제해야 반환된 예산을 다른 연결이 써도
-        // 실제 동시 보관 메모리가 Host 공유 상한 안에 남는다.
-        mSendBudget->Release(discardedPayloadBytes);
-    }
+    mSendQueue.Clear();
 }
 
 void TcpConnection::MarkClosedLocked(Core::Status reason)
@@ -630,7 +504,7 @@ void TcpConnection::CloseSocketAfterSendLocked()
 void TcpConnection::FinishCloseAfterSendLocked()
 {
     if (!mCloseAfterSendRequested || mClosed.load(std::memory_order_relaxed) || mSendInFlight ||
-        !mSendQueue.empty())
+        !mSendQueue.Empty())
     {
         return;
     }

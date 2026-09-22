@@ -52,27 +52,29 @@ public:
 
     [[nodiscard]] JsonValue ParseDocument()
     {
-        SkipByteOrderMark();
-        SkipWhitespace();
-        JsonValue result = ParseValue(0);
-        SkipWhitespace();
-        if (mPosition != mText.size())
-        {
-            Fail("unexpected trailing data");
-        }
-        return result;
+        return ParseRoot(nullptr);
     }
 
     [[nodiscard]] Detail::ParsedEnvelopeDocument ParseEnvelopeDocument()
     {
+        TopLevelMembers members;
+        Detail::ParsedEnvelopeDocument document;
+        document.value = ParseRoot(&members);
+        document.hasBody = members.hasBody;
+        document.rawBodySize = members.rawBodySize;
+        return document;
+    }
+
+private:
+    [[nodiscard]] JsonValue ParseRoot(TopLevelMembers* const members)
+    {
         SkipByteOrderMark();
         SkipWhitespace();
 
-        TopLevelMembers members;
         JsonValue result;
-        if (mPosition < mText.size() && mText[mPosition] == '{')
+        if (members != nullptr && mPosition < mText.size() && mText[mPosition] == '{')
         {
-            result = ParseObject(1, &members);
+            result = ParseObject(1, members);
         }
         else
         {
@@ -85,14 +87,9 @@ public:
             Fail("unexpected trailing data");
         }
 
-        Detail::ParsedEnvelopeDocument document;
-        document.value = std::move(result);
-        document.hasBody = members.hasBody;
-        document.rawBodySize = members.rawBodySize;
-        return document;
+        return result;
     }
 
-private:
     [[noreturn]] void Fail(const char* message) const
     {
         std::size_t line = 1;
@@ -661,7 +658,7 @@ void DumpEscapedString(const std::string& value, std::string& output)
             Core::Status elementStatus = DumpValue(element, output, depth + 1);
             if (!elementStatus.IsOk())
             {
-                return std::move(elementStatus);
+                return elementStatus;
             }
         }
         output.push_back(']');
@@ -703,7 +700,7 @@ void DumpEscapedString(const std::string& value, std::string& output)
         Core::Status memberStatus = DumpValue(member->second, output, depth + 1);
         if (!memberStatus.IsOk())
         {
-            return std::move(memberStatus);
+            return memberStatus;
         }
     }
     output.push_back('}');
@@ -728,32 +725,49 @@ void DumpEscapedString(const std::string& value, std::string& output)
     return StatusWithMessageNoThrow(Core::ErrorCode::InvalidFormat, failure.what());
 }
 
-[[nodiscard]] Core::Result<JsonValue> ParseText(const std::string_view text)
+// GCC 13 diagnoses valid moved-from std::variant destruction in this helper
+// as freeing a non-heap object (the std::string/variant false-positive family
+// tracked at https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108088). Limit the
+// workaround to this helper and compiler; other diagnostics and sanitizers stay on.
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#endif
+
+// Both public JSON entry points share text validation and exception conversion.
+template <typename Value>
+[[nodiscard]] Core::Result<Value> ParseText(
+    const std::string_view text, Value (Parser::*parse)())
 {
     if (!Core::Detail::IsValidUtf8(text))
     {
-        return Core::Result<JsonValue>::FromStatus(StatusWithMessageNoThrow(
+        return Core::Result<Value>::FromStatus(StatusWithMessageNoThrow(
             Core::ErrorCode::InvalidFormat, "JSON text is not valid UTF-8"));
     }
 
     try
     {
-        return Core::Result<JsonValue>::FromValue(Parser(text).ParseDocument());
+        Parser parser(text);
+        return Core::Result<Value>::FromValue((parser.*parse)());
     }
     catch (const JsonParseFailure& failure)
     {
-        return Core::Result<JsonValue>::FromStatus(InvalidFormatFrom(failure));
+        return Core::Result<Value>::FromStatus(InvalidFormatFrom(failure));
     }
     catch (const std::bad_alloc&)
     {
-        return Core::Result<JsonValue>::FromStatus(Core::Status::AllocationFailure());
+        return Core::Result<Value>::FromStatus(Core::Status::AllocationFailure());
     }
     catch (const std::exception& failure)
     {
-        return Core::Result<JsonValue>::FromStatus(
+        return Core::Result<Value>::FromStatus(
             StatusWithMessageNoThrow(Core::ErrorCode::PlatformError, failure.what()));
     }
 }
+
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+#pragma GCC diagnostic pop
+#endif
 
 [[nodiscard]] std::string_view AsText(const std::span<const std::byte> bytes) noexcept
 {
@@ -920,12 +934,12 @@ const std::uint64_t* JsonValue::TryUInt64() const noexcept
 
 Core::Result<JsonValue> JsonValue::Parse(const std::string_view text)
 {
-    return ParseText(text);
+    return ParseText(text, &Parser::ParseDocument);
 }
 
 Core::Result<JsonValue> JsonValue::ParseBytes(const std::span<const std::byte> bytes)
 {
-    return ParseText(AsText(bytes));
+    return ParseText(AsText(bytes), &Parser::ParseDocument);
 }
 
 Core::Result<std::string> JsonValue::Dump() const
@@ -960,31 +974,7 @@ namespace Detail
 {
 Core::Result<ParsedEnvelopeDocument> ParseEnvelopeDocument(const std::span<const std::byte> bytes)
 {
-    const std::string_view text = AsText(bytes);
-    if (!Core::Detail::IsValidUtf8(text))
-    {
-        return Core::Result<ParsedEnvelopeDocument>::FromStatus(StatusWithMessageNoThrow(
-            Core::ErrorCode::InvalidFormat, "JSON text is not valid UTF-8"));
-    }
-
-    try
-    {
-        return Core::Result<ParsedEnvelopeDocument>::FromValue(
-            Parser(text).ParseEnvelopeDocument());
-    }
-    catch (const JsonParseFailure& failure)
-    {
-        return Core::Result<ParsedEnvelopeDocument>::FromStatus(InvalidFormatFrom(failure));
-    }
-    catch (const std::bad_alloc&)
-    {
-        return Core::Result<ParsedEnvelopeDocument>::FromStatus(Core::Status::AllocationFailure());
-    }
-    catch (const std::exception& failure)
-    {
-        return Core::Result<ParsedEnvelopeDocument>::FromStatus(
-            StatusWithMessageNoThrow(Core::ErrorCode::PlatformError, failure.what()));
-    }
+    return ParseText(AsText(bytes), &Parser::ParseEnvelopeDocument);
 }
 }
 }

@@ -7,6 +7,7 @@
 
 #include "Net/AcceptorInternal.h"
 #include "Net/ConnectionInternal.h"
+#include "Net/SendQueueInternal.h"
 
 #include <algorithm>
 #include <array>
@@ -23,9 +24,7 @@
 #include <thread>
 #include <vector>
 
-#include <WinSock2.h>
-
-#include <WS2tcpip.h>
+#include "SocketTestSupport.h"
 
 /// <summary>
 /// 전송 층이 실제로 포트를 열고 바이트를 주고받는지 고정하는 검사들이다.
@@ -63,36 +62,10 @@ constexpr std::uint16_t PortBase = static_cast<std::uint16_t>(SERVERCORE_TEST_PO
 constexpr std::chrono::milliseconds WaitLimit{ 10000 };
 
 /// <summary>검사 클라이언트가 수신에 거는 제한이다. 없으면 recv가 영원히 매달린다.</summary>
-constexpr DWORD ClientReceiveTimeoutMilliseconds = 10000;
+constexpr unsigned ClientReceiveTimeoutMilliseconds = 10000;
 
 /// <summary>이 검사 파일이 도는 동안 Winsock이 살아 있게 한다.</summary>
-class WinsockGuard
-{
-public:
-    WinsockGuard()
-    {
-        WSADATA data{};
-        mStartupResult = ::WSAStartup(MAKEWORD(2, 2), &data);
-    }
-
-    ~WinsockGuard()
-    {
-        if (mStartupResult == 0)
-        {
-            ::WSACleanup();
-        }
-    }
-
-    WinsockGuard(const WinsockGuard&) = delete;
-    WinsockGuard& operator=(const WinsockGuard&) = delete;
-    WinsockGuard(WinsockGuard&&) = delete;
-    WinsockGuard& operator=(WinsockGuard&&) = delete;
-
-    [[nodiscard]] bool IsReady() const noexcept { return mStartupResult == 0; }
-
-private:
-    int mStartupResult = 0;
-};
+using SocketRuntime = ServerCoreTest::SocketRuntime;
 
 /// <summary>바이트 하나를 지정한 수만큼 늘어놓는다.</summary>
 std::vector<std::byte> MakeFilledBytes(std::size_t count, unsigned char value)
@@ -419,16 +392,16 @@ public:
     [[nodiscard]] bool Connect(std::uint16_t port)
     {
         mSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (mSocket == INVALID_SOCKET)
+        if (mSocket == ServerCoreTest::InvalidSocket)
         {
             return false;
         }
 
-        DWORD timeout = ClientReceiveTimeoutMilliseconds;
-        ::setsockopt(mSocket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout),
-            sizeof(timeout));
-        ::setsockopt(mSocket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout),
-            sizeof(timeout));
+        if (!ServerCoreTest::SetSocketTimeouts(mSocket, ClientReceiveTimeoutMilliseconds))
+        {
+            Close();
+            return false;
+        }
 
         sockaddr_in address{};
         address.sin_family = AF_INET;
@@ -436,7 +409,7 @@ public:
         ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
 
         if (::connect(mSocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) ==
-            SOCKET_ERROR)
+            ServerCoreTest::SocketError)
         {
             Close();
             return false;
@@ -450,7 +423,7 @@ public:
         std::size_t offset = 0;
         while (offset < bytes.size())
         {
-            const int chunk = ::send(mSocket, reinterpret_cast<const char*>(bytes.data() + offset),
+            const int chunk = ServerCoreTest::Send(mSocket, reinterpret_cast<const char*>(bytes.data() + offset),
                 static_cast<int>(bytes.size() - offset), 0);
             if (chunk <= 0)
             {
@@ -471,7 +444,7 @@ public:
         std::vector<char> chunk(16 * 1024);
         while (received.size() < count)
         {
-            const int read = ::recv(mSocket, chunk.data(),
+            const int read = ServerCoreTest::Receive(mSocket, chunk.data(),
                 static_cast<int>(std::min<std::size_t>(chunk.size(), count - received.size())), 0);
             if (read <= 0)
             {
@@ -490,21 +463,21 @@ public:
     [[nodiscard]] bool WaitForPeerClose()
     {
         char byte = 0;
-        return ::recv(mSocket, &byte, 1, 0) == 0;
+        return ServerCoreTest::Receive(mSocket, &byte, 1, 0) == 0;
     }
 
     void Close()
     {
-        if (mSocket != INVALID_SOCKET)
+        if (mSocket != ServerCoreTest::InvalidSocket)
         {
-            ::shutdown(mSocket, SD_BOTH);
-            ::closesocket(mSocket);
-            mSocket = INVALID_SOCKET;
+            ::shutdown(mSocket, ServerCoreTest::ShutdownBoth);
+            ServerCoreTest::CloseSocket(mSocket);
+            mSocket = ServerCoreTest::InvalidSocket;
         }
     }
 
 private:
-    SOCKET mSocket = INVALID_SOCKET;
+    ServerCoreTest::Socket mSocket = ServerCoreTest::InvalidSocket;
 };
 
 /// <summary>완료 포트·수락기·관찰자를 한 벌로 세워 두는 자리다.</summary>
@@ -790,8 +763,8 @@ void IoContextStartsAndStops()
 /// <summary>잘못된 IPv4 endpoint를 거절하고 loopback endpoint는 여는지 본다.</summary>
 void ListenRejectsInvalidEndpoint()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the test succeeded");
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
     ServerCore::Net::Acceptor acceptor;
 
@@ -824,6 +797,118 @@ void ListenRejectsInvalidEndpoint()
         "the port the acceptor reports after Stop()");
 }
 
+void SendQueueRetainsPartiallySentStorage()
+{
+    using ServerCore::Core::ErrorCode;
+    using ServerCore::Net::SendQueueLimitBytes;
+    const auto budget = std::make_shared<ServerCore::Net::SendBudget>(SendQueueLimitBytes * 2);
+    ServerCore::Net::SendQueue queue(budget);
+    const auto payload = MakeFilledBytes(SendQueueLimitBytes, 0x71);
+    const auto oneByte = MakeFilledBytes(1, 0x42);
+    const auto queued = queue.Enqueue(payload);
+    ServerCoreTest::ExpectTrue(queued.IsOk(), "the portable queue accepts a full-limit payload");
+    if (!queued.IsOk()) return;
+
+    const auto borrowed = queue.Front();
+    queue.Consume(payload.size() - 1);
+    ServerCoreTest::ExpectEqual(std::size_t{1}, queue.QueuedBytes(), "only the unsent suffix is logically queued");
+    ServerCoreTest::ExpectEqual(payload.size(), queue.RetainedBytes(), "a sent prefix remains allocated with its suffix");
+    ServerCoreTest::ExpectEqual(payload.size(), budget->UsedBytes(), "partial completion cannot refund retained storage");
+    ServerCoreTest::ExpectTrue(queue.Front().data() == borrowed.data() + payload.size() - 1,
+        "partial completion keeps the original payload storage alive");
+    ServerCoreTest::ExpectEqual(static_cast<int>(ErrorCode::WouldBlock),
+        static_cast<int>(queue.Enqueue(oneByte).Code()), "retained prefixes count against the connection limit");
+    ServerCoreTest::ExpectEqual(std::size_t{1}, queue.QueuedBytes(), "overflow is rejected without adding bytes");
+
+    queue.Consume(1);
+    ServerCoreTest::ExpectTrue(queue.Empty(), "the completed vector leaves the queue");
+    ServerCoreTest::ExpectEqual(std::size_t{0}, budget->UsedBytes(), "fully released storage refunds its reservation");
+    const auto retried = queue.Enqueue(oneByte);
+    ServerCoreTest::ExpectTrue(retried.IsOk(), "a send can retry after retained storage is released");
+    if (!retried.IsOk()) return;
+    const auto front = queue.Front();
+    ServerCoreTest::ExpectTrue(queue.Enqueue(oneByte).IsOk(), "another payload can queue behind a borrowed front");
+    ServerCoreTest::ExpectTrue(front.data() == queue.Front().data() && front.front() == oneByte.front(),
+        "appending another payload cannot invalidate an in-flight front buffer");
+    queue.Clear();
+    queue.Clear();
+    ServerCoreTest::ExpectEqual(std::size_t{0}, queue.QueuedBytes(), "discard clears all logical bytes");
+    ServerCoreTest::ExpectEqual(std::size_t{0}, budget->UsedBytes(), "repeated discard releases reservations exactly once");
+    {
+        ServerCore::Net::SendQueue temporary(budget);
+        ServerCoreTest::ExpectTrue(temporary.Enqueue(oneByte).IsOk(), "a scoped queue owns its reservation");
+    }
+    ServerCoreTest::ExpectEqual(std::size_t{0}, budget->UsedBytes(), "queue destruction refunds remaining owned storage");
+}
+
+void AcceptorReusesHandlerStateAndReleasesOnStop()
+{
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initializes for handler ownership");
+    if (!sockets.IsReady()) return;
+    ServerCore::Net::IoContext io;
+    ServerCore::Net::Acceptor acceptor;
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<unsigned int> counts;
+    std::vector<std::shared_ptr<ServerCore::Net::Connection>> connections;
+    std::vector<std::shared_ptr<RecordingObserver>> observers;
+    std::weak_ptr<int> captured;
+    {
+        auto lifetime = std::make_shared<int>(17);
+        captured = lifetime;
+        acceptor.SetConnectionHandler([lifetime, invocation = 0U, &mutex, &changed, &counts,
+            &connections, &observers](std::shared_ptr<ServerCore::Net::Connection> connection) mutable
+        {
+            (void)lifetime;
+            auto observer = std::make_shared<RecordingObserver>();
+            connection->SetObserver(observer);
+            {
+                const std::lock_guard guard(mutex);
+                counts.push_back(++invocation);
+                connections.push_back(std::move(connection));
+                observers.push_back(std::move(observer));
+            }
+            changed.notify_all();
+        });
+    }
+    ServerCoreTest::ExpectTrue(!captured.expired(), "the acceptor owns the registered callable");
+    const auto started = io.Start(1);
+    ServerCoreTest::ExpectTrue(started.IsOk(), "one I/O worker serializes mutable handler calls");
+    if (!started.IsOk()) return;
+    const auto listening = acceptor.Listen("127.0.0.1", static_cast<std::uint16_t>(PortBase + 40), 8);
+    ServerCoreTest::ExpectTrue(listening.IsOk(), "handler ownership listener binds");
+    if (!listening.IsOk()) { acceptor.Stop(); io.Stop(); return; }
+    const auto accepting = acceptor.Start(io);
+    ServerCoreTest::ExpectTrue(accepting.IsOk(), "handler ownership listener starts");
+    if (!accepting.IsOk()) { acceptor.Stop(); io.Stop(); return; }
+
+    TestClient first;
+    TestClient second;
+    const bool firstConnected = first.Connect(acceptor.Port());
+    const bool secondConnected = second.Connect(acceptor.Port());
+    ServerCoreTest::ExpectTrue(firstConnected && secondConnected, "two clients connect to the same registered callable");
+    if (firstConnected && secondConnected)
+    {
+        std::unique_lock guard(mutex);
+        const bool bothAccepted = changed.wait_for(guard, WaitLimit, [&counts] { return counts.size() == 2; });
+        ServerCoreTest::ExpectTrue(bothAccepted, "both accepted connections invoke the handler");
+        if (bothAccepted)
+        {
+            ServerCoreTest::ExpectEqual(1U, counts[0], "the registered handler receives its first invocation");
+            ServerCoreTest::ExpectEqual(2U, counts[1], "mutable callable state persists across accepted connections");
+        }
+    }
+    acceptor.Stop();
+    ServerCoreTest::ExpectTrue(captured.expired(), "Stop releases registered captures after handoffs drain");
+    for (const auto& connection : connections) connection->Close();
+    for (const auto& observer : observers)
+        ServerCoreTest::ExpectTrue(observer->WaitForDisconnect(WaitLimit), "accepted connections drain before I/O shutdown");
+    first.Close();
+    second.Close();
+    io.Stop();
+}
+
 /// <summary>Stop() 뒤 같은 수락기가 새 endpoint를 실제로 다시 수락하는지 본다.</summary>
 /// <remarks>
 /// Port()가 0으로 돌아오는 것만으로는 다음 Listen()·Start()에 새 Winsock 범위, AcceptEx와
@@ -832,9 +917,9 @@ void ListenRejectsInvalidEndpoint()
 /// </remarks>
 void AcceptorCanListenAgainAfterStop()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the relisten test succeeded");
-    if (!winsock.IsReady())
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the relisten test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -1020,8 +1105,8 @@ void AcceptorCanListenAgainAfterStop()
 /// <summary>보낸 바이트가 관찰자에게 오고 되돌아오는지 본다. 이 층의 본 경로다.</summary>
 void EchoRoundTrip()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the test succeeded");
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
     const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 1);
 
@@ -1064,8 +1149,8 @@ void EchoRoundTrip()
 /// </remarks>
 void DisconnectIsNotifiedExactlyOnce()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the test succeeded");
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
     const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 2);
 
@@ -1116,8 +1201,8 @@ void DisconnectIsNotifiedExactlyOnce()
 /// </remarks>
 void LargePayloadCrossesReceiveBoundaries()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the test succeeded");
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
     const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 3);
     constexpr std::size_t payloadSize = 256 * 1024;
@@ -1163,8 +1248,8 @@ void LargePayloadCrossesReceiveBoundaries()
 /// <summary>닫힌 연결에 보내면 거절되는지 본다.</summary>
 void SendAfterCloseIsRefused()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the test succeeded");
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
     const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 4);
 
@@ -1216,10 +1301,10 @@ void SendAfterCloseIsRefused()
 /// </remarks>
 void CloseDiscardsQueuedSendBytes()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the queued-send discard test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the queued-send discard test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -1371,10 +1456,10 @@ void CloseDiscardsQueuedSendBytes()
 /// </remarks>
 void SharedSendBudgetRejectsAcrossConnectionsAndRecovers()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the shared send-budget test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the shared send-budget test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -1552,10 +1637,10 @@ void SharedSendBudgetRejectsAcrossConnectionsAndRecovers()
 /// </remarks>
 void SendQueueLimitRejectsWholeOverflowAndRecovers()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the send queue limit test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the send queue limit test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -1732,9 +1817,9 @@ void SendQueueLimitRejectsWholeOverflowAndRecovers()
 /// <summary>빈 큐의 CloseAfterSend()가 기다리지 않고 정상 종료를 시작하는지 본다.</summary>
 void CloseAfterSendOnEmptyConnectionCloses()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the test succeeded");
-    if (!winsock.IsReady())
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -1801,9 +1886,9 @@ void CloseAfterSendOnEmptyConnectionCloses()
 /// </remarks>
 void CloseAfterSendDrainsQueuedBytes()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the test succeeded");
-    if (!winsock.IsReady())
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -1965,8 +2050,8 @@ void CloseAfterSendDrainsQueuedBytes()
 /// </remarks>
 void ConcurrentSendsDoNotInterleave()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the test succeeded");
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
     const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 5);
 
@@ -2052,10 +2137,10 @@ void ConcurrentSendsDoNotInterleave()
 /// </remarks>
 void MultiWorkerDeliversDifferentConnectionsConcurrently()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the multi-worker delivery test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the multi-worker delivery test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -2203,10 +2288,10 @@ void MultiWorkerDeliversDifferentConnectionsConcurrently()
 /// <summary>수신 관찰자가 돌아오는 동안 Close가 끊김 통지를 겹치게 하지 않는지 본다.</summary>
 void DisconnectWaitsForReceiveCallback()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for callback serialization succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for callback serialization succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -2321,10 +2406,10 @@ void DisconnectWaitsForReceiveCallback()
 /// <summary>관찰자 등록 전 Close가 나도 뒤의 SetObserver가 끊김을 받는지 본다.</summary>
 void LateObserverReceivesPriorDisconnect()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for late observer registration succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for late observer registration succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -2396,9 +2481,9 @@ void AcceptorStopWaitsForActiveCompletionHandoff()
     constexpr std::size_t HandoffCount = 4;
     constexpr std::chrono::milliseconds EarlyReturnWindow{ 500 };
 
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the test succeeded");
-    if (!winsock.IsReady())
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -2520,9 +2605,9 @@ void AcceptorStopDoesNotTimeOutActiveCompletionHandoff()
     constexpr std::chrono::seconds FormerAcceptDrainTimeout{ 10 };
     constexpr std::chrono::seconds TimeoutOverrun{ 1 };
 
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the test succeeded");
-    if (!winsock.IsReady())
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -2639,6 +2724,12 @@ const ServerCoreTest::CheckRegistration gIoContextStartsAndStops{
 };
 const ServerCoreTest::CheckRegistration gSharedSendBudgetSerializesReservations{
     "Transport.SharedSendBudgetSerializesReservations", &SharedSendBudgetSerializesReservations
+};
+const ServerCoreTest::CheckRegistration gSendQueueRetainsPartiallySentStorage{
+    "Transport.SendQueueRetainsPartiallySentStorage", &SendQueueRetainsPartiallySentStorage
+};
+const ServerCoreTest::CheckRegistration gAcceptorReusesHandlerStateAndReleasesOnStop{
+    "Transport.AcceptorReusesHandlerStateAndReleasesOnStop", &AcceptorReusesHandlerStateAndReleasesOnStop
 };
 const ServerCoreTest::CheckRegistration gListenRejectsInvalidEndpoint{
     "Transport.ListenRejectsInvalidEndpoint", &ListenRejectsInvalidEndpoint

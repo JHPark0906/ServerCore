@@ -31,7 +31,7 @@ namespace ServerCore::Runtime
 /// 위반으로 프로세스를 끝낸다.
 ///
 /// Start는 한 번만 성공할 수 있다. Stop은 동시 호출해도 모두 같은 타이머 스레드의 join이
-/// 끝난 뒤 돌아온다. 이미 JobRunner에 들어간 콜백은 JobRunner 자신의 Stop 규칙에 따라
+/// 끝난 뒤 돌아온다. 이미 JobRunner에 들어간 콜백은 JobRunner 자신의 RequestStop 규칙에 따라
 /// 실행될 수 있다.
 /// </remarks>
 class PeriodicRunner

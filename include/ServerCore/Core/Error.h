@@ -32,7 +32,10 @@ enum class ErrorCode
     AlreadyExists = 5,
     /// <summary>대상이 이미 닫혔다. 끊긴 연결로 보내려는 경우 따위.</summary>
     Closed = 6,
-    /// <summary>지금은 줄 것이 없다. 프레임이 아직 다 안 왔을 때 쓴다. 실패가 아니라 "아직"이다.</summary>
+    /// <summary>
+    /// 지금은 진행할 수 없다. 불완전한 수신 프레임, 가득 찬 송신 예산, 비차단 소켓의 일시적인
+    /// 준비 부족을 나타낸다. 각 연산의 재시도 계약을 따른다.
+    /// </summary>
     WouldBlock = 7,
     /// <summary>
     /// 운영체제 호출이나 자원 확보가 실패했다. 자세한 것은 Status의 설명 문자열에 담되, 설명
@@ -183,7 +186,9 @@ public:
 
 private:
     /// <summary>성공 결과를 만든다. mStatus는 기본값 그대로 Ok다.</summary>
-    explicit Result(T value);
+    // FromValue already owns its parameter; bind it directly rather than creating
+    // a second owning temporary before constructing mValue.
+    explicit Result(T&& value);
 
     /// <summary>실패 결과를 만든다. mValue는 기본 생성된 채로 남고 쓰이지 않는다.</summary>
     explicit Result(Status status);
@@ -198,7 +203,7 @@ private:
 // 위층과 소비자가 정하기 때문이다.
 
 template <typename T>
-Result<T>::Result(T value)
+Result<T>::Result(T&& value)
     : mStatus(Status::Ok())
     , mValue(std::move(value))
 {

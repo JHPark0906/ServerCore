@@ -31,9 +31,7 @@
 #include <utility>
 #include <vector>
 
-#include <WinSock2.h>
-
-#include <WS2tcpip.h>
+#include "SocketTestSupport.h"
 
 // 이 파일은 ServerHost가 각 층을 실제로 조립하는 경로를 검사한다. 전송 층의 단위 검사와
 // 달리, 여기서는 평범한 TCP 클라이언트가 프레임을 조각 내어 보내고 Host가 세션·디스패치·종료를
@@ -51,33 +49,9 @@ static_assert(
 
 constexpr std::uint16_t PortBase = static_cast<std::uint16_t>(SERVERCORE_TEST_PORT_BASE);
 constexpr std::chrono::milliseconds WaitLimit{ 10000 };
-constexpr DWORD ClientReceiveTimeoutMilliseconds = 10000;
+constexpr unsigned ClientReceiveTimeoutMilliseconds = 10000;
 
-class WinsockGuard
-{
-public:
-    WinsockGuard()
-    {
-        WSADATA data{};
-        mStartupResult = ::WSAStartup(MAKEWORD(2, 2), &data);
-    }
-
-    ~WinsockGuard()
-    {
-        if (mStartupResult == 0)
-        {
-            ::WSACleanup();
-        }
-    }
-
-    WinsockGuard(const WinsockGuard&) = delete;
-    WinsockGuard& operator=(const WinsockGuard&) = delete;
-
-    [[nodiscard]] bool IsReady() const noexcept { return mStartupResult == 0; }
-
-private:
-    int mStartupResult = 0;
-};
+using SocketRuntime = ServerCoreTest::SocketRuntime;
 
 /// <summary>테스트가 서버 바깥에서 프레임 하나를 만드는 작은 독립 구현이다.</summary>
 std::vector<std::byte> MakeFrame(const std::string_view json)
@@ -105,7 +79,7 @@ public:
     [[nodiscard]] bool Connect(const std::uint16_t port, const int receiveBufferBytes = 0)
     {
         mSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (mSocket == INVALID_SOCKET)
+        if (mSocket == ServerCoreTest::InvalidSocket)
         {
             return false;
         }
@@ -113,17 +87,17 @@ public:
         if (receiveBufferBytes > 0 &&
             ::setsockopt(mSocket, SOL_SOCKET, SO_RCVBUF,
                 reinterpret_cast<const char*>(&receiveBufferBytes), sizeof(receiveBufferBytes)) ==
-                SOCKET_ERROR)
+                ServerCoreTest::SocketError)
         {
             Close();
             return false;
         }
 
-        DWORD timeout = ClientReceiveTimeoutMilliseconds;
-        ::setsockopt(mSocket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout),
-            sizeof(timeout));
-        ::setsockopt(mSocket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout),
-            sizeof(timeout));
+        if (!ServerCoreTest::SetSocketTimeouts(mSocket, ClientReceiveTimeoutMilliseconds))
+        {
+            Close();
+            return false;
+        }
 
         sockaddr_in address{};
         address.sin_family = AF_INET;
@@ -135,7 +109,7 @@ public:
         }
 
         if (::connect(mSocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) ==
-            SOCKET_ERROR)
+            ServerCoreTest::SocketError)
         {
             Close();
             return false;
@@ -146,7 +120,7 @@ public:
 
     [[nodiscard]] bool SendAll(const std::span<const std::byte> bytes)
     {
-        if (mSocket == INVALID_SOCKET)
+        if (mSocket == ServerCoreTest::InvalidSocket)
         {
             return false;
         }
@@ -154,7 +128,7 @@ public:
         std::size_t offset = 0;
         while (offset < bytes.size())
         {
-            const int sent = ::send(mSocket, reinterpret_cast<const char*>(bytes.data() + offset),
+            const int sent = ServerCoreTest::Send(mSocket, reinterpret_cast<const char*>(bytes.data() + offset),
                 static_cast<int>(bytes.size() - offset), 0);
             if (sent <= 0)
             {
@@ -175,7 +149,7 @@ public:
         std::vector<char> chunk(16 * 1024);
         while (received.size() < count)
         {
-            const int read = ::recv(mSocket, chunk.data(),
+            const int read = ServerCoreTest::Receive(mSocket, chunk.data(),
                 static_cast<int>(std::min<std::size_t>(chunk.size(), count - received.size())), 0);
             if (read <= 0)
             {
@@ -215,21 +189,21 @@ public:
     [[nodiscard]] bool WaitForPeerClose()
     {
         char byte = 0;
-        return ::recv(mSocket, &byte, 1, 0) == 0;
+        return ServerCoreTest::Receive(mSocket, &byte, 1, 0) == 0;
     }
 
     void Close()
     {
-        if (mSocket != INVALID_SOCKET)
+        if (mSocket != ServerCoreTest::InvalidSocket)
         {
-            ::shutdown(mSocket, SD_BOTH);
-            ::closesocket(mSocket);
-            mSocket = INVALID_SOCKET;
+            ::shutdown(mSocket, ServerCoreTest::ShutdownBoth);
+            ServerCoreTest::CloseSocket(mSocket);
+            mSocket = ServerCoreTest::InvalidSocket;
         }
     }
 
 private:
-    SOCKET mSocket = INVALID_SOCKET;
+    ServerCoreTest::Socket mSocket = ServerCoreTest::InvalidSocket;
 };
 
 /// <summary>Host가 세션 수명 훅을 실행했는지 안전하게 관찰한다.</summary>
@@ -1406,9 +1380,9 @@ struct MetricsCaptureState
 
 void ServerHostRoutesSplitFramesAndStops()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() in the test succeeded");
-    if (!winsock.IsReady())
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -1561,10 +1535,10 @@ void ServerHostRoutesSplitFramesAndStops()
 /// </remarks>
 void ServerHostRejectsRestartAfterStop()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the Host lifecycle test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the Host lifecycle test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -1880,10 +1854,10 @@ void ServerHostRejectsInvalidOptions()
 
 void ServerHostSharesConfiguredSendBudgetAcrossSessions()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the Host shared-send-budget test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the Host shared-send-budget test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -2011,9 +1985,9 @@ void ServerHostPreparedSendsPreserveFramingLimitsAndMetrics()
 {
     using ServerCore::Core::ErrorCode;
     namespace Protocol = ServerCore::Protocol;
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "Winsock is ready for the prepared-send integration test");
-    if (!winsock.IsReady()) return;
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "Winsock is ready for the prepared-send integration test");
+    if (!sockets.IsReady()) return;
     Protocol::JsonValue body(Protocol::JsonValue::Object{
         { "payload", Protocol::JsonValue(std::string(512, 'x') + "한글\"\\\n") } });
     const Protocol::JsonValue sequence(std::uint64_t{ 18446744073709551615ULL });
@@ -2120,10 +2094,10 @@ void ServerHostPreparedSendsPreserveFramingLimitsAndMetrics()
 
 void ServerHostEnforcesConcurrentSessionLimit()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the concurrent-session-limit test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the concurrent-session-limit test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -2287,10 +2261,10 @@ void ServerHostEnforcesConcurrentSessionLimit()
 
 void ServerHostConfiguresFromConfig()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the Config-host test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the Config-host test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -2641,10 +2615,10 @@ void ServerHostBindsRegistryBeforePrepostedWork()
 
 void ServerHostSendsFinalFrameBeforeDisconnect()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the final-response test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the final-response test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -2807,10 +2781,10 @@ void ServerHostSendsFinalFrameBeforeDisconnect()
 
 void ServerHostDisconnectsIdleSessions()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the idle-session test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the idle-session test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -2906,9 +2880,9 @@ void ServerHostDisconnectsIdleSessions()
 /// <summary>읽지 않는 상대의 종료 기한이 수신 활동과 무관하게 슬롯과 송신 예산을 회수한다.</summary>
 void ServerHostBoundsGracefulCloseWithoutIdleTimeout()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() for graceful timeout succeeded");
-    if (!winsock.IsReady())
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization for graceful timeout succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -3113,10 +3087,10 @@ void ServerHostFailedStartSerializesOwnerResetWithStop()
 
 void ServerHostConcurrentStopsWaitForBlockedHandler()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the concurrent-Stop test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the concurrent-Stop test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -3283,9 +3257,9 @@ void ServerHostConcurrentStopsWaitForBlockedHandler()
 
 void ServerHostReportsMetrics()
 {
-    const WinsockGuard winsock;
-    ServerCoreTest::ExpectTrue(winsock.IsReady(), "WSAStartup() for the metrics test succeeded");
-    if (!winsock.IsReady())
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization for the metrics test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -3472,10 +3446,10 @@ void ServerHostReportsMetrics()
 
 void ServerHostParseWorkersPreserveSessionHandlerOrder()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the parse worker test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the parse worker test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -3633,10 +3607,10 @@ void ServerHostParseWorkersPreserveSessionHandlerOrder()
 
 void ServerHostFallbackFinalizerReleasesQueuedParseWork()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the parse-finalizer fallback test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the parse-finalizer fallback test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -3776,10 +3750,10 @@ void ServerHostFallbackFinalizerReleasesQueuedParseWork()
 
 void ServerHostFallbackFinalizerAllowsReentrantDisconnect()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the reentrant finalizer test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the reentrant finalizer test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -3856,10 +3830,10 @@ void ServerHostFallbackFinalizerAllowsReentrantDisconnect()
 
 void ServerHostFallbackCloseNotificationCanStopHost()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the fallback close-stop test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the fallback close-stop test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -3925,10 +3899,10 @@ void ServerHostFallbackCloseNotificationCanStopHost()
 
 void ServerHostFallbackCloseNotificationStopsStartingHost()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the Starting close-stop test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the Starting close-stop test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -4034,10 +4008,10 @@ void ServerHostFallbackCloseNotificationStopsStartingHost()
 
 void ServerHostStopWaitsForCloseNotification()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the close-notification drain test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the close-notification drain test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -4121,10 +4095,10 @@ void ServerHostStopWaitsForCloseNotification()
 void VerifyGlobalParseBudget(const std::uint16_t port, const std::uint32_t totalByteFrameCount,
     const std::uint32_t totalTaskLimit)
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the aggregate parse budget test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the aggregate parse budget test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -4350,10 +4324,10 @@ void ServerHostRollsBackParseBytesWhenTotalTaskLimitRejects()
 
 void ServerHostBoundsPendingReceiveBytes()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the receive budget test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the receive budget test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }
@@ -4552,10 +4526,10 @@ void ServerHostBoundsPendingReceiveBytes()
 
 void ServerHostBoundsTotalPendingReceiveBytes()
 {
-    const WinsockGuard winsock;
+    const SocketRuntime sockets;
     ServerCoreTest::ExpectTrue(
-        winsock.IsReady(), "WSAStartup() for the aggregate receive budget test succeeded");
-    if (!winsock.IsReady())
+        sockets.IsReady(), "socket runtime initialization for the aggregate receive budget test succeeded");
+    if (!sockets.IsReady())
     {
         return;
     }

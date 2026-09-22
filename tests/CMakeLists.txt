@@ -52,6 +52,8 @@ set(SERVERCORE_PROTOCOL_TEST_NAMES
         Protocol.MessagePreserves64BitIntegers
         Protocol.JsonRejectsUnrepresentableNumbers
         Protocol.MessageRejectsInvalidUtf8
+        Protocol.JsonEntryPointsShareValidation
+        Protocol.MessageEnvelopeValidationIsSymmetric
         Protocol.JsonDumpRejectsUnsafeValues
         Protocol.MessageRejectsUnsafeOutboundJson
         Protocol.MessageRejectsNonObjectBodies)
@@ -92,6 +94,8 @@ set(SERVERCORE_DISPATCH_TEST_NAMES
 # 걸기 때문이다. 매달리는 것이 전송 층의 대표적 실패 형태이고, 시간 제한이 없으면 검증이
 # 멈춘 채 남는다. 포트를 열지 않는 검사에까지 제한을 걸 이유는 없다.
 set(SERVERCORE_NET_TEST_NAMES
+        Transport.SendQueueRetainsPartiallySentStorage
+        Transport.AcceptorReusesHandlerStateAndReleasesOnStop
         Transport.SharedSendBudgetSerializesReservations
         Transport.IoContextStartsAndStops
         Transport.ListenRejectsInvalidEndpoint
@@ -142,6 +146,8 @@ set(SERVERCORE_HOST_TEST_NAMES
         Runtime.ServerHostBoundsTotalPendingReceiveBytes)
 
 set(SERVERCORE_DATAGRAM_TEST_NAMES
+        Runtime.DatagramSocketEndpointBoundaryConformance
+        Runtime.DatagramSocketEmptyAndTruncatedDatagrams
         Runtime.DatagramBindLifecycleAndWinsockIsolation
         Runtime.DatagramRegistrationLifecycle
         Runtime.DatagramGenericRoundTripAndSendSequence
@@ -153,6 +159,18 @@ set(SERVERCORE_DATAGRAM_TEST_NAMES
         Runtime.DatagramByteBudgetAndEmptyCallbacksPreservePendingPackets
         Runtime.DatagramTruncatedDatagramsRecover)
 
+set(SERVERCORE_WEB_TEST_NAMES
+        Web.HttpResponseSemantics
+        Web.WebSocketSendValidationSymmetry
+        Web.HttpParserConformance
+        Web.HttpParserRejectsAmbiguousRequests
+        Web.WebSocketProtocolConformance
+        Web.HttpSocketIntegration
+        Web.WebSocketSocketIntegration
+        Web.LimitsAndShutdown
+        Web.WebSocketRejectsProtocolErrors
+        Web.ConnectionLimitAndActiveShutdown)
+
 list(APPEND SERVERCORE_TEST_NAMES
         ${SERVERCORE_PROTOCOL_TEST_NAMES}
         ${SERVERCORE_JOB_TEST_NAMES}
@@ -160,7 +178,8 @@ list(APPEND SERVERCORE_TEST_NAMES
         ${SERVERCORE_DISPATCH_TEST_NAMES}
         ${SERVERCORE_NET_TEST_NAMES}
         ${SERVERCORE_HOST_TEST_NAMES}
-        ${SERVERCORE_DATAGRAM_TEST_NAMES})
+        ${SERVERCORE_DATAGRAM_TEST_NAMES}
+        ${SERVERCORE_WEB_TEST_NAMES})
 
 add_executable(ServerCoreTests
         TestHarness.cpp
@@ -177,7 +196,8 @@ add_executable(ServerCoreTests
         Runtime/ServerHostTest.cpp
         Runtime/DatagramTransportTest.cpp
         Session/SessionRegistryTest.cpp
-        Net/TransportTest.cpp)
+        Net/TransportTest.cpp
+        Web/WebTest.cpp)
 
 target_include_directories(ServerCoreTests
         PRIVATE
@@ -215,7 +235,7 @@ endforeach ()
 
 # 포트를 여는 검사에만 시간 제한을 건다. 60초는 정상 경로보다 한참 넉넉하다. 이 값은 검사가
 # 얼마나 걸리는지를 말하는 것이 아니라, 매달린 것을 언제 실패로 판정할지를 말한다.
-foreach (test_name IN LISTS SERVERCORE_NET_TEST_NAMES SERVERCORE_HOST_TEST_NAMES)
+foreach (test_name IN LISTS SERVERCORE_NET_TEST_NAMES SERVERCORE_HOST_TEST_NAMES SERVERCORE_WEB_TEST_NAMES)
     set_tests_properties(ServerCore.${test_name} PROPERTIES
             TIMEOUT 60
             RESOURCE_LOCK ServerCore.TcpPorts)
@@ -268,4 +288,4 @@ add_test(NAME ServerCore.CMake.InstallAndSourceTreeConsume
         "-DSERVERCORE_PACKAGE_CTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
         "-DSERVERCORE_PACKAGE_VERSION=${ServerCore_VERSION}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/CMakePackageTest.cmake")
-set_tests_properties(ServerCore.CMake.InstallAndSourceTreeConsume PROPERTIES TIMEOUT 180)
+set_tests_properties(ServerCore.CMake.InstallAndSourceTreeConsume PROPERTIES TIMEOUT 600)

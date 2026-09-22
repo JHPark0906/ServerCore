@@ -56,15 +56,22 @@ public:
     void UnregisterSession(Session::SessionId id) noexcept;
     [[nodiscard]] bool IsReady(Session::SessionId id) const noexcept;
 
-    /// Sends an already serialized payload without copying into a queue or parsing it again.
+    /// Sends an already serialized UTF-8 JSON envelope without queuing or parsing it again.
+    /// Payload excludes the TCP length prefix and UDP header; this transport adds its own header.
+    /// Use Protocol::SerializeMessage or PreparedMessage::Bytes to construct the payload.
     /// Ok means OS acceptance, not delivery. Sequence advances only on success and never wraps.
     /// A platform failure does not unregister the session or close its reliable control channel.
+    [[nodiscard]] Core::Status SendSerialized(Session::SessionId id,
+        std::span<const std::byte> payload) noexcept;
+
+    /// Compatibility alias; preserves the same status, size and sequence rules.
+    [[deprecated("Use SendSerialized(id, payload); payload must already contain a serialized JSON envelope")]]
     [[nodiscard]] Core::Status Send(Session::SessionId id, std::span<const std::byte> payload) noexcept;
 
     /// Decode, token and replay checks precede one JSON parse. Admission runs before committing
     /// the sequence, endpoint and ready state; a false result cannot rebind or consume a sequence.
     /// Receiver runs after commit. Both callbacks run synchronously without the state mutex and
-    /// may call Send, UnregisterSession or Close. Message references last only for the callback.
+    /// may call SendSerialized, UnregisterSession or Close. Message references last only for the callback.
     /// Binding lifetime, registration identity and sequence are rechecked after admission.
     /// Rebinding the socket ends the current Poll without consuming packets from the new binding.
     /// Serialize Poll calls on the application's execution context; other methods are thread safe.

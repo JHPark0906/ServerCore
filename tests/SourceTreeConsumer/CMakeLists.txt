@@ -30,3 +30,5 @@ target_link_libraries(ServerCoreSourceTreeConsumer PRIVATE ServerCore::ServerCor
 
 enable_testing()
 add_test(NAME ServerCoreSourceTreeConsumer.Runs COMMAND ServerCoreSourceTreeConsumer)
+include("${CMAKE_CURRENT_LIST_DIR}/../ApiConsumerChecks.cmake")
+ServerCoreAddConsumerApiChecks(ServerCoreSourceTreeConsumer)

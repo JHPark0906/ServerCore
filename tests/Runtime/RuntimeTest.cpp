@@ -34,13 +34,16 @@ void JobRunnerDrainsAcceptedJobsOnStop()
 
     const ServerCore::Core::Status first = runner.Post([&order]() { order.push_back(1); });
     const ServerCore::Core::Status second = runner.Post([&order]() { order.push_back(2); });
-    ServerCoreTest::ExpectTrue(first.IsOk() && second.IsOk(), "jobs are accepted before Stop");
+    ServerCoreTest::ExpectTrue(first.IsOk() && second.IsOk(), "jobs are accepted before RequestStop");
 
-    runner.Stop();
+    runner.RequestStop();
+    runner.RequestStop();
+    ServerCoreTest::ExpectTrue(runner.IsStopRequested(), "RequestStop synchronously closes admission");
+    ServerCoreTest::ExpectTrue(order.empty(), "RequestStop does not execute or wait for queued jobs");
     std::thread worker([&runner]() { runner.RunUntilStopped(); });
     worker.join();
 
-    ServerCoreTest::ExpectEqual(std::size_t{ 2 }, order.size(), "accepted jobs drain after Stop");
+    ServerCoreTest::ExpectEqual(std::size_t{ 2 }, order.size(), "accepted jobs drain after RequestStop");
     if (order.size() == 2)
     {
         ServerCoreTest::ExpectEqual(1, order[0], "first accepted job keeps its order");
@@ -49,7 +52,21 @@ void JobRunnerDrainsAcceptedJobsOnStop()
 
     const ServerCore::Core::Status rejected = runner.Post([]() {});
     ServerCoreTest::ExpectTrue(
-        !rejected.IsOk() && rejected.Code() == ErrorCode::Closed, "Post after Stop reports Closed");
+        !rejected.IsOk() && rejected.Code() == ErrorCode::Closed, "Post after RequestStop reports Closed");
+
+    JobRunner callbackRunner;
+    bool requestReturned = false;
+    bool acceptedTailRan = false;
+    const auto stoppingJob = callbackRunner.Post([&]() {
+        callbackRunner.RequestStop();
+        requestReturned = callbackRunner.IsStopRequested();
+    });
+    const auto tailJob = callbackRunner.Post([&]() { acceptedTailRan = requestReturned; });
+    ServerCoreTest::ExpectTrue(stoppingJob.IsOk() && tailJob.IsOk(), "callback shutdown jobs are accepted");
+    if (!stoppingJob.IsOk()) callbackRunner.RequestStop();
+    callbackRunner.RunUntilStopped();
+    ServerCoreTest::ExpectTrue(requestReturned, "an executing job can request stop without waiting for itself");
+    ServerCoreTest::ExpectTrue(acceptedTailRan, "work accepted before an executing job requests stop still drains");
 }
 
 void JobRunnerReportsThreadAffinity()
@@ -79,7 +96,7 @@ void JobRunnerReportsThreadAffinity()
             WaitFor(wake, guard, [&executed]() { return executed; }), "probe runs");
     }
 
-    runner.Stop();
+    runner.RequestStop();
     worker.join();
 
     ServerCoreTest::ExpectTrue(ranOnRunnerThread, "job runs on JobRunner thread");
@@ -140,7 +157,7 @@ void PeriodicRunnerInvokesThroughJobRunner()
             callsAfterStop, callCount, "Stop prevents new periodic callbacks");
     }
 
-    jobRunner.Stop();
+    jobRunner.RequestStop();
     worker.join();
     ServerCoreTest::ExpectTrue(everyCallUsedRunner, "every periodic callback uses JobRunner");
 }
@@ -176,7 +193,7 @@ void PeriodicRunnerCountsSkippedPeriods()
     periodic.Stop();
     ServerCoreTest::ExpectEqual(periodic.SkippedCount(), jobRunner.PeriodicSkippedCount(),
         "JobRunner aggregates skipped periods from its periodic leases");
-    jobRunner.Stop();
+    jobRunner.RequestStop();
     worker.join();
 
     ServerCoreTest::ExpectTrue(periodic.SkippedCount() != 0,
@@ -303,7 +320,7 @@ void PeriodicRunnerConcurrentStopsShareCompletedJoin()
 
     // Stop 이전에 JobRunner로 들어간 콜백은 실행될 수 있다는 계약이므로, 먼저 그 실행자도
     // 배수해 놓고 이후에는 타이머가 새 콜백을 만들지 않는지만 확인한다.
-    jobRunner.Stop();
+    jobRunner.RequestStop();
     worker.join();
 
     std::size_t callsAfterStops = 0;

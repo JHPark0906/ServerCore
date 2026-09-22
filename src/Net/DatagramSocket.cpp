@@ -1,7 +1,6 @@
 #include "Net/DatagramSocket.h"
+#include "Net/Ipv4EndpointInternal.h"
 
-#include <array>
-#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
@@ -57,16 +56,8 @@ Core::Status DatagramSocket::Bind(const std::string_view address, const std::uin
 {
     if (IsOpen()) return Status::FailWithoutMessage(ErrorCode::AlreadyExists);
 
-    std::array<char, INET_ADDRSTRLEN> addressText{};
-    if (address.empty() || address.size() >= addressText.size() ||
-        address.find('\0') != std::string_view::npos)
-        return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
-    std::memcpy(addressText.data(), address.data(), address.size());
-
     sockaddr_in endpoint{};
-    endpoint.sin_family = AF_INET;
-    endpoint.sin_port = htons(port);
-    if (::InetPtonA(AF_INET, addressText.data(), &endpoint.sin_addr) != 1)
+    if (!TryParseIpv4Endpoint(address, port, endpoint))
         return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
 
     try

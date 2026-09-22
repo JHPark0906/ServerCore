@@ -144,6 +144,11 @@ bool DatagramTransport::IsReady(const SessionId id) const noexcept
 
 Status DatagramTransport::Send(const SessionId id, const std::span<const std::byte> payload) noexcept
 {
+    return SendSerialized(id, payload);
+}
+
+Status DatagramTransport::SendSerialized(const SessionId id, const std::span<const std::byte> payload) noexcept
+{
     const std::lock_guard guard(mImpl->mutex);
     const auto found = mImpl->peers.find(id);
     if (found == mImpl->peers.end()) return Status::FailWithoutMessage(ErrorCode::Closed);

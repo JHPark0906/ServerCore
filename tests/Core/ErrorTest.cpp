@@ -2,7 +2,9 @@
 
 #include "ServerCore/Core/Error.h"
 
+#include <memory>
 #include <string>
+#include <utility>
 
 /// <summary>
 /// Status와 Result가 담은 것을 그대로 돌려주는지 고정하는 검사다.
@@ -121,6 +123,23 @@ void ResultHoldsNonTrivialValue()
     ServerCoreTest::ExpectTrue(result.IsOk(), "Result<std::string>::FromValue() reports IsOk");
     ServerCoreTest::ExpectEqual(
         std::string("PlayerMove"), result.Value(), "Result<std::string> holds the value");
+
+    std::string source(256, 'x');
+    const auto copied = ServerCore::Core::Result<std::string>::FromValue(source);
+    source[0] = 'y';
+    ServerCoreTest::ExpectEqual(std::string(256, 'x'), copied.Value(),
+        "FromValue copies an lvalue into independent owned storage");
+
+    const auto moved = ServerCore::Core::Result<std::string>::FromValue(std::move(source));
+    ServerCoreTest::ExpectEqual(std::string("y") + std::string(255, 'x'), moved.Value(),
+        "FromValue preserves heap-backed strings passed as rvalues");
+
+    auto pointer = std::make_unique<int>(42);
+    const int* const original = pointer.get();
+    const auto owned = ServerCore::Core::Result<std::unique_ptr<int>>::FromValue(std::move(pointer));
+    ServerCoreTest::ExpectTrue(pointer == nullptr && owned.Value().get() == original &&
+                                  *owned.Value() == 42,
+        "FromValue transfers a move-only value into the result exactly once");
 }
 
 void ResultValueIsMutable()

@@ -1,6 +1,11 @@
 #pragma once
 
+#ifdef _WIN32
 #include "Net/WinsockInternal.h"
+#else
+#include "ServerCore/Core/Error.h"
+#include <netinet/in.h>
+#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -28,7 +33,14 @@ public:
 
     [[nodiscard]] Core::Status Bind(std::string_view address, std::uint16_t port);
     void Close() noexcept;
-    [[nodiscard]] bool IsOpen() const noexcept { return mSocket != INVALID_SOCKET; }
+    [[nodiscard]] bool IsOpen() const noexcept
+    {
+#ifdef _WIN32
+        return mSocket != INVALID_SOCKET;
+#else
+        return mSocket >= 0;
+#endif
+    }
     [[nodiscard]] std::uint16_t Port() const noexcept { return mPort; }
     // An empty datagram succeeds with zero bytes. Oversized datagrams are consumed as TooLarge.
     // Only connection-reset/refused receive errors are retryable platform failures.
@@ -37,11 +49,15 @@ public:
         std::span<const std::byte> payload) noexcept;
 
 private:
+#ifdef _WIN32
     std::shared_ptr<WinsockScope> mWinsock;
     SOCKET mSocket = INVALID_SOCKET;
+#else
+    int mSocket = -1;
+#endif
     std::uint16_t mPort = 0;
 };
 
-// Empty output succeeds; spans exceeding ULONG's byte-count limit are rejected.
+// Empty output succeeds; spans exceeding a 32-bit byte count are rejected.
 [[nodiscard]] Core::Status GenerateDatagramSecret(std::span<std::byte> bytes) noexcept;
 }

@@ -158,7 +158,7 @@ Core::Status FrameReader::Append(const std::span<const std::byte> bytes,
     Core::Status prepared = EnsureReader();
     if (!prepared.IsOk())
     {
-        return std::move(prepared);
+        return prepared;
     }
 
     mCallbackAllocationFailed = false;
