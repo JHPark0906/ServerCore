@@ -120,10 +120,7 @@ Core::Result<std::string> RenderPrometheus(const Runtime::ServerMetricsSnapshot&
         Scalar(out, prefix, "queued_send_frames_total", "counter", s.queuedSendFrameCount);
         Scalar(out, prefix, "errors_total", "counter", s.errorCount);
         Scalar(out, prefix, "skipped_periods_total", "counter", s.skippedPeriodCount);
-        std::uint64_t sendBytes = 0;
-        for (const auto& session : s.sessionSendQueues)
-            Detail::Add(sendBytes, session.queuedBytes);
-        Scalar(out, prefix, "retained_send_bytes", "gauge", sendBytes);
+        Scalar(out, prefix, "retained_send_bytes", "gauge", s.retainedSendBytes);
         Jobs(out, s.jobs);
         return Core::Result<std::string>::FromValue(std::move(out));
     }

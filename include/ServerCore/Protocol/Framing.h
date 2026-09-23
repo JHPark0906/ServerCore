@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include "ServerCore/Core/Error.h"
 #include "ServerCore/Protocol/FrameCodec.h"
 
@@ -65,7 +67,7 @@ public:
     using CompletedFrameAdmission = bool (*)(void* context, std::size_t bodySize) noexcept;
 
     /// <summary>본문 상한을 정해서 만든다.</summary>
-    explicit FrameReader(std::uint32_t maxBodySize = DefaultMaxBodySize);
+    SERVERCORE_API explicit FrameReader(std::uint32_t maxBodySize = DefaultMaxBodySize);
 
     /// <summary>
     /// 내부 FrameCodec이 이 객체의 저장소를 span으로 가리키므로 복사·이동을 막는다.
@@ -80,7 +82,7 @@ public:
     FrameReader& operator=(FrameReader&&) = delete;
 
     /// <summary>도착한 바이트를 뒤에 붙인다.</summary>
-    Core::Status Append(std::span<const std::byte> bytes);
+    SERVERCORE_API Core::Status Append(std::span<const std::byte> bytes);
 
     /// <summary>완결 본문마다 admission을 거쳐 도착한 바이트를 뒤에 붙인다.</summary>
     /// <remarks>
@@ -91,7 +93,7 @@ public:
     /// 거부는 이 Reader를 terminal 상태로 만든다. 그 뒤 Append와 Finish는 TooLarge를 돌리며,
     /// 남아 있는 완료 본문을 처리할지 버릴지는 호출자의 종료 정책이 정한다.
     /// </remarks>
-    Core::Status Append(std::span<const std::byte> bytes, void* admissionContext,
+    SERVERCORE_API Core::Status Append(std::span<const std::byte> bytes, void* admissionContext,
         CompletedFrameAdmission admission);
 
     /// <summary>완결된 프레임의 본문 하나를 소유 벡터로 꺼낸다.</summary>
@@ -105,7 +107,7 @@ public:
     /// 성공이면 본문을 소유한 vector. 아직 다 안 왔으면 ErrorCode::WouldBlock이며 이것은 실패가
     /// 아니다.
     /// </returns>
-    Core::Result<std::vector<std::byte>> TakeNextFrame();
+    SERVERCORE_API Core::Result<std::vector<std::byte>> TakeNextFrame();
 
     /// <summary>완결된 프레임의 본문을 하나 꺼낸다.</summary>
     /// <returns>
@@ -116,14 +118,14 @@ public:
     /// 이 기존 편의 API의 반환 span은 다음 Append(), NextFrame(), TakeNextFrame() 호출 전까지만
     /// 유효하다. 본문을 현재 호출보다 오래 보관해야 하면 TakeNextFrame()을 쓴다.
     /// </remarks>
-    Core::Result<std::span<const std::byte>> NextFrame();
+    SERVERCORE_API Core::Result<std::span<const std::byte>> NextFrame();
 
     /// <summary>아직 꺼내지 않은 완결 본문의 수를 준다.</summary>
     /// <remarks>
     /// 반환값은 completed queue의 순간값이다. NextFrame() 또는 TakeNextFrame()으로 꺼낸 현재
     /// 본문과, 아직 완결되지 않은 FrameCodec 저장소는 세지 않는다.
     /// </remarks>
-    [[nodiscard]] std::size_t CompletedFrameCount() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::size_t CompletedFrameCount() const noexcept;
 
     /// <summary>아직 꺼내지 않은 완결 본문이 차지하는 바이트 합계를 준다.</summary>
     /// <remarks>
@@ -131,14 +133,14 @@ public:
     /// NextFrame() span의 본문, allocator의 부가 메모리는 포함하지 않는다. 호출자는 이 값을
     /// 수신/파싱 대기열의 논리적 body-byte 예산에 쓸 수 있다.
     /// </remarks>
-    [[nodiscard]] std::size_t CompletedBodyBytes() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::size_t CompletedBodyBytes() const noexcept;
 
     /// <summary>아직 꺼내지 않은 완결 본문을 모두 버린다.</summary>
     /// <remarks>
     /// 미완성 프레임과 이미 NextFrame()이 돌려준 현재 본문은 건드리지 않는다. 연결 종료처럼
     /// 더 이상 이 completed body들을 처리하지 않을 때 쓴다.
     /// </remarks>
-    void DiscardCompletedFrames() noexcept;
+    SERVERCORE_API void DiscardCompletedFrames() noexcept;
 
     /// <summary>미완성·완성·현재 본문과 내부 codec 저장소를 모두 놓는다.</summary>
     /// <remarks>
@@ -146,12 +148,12 @@ public:
     /// 저장소를 계속 붙들지 않게 하는 수명 경계다. NextFrame()이 돌려준 span은 즉시 무효가 된다.
     /// 이후 Append()를 다시 부르면 빈 Reader처럼 저장소를 다시 준비한다.
     /// </remarks>
-    void ReleaseStorage() noexcept;
+    SERVERCORE_API void ReleaseStorage() noexcept;
 
     /// <summary>연결이 닫힐 때 남은 미완성 프레임이 있는지 판정한다.</summary>
-    [[nodiscard]] Core::Status Finish() const;
+    [[nodiscard]] SERVERCORE_API Core::Status Finish() const;
 
-    [[nodiscard]] bool HasIncompleteFrame() const noexcept;
+    [[nodiscard]] SERVERCORE_API bool HasIncompleteFrame() const noexcept;
 
 private:
     static void CopyCompletedFrame(void* context, std::span<const std::byte> body) noexcept;
@@ -176,6 +178,6 @@ private:
 /// </summary>
 /// <param name="jsonBody">UTF-8로 인코딩된 JSON 본문.</param>
 /// <returns>본문이 상한을 넘으면 ErrorCode::TooLarge.</returns>
-Core::Result<std::vector<std::byte>> EncodeFrame(
+SERVERCORE_API Core::Result<std::vector<std::byte>> EncodeFrame(
     std::span<const std::byte> jsonBody, std::uint32_t maxBodySize = DefaultMaxBodySize);
 }

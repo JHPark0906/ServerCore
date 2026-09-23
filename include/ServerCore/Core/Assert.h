@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 namespace ServerCore::Core
 {
 /// <summary>
@@ -32,7 +34,7 @@ namespace ServerCore::Core
 /// <param name="file">그 조건식이 있는 파일.</param>
 /// <param name="line">그 조건식이 있는 줄.</param>
 /// <param name="message">무엇이 기대와 달랐는지. 원인 짐작을 담지 않는다.</param>
-[[noreturn]] void ReportAssertFailure(
+[[noreturn]] SERVERCORE_API void ReportAssertFailure(
     const char* expression, const char* file, int line, const char* message) noexcept;
 }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include "ServerCore/Core/Error.h"
 
 #include <memory>
@@ -53,14 +55,14 @@ class IoContextAccess;
 class IoContext
 {
 public:
-    IoContext();
+    SERVERCORE_API IoContext();
 
     /// <summary>Stop()을 부르고, 스레드가 모두 빠져나온 뒤에 끝난다.</summary>
     /// <remarks>
     /// 위 "소멸 전에 반드시 Stop()"을 지키는 것이 이 소멸자다. 여기서 부르지 않으면 그 문장은
     /// 약속이 아니라 희망이 된다.
     /// </remarks>
-    ~IoContext();
+    SERVERCORE_API ~IoContext();
 
     IoContext(const IoContext&) = delete;
     IoContext& operator=(const IoContext&) = delete;
@@ -75,7 +77,7 @@ public:
     /// 이미 돌고 있는데 다시 부르면 AlreadyExists. 이벤트 자원을 만들지 못하면 PlatformError이며
     /// 설명 문자열에 OS 오류 코드(Windows GetLastError 또는 Linux errno)가 들어간다.
     /// </returns>
-    Core::Status Start(int workerThreadCount);
+    SERVERCORE_API Core::Status Start(int workerThreadCount);
 
     /// <summary>I/O 스레드를 멈추고 모두 빠져나올 때까지 기다린다. 여러 번 불러도 된다.</summary>
     /// <remarks>
@@ -86,9 +88,9 @@ public:
     /// 돌아오지 않는다. 그것을 잡는 것은 이 함수 안의 단언이고 판정 근거는
     /// IsCurrentThreadIoThread()다.
     /// </remarks>
-    void Stop();
+    SERVERCORE_API void Stop();
 
-    [[nodiscard]] bool IsRunning() const noexcept;
+    [[nodiscard]] SERVERCORE_API bool IsRunning() const noexcept;
 
     /// <summary>지금 이 스레드가 이 객체의 I/O 스레드인지 알린다.</summary>
     /// <remarks>
@@ -97,7 +99,7 @@ public:
     ///
     /// 스레드 안전성: 스레드 안전.
     /// </remarks>
-    [[nodiscard]] bool IsCurrentThreadIoThread() const noexcept;
+    [[nodiscard]] SERVERCORE_API bool IsCurrentThreadIoThread() const noexcept;
 
 private:
     /// <summary>전송 층 구현이 이벤트 처리 기반에 닿는 통로다. src/Net 안에서만 정의된다.</summary>

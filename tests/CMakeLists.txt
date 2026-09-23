@@ -20,6 +20,10 @@ set(SERVERCORE_TEST_NAMES
         Error.ResultTakeStatusMovesFailure
         Error.ResultHoldsNonTrivialValue
         Error.ResultValueIsMutable
+        Error.ResultFailureDoesNotConstructValue
+        Error.ResultSupportsNonDefaultMoveOnlyValues
+        Core.JobQueueOwnsMoveOnlyJobs
+        Core.JobQueueRejectsEmptyLegacyJobs
         ByteBuffer.NewBufferIsEmpty
         ByteBuffer.WriteThenPeekReturnsSameBytes
         ByteBuffer.ConsumeRemovesFromTheFront
@@ -60,9 +64,28 @@ set(SERVERCORE_PROTOCOL_TEST_NAMES
         Protocol.MessageRejectsNonObjectBodies)
 
 set(SERVERCORE_JOB_TEST_NAMES
+        Runtime.RequestLimiterBudgetsAndLease
+        Runtime.RequestLimiterExpiryAndConcurrency
+        Runtime.TimerSchedulerAdmissionAndReschedule
+        Runtime.TimerSchedulerRepeatsAndCancellation
+        Runtime.TimerSchedulerShutdownAndExecutorPressure
+        Runtime.TaskGroupBoundsAndCollection
+        Runtime.TaskGroupCancellationAndDeadlines
+        Runtime.TaskGroupWaitAndShutdownRace
+        Runtime.ChannelLimitsAndDrain
+        Runtime.ChannelNotificationsAndCancellation
+        Runtime.LatestValueVersionsAndRetirement
+        Core.CompletionResetQuiesces
+        Runtime.KeyedExecutorFifoAndParallelism
+        Runtime.KeyedExecutorRoundRobin
+        Runtime.KeyedExecutorLimitsAndCancellation
+        Runtime.KeyedExecutorDeadlineShutdownAndReentrancy
+        Runtime.TaskExecutorMoveOnlyOwnership
+        Runtime.JobRunnerMoveOnlyOwnership
         Runtime.BoundedRunnerReservations
         Runtime.RunnerChargesExecutingCaptures
         Runtime.SessionTaskReturnsThroughReservation
+        Runtime.SessionTaskRejectsEmptyLegacyWork
         Runtime.SessionTaskCancelsQueuedAndRunning
         Runtime.TaskCompletionCleanupAndRejection
         Runtime.TaskExecutorBoundedAdmission
@@ -105,6 +128,7 @@ set(SERVERCORE_DISPATCH_TEST_NAMES
 # 걸기 때문이다. 매달리는 것이 전송 층의 대표적 실패 형태이고, 시간 제한이 없으면 검증이
 # 멈춘 채 남는다. 포트를 열지 않는 검사에까지 제한을 걸 이유는 없다.
 set(SERVERCORE_NET_TEST_NAMES
+        Runtime.SessionCapacityNotifications
         Runtime.HostBinaryAndUdpLifetime
         Runtime.DatagramRegistryAndBinary
         Runtime.HostInputAdmission
@@ -187,6 +211,17 @@ set(SERVERCORE_DATAGRAM_TEST_NAMES
         Runtime.DatagramTruncatedDatagramsRecover)
 
 set(SERVERCORE_WEB_TEST_NAMES
+        Web.GroupedPoliciesAndJson
+        Web.CorsPreflightAndCredentials
+        Web.TrustedProxyBoundaries
+        Web.RequestFieldsAndEncoding
+        Web.CookiesValidateAndPreserveDuplicates
+        Web.MultipartArbitraryChunkBoundaries
+        Web.MultipartBoundsAndOwnedEvents
+        Web.MultipartRejectsMalformedAndLimits
+        Web.WebSocketNegotiationAndFragments
+        Web.WebSocketHeartbeatCorrelation
+        Web.WebSocketFragmentBackpressure
         Web.StreamingUploadBackpressure
         Web.RequestPolicyAndWebSocketGate
         Web.GracefulDrain
@@ -223,6 +258,25 @@ set(SERVERCORE_WEB_TEST_NAMES
         Web.ConnectionLimitAndActiveShutdown)
 
 list(APPEND SERVERCORE_TEST_NAMES
+        Core.NumericEndpointBoundaries
+        Core.AtomicFilePublication
+        Runtime.LogicalTickPoliciesAndCancellation
+        Runtime.DatagramReadinessAndCancellation
+        Runtime.DatagramExecutorPressureAndStop
+        Runtime.DatagramSendRateLimits
+        Runtime.OutboundFifoLatestAndBatch
+        Runtime.OutboundExpiryAndReentrancy
+        Observability.StructuredRecordsAndBounds
+        Observability.StructuredLoggerOwnershipAndDrain
+        Observability.ObservationAvailabilityAndLifecycle
+        Core.AtomicFileFailureAndCleanup
+        Protocol.BinaryWireAndBounds
+        Protocol.BinaryVersionNegotiation
+        Core.CidrMasksAndFamilies
+        Transport.Ipv6ConnectionEndpoints
+        Transport.Ipv6OnlyAndDualStack
+        Transport.Ipv6DatagramEndpoints
+        Runtime.Ipv6DatagramSessionEndpoints
         Observability.LoggerFilteringAndRotation
         Observability.HistogramAndPrometheus
         Observability.TaskMetrics
@@ -237,6 +291,16 @@ list(APPEND SERVERCORE_TEST_NAMES
         ${SERVERCORE_WEB_TEST_NAMES})
 
 add_executable(ServerCoreTests
+        Core/EndpointTest.cpp
+        Core/AtomicFileTest.cpp
+        Runtime/GameExecutionTest.cpp
+        Runtime/DatagramExecutionTest.cpp
+        Observability/ObservationTest.cpp
+        Protocol/BinaryIOTest.cpp
+        Net/EndpointTest.cpp
+        Runtime/RequestLimiterTest.cpp
+        Web/PolicyTest.cpp
+        Web/WebDataTest.cpp
         TestHarness.cpp
         Observability/OperationsTest.cpp
         Web/InputLifecycleTest.cpp
@@ -252,6 +316,10 @@ add_executable(ServerCoreTests
         Runtime/RuntimeTest.cpp
         Runtime/TaskExecutorTest.cpp
         Runtime/SessionTaskTest.cpp
+        Runtime/ChannelTest.cpp
+        Runtime/KeyedExecutorTest.cpp
+        Runtime/TimerSchedulerTest.cpp
+        Runtime/TaskGroupTest.cpp
         Runtime/GameHostExtensionsTest.cpp
         Protocol/BinaryMessageTest.cpp
         Runtime/ServerHostTest.cpp
@@ -265,16 +333,24 @@ add_executable(ServerCoreTests
 target_sources(ServerCoreTests PRIVATE Web/AsyncStreamingTest.cpp Web/StreamingEncodingTest.cpp)
 
 if (SERVERCORE_BUILD_C_API)
-    target_sources(ServerCoreTests PRIVATE C/WebAbiTest.cpp C/NetAbiTest.cpp)
+    target_sources(ServerCoreTests PRIVATE C/WebAbiTest.cpp C/NetAbiTest.cpp C/ReadinessAbiTest.cpp C/RuntimeAbiTest.cpp
+        C/EndpointAbiTest.cpp C/WebDataAbiTest.cpp C/WebPolicyAbiTest.cpp C/UtilityAbiTest.cpp
+        C/ObservationAbiTest.cpp C/DatagramAbiTest.cpp C/GameExecutionAbiTest.cpp)
     list(APPEND SERVERCORE_TEST_NAMES CAbi.WebHttpOwnershipAndStreaming CAbi.WebSocketOwnershipAndOverflow
+        CAbi.EndpointValues CAbi.TcpIpv6Endpoints CAbi.RequestDataOwnedViews CAbi.MultipartOwnedEventsAndFailure
+        CAbi.UtilityOwnedHandles
+        CAbi.ObservationContracts
+        CAbi.LogicalTicksOwnership
+        CAbi.OutboundOwnershipAndBatch
+        CAbi.DatagramOwnedEventsAndBackpressure
+        CAbi.DatagramCodecAndValidation
+        CAbi.PolicyOwnershipAndLimits CAbi.PolicyPreflightSocket
         CAbi.WebPolicyBeforeUpgrade CAbi.WebStreamingBodyOwnership CAbi.WebDrainMetricsAndLogger
-            CAbi.TcpOwnershipAndTerminal CAbi.TcpRetainedEventOverflow)
+            CAbi.TcpOwnershipAndTerminal CAbi.TcpRetainedEventOverflow
+            CAbi.ReadinessLifetimeAndRaces CAbi.ReadinessWebAndTcp
+            CAbi.RuntimeWorkAndNotifications CAbi.RuntimeTimersAndGroups
+            CAbi.RuntimeDeferredOwnerDestruction CAbi.RuntimeShutdown)
     target_link_libraries(ServerCoreTests PRIVATE ServerCore::CAbi)
-    if (SERVERCORE_C_API_SHARED)
-        add_custom_command(TARGET ServerCoreTests POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                $<TARGET_FILE:ServerCoreCAbi> $<TARGET_FILE_DIR:ServerCoreTests>)
-    endif ()
 endif ()
 
 target_include_directories(ServerCoreTests
@@ -298,6 +374,11 @@ target_compile_definitions(ServerCoreTests
         SERVERCORE_PROTOCOL_VECTOR_PATH="${CMAKE_CURRENT_SOURCE_DIR}/Protocol/FramingVectors.txt")
 
 target_link_libraries(ServerCoreTests PRIVATE ServerCore::ServerCore)
+if (WIN32 AND SERVERCORE_BUILD_SHARED)
+    add_custom_command(TARGET ServerCoreTests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:ServerCore> $<TARGET_FILE_DIR:ServerCoreTests>)
+endif ()
 
 if (MSVC)
     # 시험 실행 파일도 ServerCore 정적 라이브러리와 같은 CRT로 링크한다. 이 값은 최상위
@@ -326,9 +407,20 @@ foreach (test_name IN LISTS SERVERCORE_DATAGRAM_TEST_NAMES)
             RESOURCE_LOCK ServerCore.UdpPorts)
 endforeach ()
 
+set_tests_properties(ServerCore.Transport.Ipv6ConnectionEndpoints ServerCore.Transport.Ipv6OnlyAndDualStack
+    ServerCore.Transport.Ipv6DatagramEndpoints ServerCore.Runtime.Ipv6DatagramSessionEndpoints
+    PROPERTIES TIMEOUT 60 RESOURCE_LOCK ServerCore.TcpPorts)
+
 foreach (test_name IN LISTS SERVERCORE_JOB_TEST_NAMES)
     set_tests_properties(ServerCore.${test_name} PROPERTIES TIMEOUT 60)
 endforeach ()
+
+set_tests_properties(ServerCore.Runtime.LogicalTickPoliciesAndCancellation
+    ServerCore.Runtime.OutboundFifoLatestAndBatch ServerCore.Runtime.OutboundExpiryAndReentrancy
+    PROPERTIES TIMEOUT 60)
+set_tests_properties(ServerCore.Runtime.DatagramReadinessAndCancellation
+    ServerCore.Runtime.DatagramExecutorPressureAndStop ServerCore.Runtime.DatagramSendRateLimits
+    PROPERTIES TIMEOUT 60 RESOURCE_LOCK ServerCore.UdpPorts)
 
 foreach(test_name IN LISTS SERVERCORE_TEST_NAMES)
     if (test_name MATCHES "^(CAbi|Observability)\\.")
@@ -379,10 +471,30 @@ add_test(NAME ServerCore.CMake.InstallAndSourceTreeConsume
         "-DSERVERCORE_PACKAGE_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
         "-DSERVERCORE_PACKAGE_CTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
         "-DSERVERCORE_PACKAGE_VERSION=${ServerCore_VERSION}"
+        "-DSERVERCORE_PACKAGE_SHARED=${SERVERCORE_BUILD_SHARED}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/CMakePackageTest.cmake")
 set_tests_properties(ServerCore.CMake.InstallAndSourceTreeConsume PROPERTIES TIMEOUT 600)
 
-if (SERVERCORE_BUILD_C_API AND SERVERCORE_C_API_SHARED)
+if (WIN32 AND MSVC AND SERVERCORE_BUILD_SHARED)
+    add_test(NAME ServerCore.CMake.SharedAbiCompatibility COMMAND "${CMAKE_COMMAND}"
+            "-DSERVERCORE_ABI_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+            "-DSERVERCORE_ABI_BINARY_DIR=${PROJECT_BINARY_DIR}"
+            "-DSERVERCORE_ABI_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/SharedAbiConsumer-$<CONFIG>"
+            "-DSERVERCORE_ABI_GENERATOR=${CMAKE_GENERATOR}"
+            "-DSERVERCORE_ABI_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+            "-DSERVERCORE_ABI_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+            "-DSERVERCORE_ABI_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+            "-DSERVERCORE_ABI_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+            "-DSERVERCORE_ABI_CONFIGURATION=$<CONFIG>"
+            "-DSERVERCORE_ABI_MULTI_CONFIG=${ServerCorePackageMultiConfig}"
+            "-DSERVERCORE_ABI_CTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
+            "-DSERVERCORE_ABI_LIBRARY=$<TARGET_LINKER_FILE:ServerCore>"
+            "-DSERVERCORE_ABI_RUNTIME=$<TARGET_FILE:ServerCore>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/SharedAbiTest.cmake")
+    set_tests_properties(ServerCore.CMake.SharedAbiCompatibility PROPERTIES TIMEOUT 240)
+endif ()
+
+if (SERVERCORE_BUILD_C_API AND SERVERCORE_BUILD_SHARED)
     add_test(NAME ServerCore.CMake.CAbiPackageConsume COMMAND "${CMAKE_COMMAND}"
             "-DSERVERCORE_PACKAGE_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
             "-DSERVERCORE_PACKAGE_BINARY_DIR=${PROJECT_BINARY_DIR}"

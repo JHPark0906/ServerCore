@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include "Net/SendBudgetInternal.h"
 #include "ServerCore/Net/Connection.h"
 #include "ServerCore/Net/ConnectionFlowControl.h"
@@ -22,23 +24,23 @@ namespace ServerCore::Net
 class SendQueue final
 {
 public:
-    explicit SendQueue(std::shared_ptr<SendBudget> budget = nullptr);
-    ~SendQueue();
+    SERVERCORE_TEST_API explicit SendQueue(std::shared_ptr<SendBudget> budget = nullptr);
+    SERVERCORE_TEST_API ~SendQueue();
     SendQueue(const SendQueue&) = delete;
     SendQueue& operator=(const SendQueue&) = delete;
 
-    [[nodiscard]] Core::Status Enqueue(std::span<const std::byte> bytes) noexcept;
-    [[nodiscard]] bool Empty() const noexcept;
-    [[nodiscard]] std::span<std::byte> Front() noexcept;
-    void Consume(std::size_t bytes) noexcept;
-    void Clear() noexcept;
-    [[nodiscard]] std::size_t QueuedBytes() const noexcept;
-    [[nodiscard]] std::size_t RetainedBytes() const noexcept;
-    [[nodiscard]] std::shared_ptr<SendBudget> Budget() const noexcept;
+    [[nodiscard]] SERVERCORE_TEST_API Core::Status Enqueue(std::span<const std::byte> bytes) noexcept;
+    [[nodiscard]] SERVERCORE_TEST_API bool Empty() const noexcept;
+    [[nodiscard]] SERVERCORE_TEST_API std::span<std::byte> Front() noexcept;
+    SERVERCORE_TEST_API void Consume(std::size_t bytes) noexcept;
+    SERVERCORE_TEST_API void Clear() noexcept;
+    [[nodiscard]] SERVERCORE_TEST_API std::size_t QueuedBytes() const noexcept;
+    [[nodiscard]] SERVERCORE_TEST_API std::size_t RetainedBytes() const noexcept;
+    [[nodiscard]] SERVERCORE_TEST_API std::shared_ptr<SendBudget> Budget() const noexcept;
     // Mark send admission closed under the transport lock, then use
     // SendNotificationScope outside the lock to dispatch terminal notifications.
-    void CloseCapacityWaits() noexcept;
-    Core::Result<SendCapacitySubscription> WaitForCapacity(std::size_t requiredBytes,
+    SERVERCORE_TEST_API void CloseCapacityWaits() noexcept;
+    SERVERCORE_TEST_API Core::Result<SendCapacitySubscription> WaitForCapacity(std::size_t requiredBytes,
         std::function<void(Core::Status)> callback, std::stop_token cancellation);
 
 private:

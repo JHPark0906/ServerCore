@@ -5,6 +5,7 @@
 #   - PROJECT_IS_TOP_LEVEL(3.21)을 써서, 다른 프로젝트가 우리를 포함했을 때
 #     시험이 그쪽 빌드에 딸려 들어가지 않게 한다.
 #   - CMakePresets v3(3.21)를 쓴다.
+#   - C++23 표준 선택과 cxx_std_23은 3.20부터 지원한다.
 cmake_minimum_required(VERSION 3.21)
 
 # MSVC runtime target 속성은 언어를 켜기 전에 CMP0091이 NEW여야만 작동한다. 최상위
@@ -48,14 +49,27 @@ else ()
     message(FATAL_ERROR "ServerCore supports Windows and Linux.")
 endif ()
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Check the compiler AND its selected standard library, including cross builds.
+# CMake selects the appropriate /std: mode for MSVC; do not hard-code a preview
+# flag or assume support from a compiler's version number alone.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckCxx23.cmake")
+ServerCoreCheckCxx23Support()
+
 # 소비자(게임 프로젝트)가 우리를 add_subdirectory로 포함하면 시험은 꺼진다.
 option(SERVERCORE_BUILD_TESTS   "ServerCore의 시험을 빌드한다"   ${PROJECT_IS_TOP_LEVEL})
+# C and C++ APIs now share one binary. Reject obsolete scripts rather than
+# silently accepting an option that no longer controls a separate artifact.
+if (DEFINED SERVERCORE_C_API_SHARED)
+    message(FATAL_ERROR
+            "SERVERCORE_C_API_SHARED has been removed: C++ and C ABI now use one ServerCore binary. "
+            "Use SERVERCORE_BUILD_SHARED and clear the old cache entry with -U SERVERCORE_C_API_SHARED.")
+endif ()
+option(SERVERCORE_BUILD_SHARED "Build the unified C++ and optional C ABI as a shared library" OFF)
 option(SERVERCORE_BUILD_C_API "Build the C ABI used by Rust and other languages" OFF)
-option(SERVERCORE_C_API_SHARED "Build the C ABI as a self-contained shared library" ON)
 
 # Diagnose stale build scripts instead of silently dropping a requested feature.
 if (SERVERCORE_BUILD_HTTP_CLIENT)
@@ -70,10 +84,17 @@ endif ()
 # PublicHeaderCompileCheck.cpp는 공개 헤더 전부를 포함하는 번역 단위여서,
 # 빌드의 성공이 곧 "공개 헤더 전부가 컴파일된다"의 증거가 된다.
 # 새 공개 헤더를 더하면 그 파일에도 한 줄 더한다.
-add_library(ServerCore STATIC
+if (SERVERCORE_BUILD_SHARED)
+    set(ServerCoreLibraryKind SHARED)
+else ()
+    set(ServerCoreLibraryKind STATIC)
+endif ()
+add_library(ServerCore ${ServerCoreLibraryKind}
         src/Core/Assert.cpp
         src/Core/ByteBuffer.cpp
         src/Core/Clock.cpp
+        src/Core/CompletionSubscription.cpp
+        src/Core/Endpoint.cpp
         src/Core/Config.cpp
         src/Core/Error.cpp
         src/Core/JobQueue.cpp
@@ -89,17 +110,31 @@ add_library(ServerCore STATIC
         src/Net/SendQueueInternal.cpp
         src/Protocol/Framing.cpp
         src/Protocol/BinaryMessage.cpp
+        src/Protocol/BinaryIO.cpp
+        src/Core/AtomicFile.cpp
+        src/Observability/ServerObservation.cpp
+        src/Net/DatagramReadiness.cpp
+        src/Runtime/TickRunner.cpp
+        src/Runtime/OutboundQueue.cpp
         src/Protocol/Json.cpp
         src/Protocol/Message.cpp
         src/Runtime/DatagramTransport.cpp
         src/Runtime/JobRunner.cpp
+        src/Runtime/KeyedExecutor.cpp
+        src/Runtime/RequestLimiter.cpp
         src/Runtime/ParseWorkerPool.cpp
         src/Runtime/PeriodicRunner.cpp
         src/Runtime/ServerHost.cpp
         src/Runtime/TaskExecutor.cpp
+        src/Runtime/TaskGroup.cpp
+        src/Runtime/TimerScheduler.cpp
         src/Runtime/SessionTask.cpp
         src/Session/SessionRegistry.cpp
         src/Web/HttpServer.cpp
+        src/Web/HttpPolicy.cpp
+        src/Web/TrustedProxy.cpp
+        src/Web/RequestData.cpp
+        src/Web/Multipart.cpp
         src/Web/HttpObservationInternal.cpp
         src/Web/HttpResponseInternal.cpp
         src/Web/HttpStreaming.cpp
@@ -109,32 +144,37 @@ add_library(ServerCore STATIC
         src/PublicHeaderCompileCheck.cpp)
 
 add_library(ServerCore::ServerCore ALIAS ServerCore)
-
-# A narrow C interface owns all C++ allocations on the native side. Shared builds
-# intentionally do not export C++ dependency usage requirements to C/Rust users.
-if (SERVERCORE_BUILD_C_API)
-    if (SERVERCORE_C_API_SHARED)
-        set(ServerCoreCAbiKind SHARED)
-    else ()
-        set(ServerCoreCAbiKind STATIC)
-    endif ()
-    add_library(ServerCoreCAbi ${ServerCoreCAbiKind} src/C/Types.cpp src/C/Web.cpp src/C/Net.cpp)
-    add_library(ServerCore::CAbi ALIAS ServerCoreCAbi)
-    set_target_properties(ServerCoreCAbi PROPERTIES EXPORT_NAME CAbi POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(ServerCoreCAbi PUBLIC
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-            PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_compile_features(ServerCoreCAbi PRIVATE cxx_std_20)
-    target_link_libraries(ServerCoreCAbi PRIVATE ServerCore::ServerCore)
-    if (SERVERCORE_C_API_SHARED)
-        target_compile_definitions(ServerCoreCAbi PUBLIC SC_CABI_SHARED PRIVATE SC_CABI_BUILD)
-    endif ()
+if (SERVERCORE_BUILD_SHARED)
+    target_compile_definitions(ServerCore PUBLIC SERVERCORE_SHARED PRIVATE SERVERCORE_BUILDING_LIBRARY)
+    # Native C++ ABI requires a matching release/toolchain; do not promise a
+    # stable class layout across future library versions.
+    set_target_properties(ServerCore PROPERTIES VERSION "${PROJECT_VERSION}"
+            SOVERSION "${PROJECT_VERSION}" DEBUG_POSTFIX "d")
     if (MSVC)
-        set_property(TARGET ServerCoreCAbi PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-        target_compile_options(ServerCoreCAbi PRIVATE /W4 /WX /permissive- /utf-8 /EHsc)
-    else ()
-        target_compile_options(ServerCoreCAbi PRIVATE -Wall -Wextra -Wpedantic -Werror)
+        target_compile_definitions(ServerCore PUBLIC
+                SERVERCORE_MSVC_DEBUG=$<IF:$<CONFIG:Debug>,1,0>
+                SERVERCORE_MSVC_VERSION=${MSVC_VERSION})
+    endif ()
+endif ()
+
+# Both API surfaces use the same implementation and binary. The interface target
+# exposes only the C declarations and link requirements, without propagating the
+# native C++ compiler/STL ABI requirements to C or Rust consumers.
+if (SERVERCORE_BUILD_C_API)
+    target_sources(ServerCore PRIVATE src/C/Types.cpp src/C/Web.cpp src/C/Net.cpp
+            src/C/Channel.cpp src/C/Runtime.cpp src/C/Endpoint.cpp src/C/RequestLimiter.cpp
+            src/C/WebData.cpp src/C/WebPolicy.cpp src/C/BinaryIO.cpp src/C/Files.cpp
+            src/C/Datagram.cpp src/C/GameExecution.cpp)
+    add_library(ServerCoreCAbi INTERFACE)
+    add_library(ServerCore::CAbi ALIAS ServerCoreCAbi)
+    set_target_properties(ServerCoreCAbi PROPERTIES EXPORT_NAME CAbi)
+    target_include_directories(ServerCoreCAbi INTERFACE
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_link_libraries(ServerCoreCAbi INTERFACE "$<LINK_ONLY:ServerCore>")
+    if (SERVERCORE_BUILD_SHARED)
+        target_compile_definitions(ServerCore PUBLIC SC_CABI_SHARED PRIVATE SC_CABI_BUILD)
+        target_compile_definitions(ServerCoreCAbi INTERFACE SC_CABI_SHARED)
     endif ()
 endif ()
 
@@ -155,7 +195,7 @@ endif ()
 # Allow the static core to be embedded in shared application libraries.
 set_property(TARGET ServerCore PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-target_compile_features(ServerCore PUBLIC cxx_std_20)
+target_compile_features(ServerCore PUBLIC cxx_std_23)
 
 if (MSVC)
     # ServerCore의 공개 API는 std::string, std::function, shared_ptr 등을 넘긴다. 따라서
@@ -207,20 +247,19 @@ write_basic_package_version_file(
         COMPATIBILITY SameMinorVersion)
 
 set(ServerCoreNativeInstallComponent Unspecified)
-if (SERVERCORE_BUILD_C_API AND NOT SERVERCORE_C_API_SHARED)
-    # Static C ABI consumers also need the archives and imported dependency
-    # targets. Keep component installs usable by Cargo's static source build.
+if (SERVERCORE_BUILD_C_API)
+    # The C ABI is part of the real ServerCore binary in both link modes.
+    # Its component therefore includes that binary and its imported target.
     set(ServerCoreNativeInstallComponent CAbi)
 endif ()
 install(TARGETS ServerCore
         EXPORT ServerCoreTargets
-        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT ${ServerCoreNativeInstallComponent})
+        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT ${ServerCoreNativeInstallComponent}
+        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT ${ServerCoreNativeInstallComponent}
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT ${ServerCoreNativeInstallComponent})
 
 if (SERVERCORE_BUILD_C_API)
-    install(TARGETS ServerCoreCAbi EXPORT ServerCoreCAbiTargets
-            RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT CAbi
-            LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT CAbi
-            ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT CAbi)
+    install(TARGETS ServerCoreCAbi EXPORT ServerCoreCAbiTargets)
     install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/ServerCore/C"
             DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/ServerCore" COMPONENT CAbi)
     install(EXPORT ServerCoreCAbiTargets FILE ServerCoreCAbiTargets.cmake

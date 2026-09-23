@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include <string_view>
 
 /// <summary>
@@ -25,5 +27,5 @@ inline constexpr int VersionPatch = 0;
 /// 정적 저장기간을 갖는 버전 문자열이다. 호출자가 수명을 관리하지 않으며,
 /// 반환된 뷰는 프로그램이 끝날 때까지 유효하다.
 /// </returns>
-[[nodiscard]] std::string_view GetVersionString() noexcept;
+[[nodiscard]] SERVERCORE_API std::string_view GetVersionString() noexcept;
 }

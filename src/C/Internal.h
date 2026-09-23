@@ -4,6 +4,7 @@
 #include "ServerCore/Core/Error.h"
 #include "ServerCore/Core/Logging.h"
 #include "ServerCore/Net/ConnectionFlowControl.h"
+#include "C/ReadinessInternal.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -74,19 +75,19 @@ public:
             else mFirst = std::move(link);
             mLast = tail;
         }
-        mWake.notify_one(); return true;
+        mWake.notify_one(); mReadiness.Signal(); return true;
     }
     // Terminal storage is allocated at connection/request admission, never here.
     void Finish(std::unique_ptr<T> terminal) noexcept {
         { std::lock_guard lock(mMutex); if (mClosed) return; mClosed = true; mTerminal = std::move(terminal); }
-        mWake.notify_all();
+        mWake.notify_all(); mReadiness.Signal();
     }
     void Close() noexcept {
         std::unique_ptr<Link> discarded;
         std::unique_ptr<T> terminal;
         { std::lock_guard lock(mMutex); mClosed = true; discarded = std::move(mFirst);
           mLast = nullptr; terminal = std::move(mTerminal); }
-        mWake.notify_all();
+        mWake.notify_all(); mReadiness.Signal();
         // Item destruction may close a transport; never do it under mMutex.
         // Detach each next link before deletion to avoid recursive destruction.
         while (discarded) {
@@ -94,6 +95,11 @@ public:
             discarded.reset();
             discarded = std::move(next);
         }
+    }
+    sc_status Subscribe(sc_notifier* notifier, uint64_t key, sc_subscription** out) {
+        return CDetail::Subscribe(mReadiness, [&] {
+            std::lock_guard guard(mMutex); return mFirst || mTerminal || mClosed;
+        }, notifier, key, out);
     }
     sc_status Next(uint32_t timeout, T** out) {
         if (!out) return SC_INVALID_ARGUMENT;
@@ -119,6 +125,7 @@ private:
     struct Link { std::unique_ptr<T> item; std::unique_ptr<Link> next; };
     std::mutex mMutex;
     std::condition_variable mWake;
+    ReadinessSource mReadiness;
     std::unique_ptr<Link> mFirst;
     Link* mLast = nullptr;
     std::unique_ptr<T> mTerminal;
@@ -129,8 +136,10 @@ struct WaitState {
     std::mutex mutex;
     std::condition_variable wake;
     sc_status result = SC_WOULD_BLOCK;
+    ReadinessSource readiness;
     void Complete(Core::Status status) noexcept {
-        { std::lock_guard lock(mutex); result = Code(status); } wake.notify_all();
+        { std::lock_guard lock(mutex); result = Code(status); }
+        wake.notify_all(); readiness.Signal();
     }
 };
 using RegisterWait = std::function<Core::Result<Net::SendCapacitySubscription>(std::function<void(Core::Status)>)>;

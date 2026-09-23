@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include "ServerCore/Core/Error.h"
 #include "ServerCore/Protocol/Json.h"
 
@@ -44,22 +46,22 @@ class Message
 {
 public:
     /// <summary>봉투의 type 값이다. 디스패치의 열쇠다.</summary>
-    [[nodiscard]] std::string_view Type() const;
+    [[nodiscard]] SERVERCORE_API std::string_view Type() const;
 
     /// <summary>봉투의 body 값이다. 없으면 널이다.</summary>
-    [[nodiscard]] const JsonValue* Body() const noexcept;
+    [[nodiscard]] SERVERCORE_API const JsonValue* Body() const noexcept;
 
     /// <summary>봉투의 seq 값이다. 없으면 널이다.</summary>
-    [[nodiscard]] const JsonValue* Sequence() const noexcept;
+    [[nodiscard]] SERVERCORE_API const JsonValue* Sequence() const noexcept;
 
     /// <summary>봉투의 error 값이다. 없으면 널이다.</summary>
-    [[nodiscard]] const JsonValue* Error() const noexcept;
+    [[nodiscard]] SERVERCORE_API const JsonValue* Error() const noexcept;
 
     /// <summary>원래 wire에서 body 값만 차지한 UTF-8 바이트 수다.</summary>
-    [[nodiscard]] std::size_t RawBodySize() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::size_t RawBodySize() const noexcept;
 
 private:
-    friend Core::Result<Message> ParseMessage(std::span<const std::byte> jsonBody);
+    friend SERVERCORE_API Core::Result<Message> ParseMessage(std::span<const std::byte> jsonBody);
 
     std::string mType;
     std::optional<JsonValue> mBody;
@@ -91,7 +93,7 @@ public:
 private:
     PreparedJsonValue() = default;
     friend class Core::Result<PreparedJsonValue>;
-    friend Core::Result<PreparedJsonValue> PrepareJsonValue(const JsonValue& value);
+    friend SERVERCORE_API Core::Result<PreparedJsonValue> PrepareJsonValue(const JsonValue& value);
     std::vector<std::byte> mBytes;
 };
 
@@ -105,21 +107,21 @@ public:
 private:
     PreparedMessage() = default;
     friend class Core::Result<PreparedMessage>;
-    friend Core::Result<PreparedMessage> PrepareMessage(const MessageFields& fields);
-    friend Core::Result<PreparedMessage> PrepareArrayMessage(std::string_view type,
+    friend SERVERCORE_API Core::Result<PreparedMessage> PrepareMessage(const MessageFields& fields);
+    friend SERVERCORE_API Core::Result<PreparedMessage> PrepareArrayMessage(std::string_view type,
         std::string_view arrayKey, std::span<const PreparedJsonValue* const> items);
     std::vector<std::byte> mBytes;
 };
 
 /// <summary>UTF-8·유한 숫자 검증을 거쳐 재사용할 JSON 값 하나를 만든다.</summary>
 /// <remarks>조립할 봉투/body/배열의 깊이 3도 JSON 중첩 한도에 포함해 검증한다.</remarks>
-Core::Result<PreparedJsonValue> PrepareJsonValue(const JsonValue& value);
+SERVERCORE_API Core::Result<PreparedJsonValue> PrepareJsonValue(const JsonValue& value);
 /// <summary>일반 봉투를 한 번 직렬화한다. SendPrepared는 같은 봉투를 다시 직렬화하지 않는다.</summary>
-Core::Result<PreparedMessage> PrepareMessage(const MessageFields& fields);
+SERVERCORE_API Core::Result<PreparedMessage> PrepareMessage(const MessageFields& fields);
 /// <summary>body의 한 배열에 준비된 바이트를 복사한다. JSON 값을 재파싱·재직렬화하지 않는다.</summary>
 /// <remarks>type과 배열 키는 정상 JSON 문자열로 escape한다. null/이동 후 빈 항목은 거절한다.
 /// Size()는 봉투 전체 크기이며 실제 TCP 프레임 예산에는 길이 접두사 4바이트도 포함한다.</remarks>
-Core::Result<PreparedMessage> PrepareArrayMessage(std::string_view type,
+SERVERCORE_API Core::Result<PreparedMessage> PrepareArrayMessage(std::string_view type,
     std::string_view arrayKey, std::span<const PreparedJsonValue* const> items);
 
 /// <summary>
@@ -134,18 +136,18 @@ Core::Result<PreparedMessage> PrepareArrayMessage(std::string_view type,
 /// 대한 호출은 동시에 해도 안전하다. 단, 반환 Message의 참조는 일반적인 객체 수명 규칙을 따른다.
 /// ServerHost는 이 성질을 이용해 FrameReader 뒤의 JSON 해석만 별도 parse worker에서 병렬화한다.
 /// </remarks>
-Core::Result<Message> ParseMessage(std::span<const std::byte> jsonBody);
+SERVERCORE_API Core::Result<Message> ParseMessage(std::span<const std::byte> jsonBody);
 
 /// <summary>선택 필드까지 포함해 봉투 하나를 직렬화한다.</summary>
 /// <remarks>
 /// body가 없으면 error가 반드시 있어야 한다. error는 객체이고 그 안의 code는 문자열이어야
 /// 한다. 코어는 code의 의미는 검증하지 않는다.
 /// </remarks>
-Core::Result<std::vector<std::byte>> SerializeMessage(const MessageFields& fields);
+SERVERCORE_API Core::Result<std::vector<std::byte>> SerializeMessage(const MessageFields& fields);
 
 /// <summary>
 /// 타입과 본문으로 봉투를 만들어 UTF-8 JSON 바이트로 만든다.
 /// </summary>
 /// <remarks>머리는 붙이지 않는다. 그것은 EncodeFrame의 일이다.</remarks>
-Core::Result<std::vector<std::byte>> SerializeMessage(std::string_view type, const JsonValue& body);
+SERVERCORE_API Core::Result<std::vector<std::byte>> SerializeMessage(std::string_view type, const JsonValue& body);
 }

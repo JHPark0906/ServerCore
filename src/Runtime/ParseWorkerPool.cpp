@@ -36,7 +36,7 @@ class ParseWorkerPool::State
 {
 public:
     [[nodiscard]] Core::Status Start(int workerThreadCount);
-    [[nodiscard]] Core::Status Post(std::function<void()> job);
+    [[nodiscard]] Core::Status Post(Job job);
     void StopAndDiscard();
     [[nodiscard]] bool IsCurrentThread() const noexcept;
 
@@ -45,7 +45,10 @@ private:
 
     mutable std::mutex mMutex;
     std::condition_variable mWake;
-    std::deque<std::function<void()>> mJobs;
+    using Queue = std::deque<std::unique_ptr<Job>>;
+    // Owning nodes keep callable moves/destruction out of the lock. Owning the
+    // queue also lets shutdown detach it without allocating a new container.
+    std::unique_ptr<Queue> mJobs = std::make_unique<Queue>();
     std::vector<std::thread> mWorkers;
     bool mStarted = false;
     bool mAccepting = false;
@@ -67,7 +70,7 @@ Core::Status ParseWorkerPool::Start(const int workerThreadCount)
     return mState->Start(workerThreadCount);
 }
 
-Core::Status ParseWorkerPool::Post(std::function<void()> job)
+Core::Status ParseWorkerPool::Post(Job job)
 {
     return mState->Post(std::move(job));
 }
@@ -149,7 +152,7 @@ Core::Status ParseWorkerPool::State::Start(const int workerThreadCount)
     return Core::Status::Ok();
 }
 
-Core::Status ParseWorkerPool::State::Post(std::function<void()> job)
+Core::Status ParseWorkerPool::State::Post(Job job)
 {
     if (!job)
     {
@@ -159,6 +162,7 @@ Core::Status ParseWorkerPool::State::Post(std::function<void()> job)
 
     try
     {
+        auto node = std::make_unique<Job>(std::move(job));
         {
             const std::lock_guard<std::mutex> guard(mMutex);
             if (!mAccepting)
@@ -166,7 +170,7 @@ Core::Status ParseWorkerPool::State::Post(std::function<void()> job)
                 return Core::Status::Fail(Core::ErrorCode::Closed,
                     "ParseWorkerPool no longer accepts jobs after StopAndDiscard");
             }
-            mJobs.emplace_back(std::move(job));
+            mJobs->push_back(std::move(node));
         }
         mWake.notify_one();
         return Core::Status::Ok();
@@ -184,6 +188,7 @@ Core::Status ParseWorkerPool::State::Post(std::function<void()> job)
 void ParseWorkerPool::State::StopAndDiscard()
 {
     std::vector<std::thread> workers;
+    std::unique_ptr<Queue> discarded;
     {
         const std::lock_guard<std::mutex> guard(mMutex);
         if (!mStarted)
@@ -193,12 +198,13 @@ void ParseWorkerPool::State::StopAndDiscard()
 
         mAccepting = false;
         mStopRequested = true;
-        // 대기 lambda가 소유한 ParseWorkItem을 여기서 파기해 예약을 반환한다. 이미 worker가
-        // 꺼낸 작업은 따로 끝까지 실행되므로, 그 payload의 예약은 아래 join 이전에 빼앗지 않는다.
-        mJobs.clear();
+        // Release queued captures outside the lock; their destructors can
+        // return reservations or query execution state.
+        discarded = std::move(mJobs);
         workers.swap(mWorkers);
     }
     mWake.notify_all();
+    discarded.reset();
 
     for (std::thread& worker : workers)
     {
@@ -219,22 +225,22 @@ void ParseWorkerPool::State::RunWorker() noexcept
     gCurrentParseWorkerState = this;
     for (;;)
     {
-        std::function<void()> job;
+        std::unique_ptr<Job> current;
         {
             std::unique_lock<std::mutex> guard(mMutex);
-            mWake.wait(guard, [this]() { return mStopRequested || !mJobs.empty(); });
-            if (mStopRequested && mJobs.empty())
+            mWake.wait(guard, [this]() { return mStopRequested || !mJobs->empty(); });
+            if (mStopRequested && (!mJobs || mJobs->empty()))
             {
                 break;
             }
 
-            job = std::move(mJobs.front());
-            mJobs.pop_front();
+            current = std::move(mJobs->front());
+            mJobs->pop_front();
         }
 
         try
         {
-            job();
+            (*current)();
         }
         catch (...)
         {

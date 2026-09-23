@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ServerCore/Core/Error.h"
+#include "ServerCore/Core/Endpoint.h"
 
 #include <cstddef>
 #include <memory>
@@ -204,6 +205,11 @@ public:
     /// 포함된다. 따라서 이 값은 실제 보관 메모리, peer 수신량, OS 소켓 버퍼 점유량이 아니다.
     /// </remarks>
     [[nodiscard]] virtual std::size_t QueuedSendBytes() const noexcept = 0;
+
+    // Immutable accepted-socket snapshots; available before the accept handler
+    // and retained after Close. Custom transports may return unspecified values.
+    [[nodiscard]] virtual Core::IpEndpoint LocalEndpoint() const noexcept { return {}; }
+    [[nodiscard]] virtual Core::IpEndpoint RemoteEndpoint() const noexcept { return {}; }
 
 protected:
     Connection() = default;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include "ServerCore/Core/Error.h"
 
 #include <cstddef>
@@ -22,8 +24,8 @@ struct BinaryMessageView
 
 inline constexpr std::size_t BinaryMessageHeaderSize = 4;
 
-[[nodiscard]] Core::Result<BinaryMessageView> DecodeBinaryMessage(
+[[nodiscard]] SERVERCORE_API Core::Result<BinaryMessageView> DecodeBinaryMessage(
     std::span<const std::byte> bytes) noexcept;
-[[nodiscard]] Core::Result<std::vector<std::byte>> EncodeBinaryMessage(
+[[nodiscard]] SERVERCORE_API Core::Result<std::vector<std::byte>> EncodeBinaryMessage(
     std::uint32_t type, std::span<const std::byte> payload, std::size_t maximumBytes);
 }

@@ -1,8 +1,11 @@
 #pragma once
+#include "ServerCore/Export.h"
 #include "ServerCore/Observability/Metrics.h"
 #include "ServerCore/Observability/RequestTrace.h"
 
 #include "ServerCore/Core/Error.h"
+#include "ServerCore/Core/Endpoint.h"
+#include "ServerCore/Core/CompletionSubscription.h"
 #include "ServerCore/Core/Logging.h"
 #include "ServerCore/Net/ConnectionFlowControl.h"
 
@@ -33,12 +36,14 @@ struct HttpRequest
     // Owned, decoded captures from the selected pattern, in path order. Empty
     // for exact routes. Copying the request also copies these values.
     std::vector<std::pair<std::string, std::string>> pathParameters{};
+    // Transport endpoints, independent of untrusted forwarding headers.
+    Core::IpEndpoint localEndpoint{}, remoteEndpoint{};
 
-    [[nodiscard]] std::string_view Path() const noexcept;
-    [[nodiscard]] std::string_view Header(std::string_view name) const noexcept;
+    [[nodiscard]] SERVERCORE_API std::string_view Path() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::string_view Header(std::string_view name) const noexcept;
     // Case-sensitive name; an absent parameter returns an empty view. Views
     // remain valid only while the request's corresponding storage is unchanged.
-    [[nodiscard]] std::string_view PathParameter(std::string_view name) const noexcept;
+    [[nodiscard]] SERVERCORE_API std::string_view PathParameter(std::string_view name) const noexcept;
 };
 
 struct HttpResponse
@@ -104,6 +109,15 @@ public:
     virtual void Cancel() noexcept = 0;
     [[nodiscard]] virtual std::stop_token GetCancellationToken() const noexcept = 0;
     [[nodiscard]] virtual std::size_t RetainedBytes() const noexcept = 0;
+    // One advisory one-shot waiter; ready data/EOF/errors notify inline.
+    // Callbacks run outside parser/body locks. Reset is a quiescence boundary.
+    virtual Core::Result<Core::CompletionSubscription> WaitForReadReady(
+        std::function<void(Core::Status)> callback, std::stop_token cancellation = {})
+    {
+        (void)callback; (void)cancellation;
+        return Core::Result<Core::CompletionSubscription>::FromStatus(
+            Core::Status::FailWithoutMessage(Core::ErrorCode::Unimplemented));
+    }
 };
 
 struct HttpRequestContext
@@ -150,8 +164,8 @@ public:
     virtual ~WebSocketConnection() = default;
     [[nodiscard]] virtual std::uint64_t Id() const noexcept = 0;
     // Thread-safe. Success means queued locally, not delivered to the peer.
-    // Outgoing messages must fit maxWebSocketFrameBytes; incoming fragmented
-    // messages may be larger, up to maxWebSocketMessageBytes.
+    // These single-frame sends must fit maxWebSocketFrameBytes. The optional
+    // message writer sends larger messages up to maxWebSocketMessageBytes.
     // Closed state is checked before payload validation. Live sends enforce size
     // before inspecting UTF-8; malformed caller text/close reasons return
     // InvalidArgument. Invalid received UTF-8 instead closes with wire code 1007.
@@ -174,7 +188,38 @@ public:
         std::size_t payloadBytes, std::function<void(Core::Status)> callback,
         std::stop_token cancellation = {}) = 0;
 };
-[[nodiscard]] std::shared_ptr<WebSocketFlowControl> GetWebSocketFlowControl(
+[[nodiscard]] SERVERCORE_API std::shared_ptr<WebSocketFlowControl> GetWebSocketFlowControl(
+    const std::shared_ptr<WebSocketConnection>& connection) noexcept;
+
+// One owned writer reserves the data-message lane. Every successful Write
+// admits one frame (first Text/Binary, then continuations); final releases the
+// lane. Control frames may interleave. Another writer or ordinary data send
+// returns AlreadyExists while reserved. WouldBlock accepts no bytes/state change.
+// Text is checked incrementally, including code points split across frames.
+// Invalid input is retryable; dropping/aborting after any admitted fragment
+// closes the connection, since an incomplete wire message cannot be withdrawn.
+class WebSocketMessageWriter
+{
+public:
+    virtual ~WebSocketMessageWriter() = default;
+    virtual Core::Status Write(std::span<const std::byte> bytes, bool final) = 0;
+    virtual void Abort() noexcept = 0;
+    [[nodiscard]] virtual std::size_t MaxWriteBytes() const noexcept = 0;
+    // Reentry during a Write transaction returns WouldBlock without installing
+    // a waiter. Capacity itself is advisory; recheck Write after notification.
+    virtual Core::Result<Net::SendCapacitySubscription> WaitForWriteCapacity(
+        std::size_t bytes, std::function<void(Core::Status)> callback,
+        std::stop_token cancellation = {}) = 0;
+};
+// Optional extension preserves existing WebSocketConnection implementers.
+class WebSocketMessageControl
+{
+public:
+    virtual ~WebSocketMessageControl() = default;
+    [[nodiscard]] virtual std::string_view Subprotocol() const noexcept = 0;
+    virtual Core::Result<std::shared_ptr<WebSocketMessageWriter>> BeginMessage(WebSocketMessageType type) = 0;
+};
+[[nodiscard]] SERVERCORE_API std::shared_ptr<WebSocketMessageControl> GetWebSocketMessageControl(
     const std::shared_ptr<WebSocketConnection>& connection) noexcept;
 
 struct WebSocketCallbacks
@@ -195,6 +240,11 @@ struct WebSocketCallbacks
     // Runs before the synchronous accept predicate and before any 101 bytes.
     // The server-wide policy, when set, is evaluated first.
     RequestPolicy authorize{};
+    // Server preference order; unique case-sensitive ASCII tokens. At most 64
+    // tokens/4096 bytes (also enforced for offered request tokens). A missing
+    // match omits Sec-WebSocket-Protocol. Repeated
+    // request fields combine normally; duplicate offered tokens are rejected.
+    std::vector<std::string> subprotocols{};
 };
 
 struct HttpServerOptions
@@ -236,11 +286,18 @@ struct HttpServerOptions
     std::chrono::milliseconds streamIdleTimeout{120000};
     std::size_t maxRequestBodyBufferBytes = 64 * 1024;
     std::size_t maxStreamedBodyBytes = 1024 * 1024 * 1024;
+    // Disabled at zero. The shared maintenance tick sends correlated Pings;
+    // only the matching Pong satisfies the positive timeout. No per-peer thread.
+    // Deadlines begin at local queue admission, not remote delivery.
+    std::chrono::milliseconds webSocketPingInterval{0};
+    std::chrono::milliseconds webSocketPongTimeout{10000};
+    // IPv6 listeners default to V6ONLY. Explicit false accepts mapped IPv4 too.
+    bool ipv6Only = true;
 };
 
 // HTTP/1.1 exact and pattern routes, persistent connections, Content-Length and bounded
-// chunked request decoding. No TLS, HTTP/2, HTTP/3, WebSocket compression or
-// subprotocol negotiation. TLS can terminate at a reverse proxy.
+// chunked request decoding. No TLS, HTTP/2, HTTP/3 or WebSocket compression.
+// TLS can terminate at a reverse proxy.
 //
 // Register routes before Start. HTTP handlers run on the bounded handler pool;
 // async handlers may retain their owning context and complete later. One response
@@ -254,18 +311,18 @@ public:
     using Handler = std::function<HttpResponse(const HttpRequest&)>;
     using AsyncHandler = std::function<void(std::shared_ptr<const HttpRequestContext>)>;
 
-    HttpServer();
-    ~HttpServer();
+    SERVERCORE_API HttpServer();
+    SERVERCORE_API ~HttpServer();
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
 
     // Register before Start. Calls from this server's callbacks return Closed.
     // Other calls validate arguments first (InvalidArgument), then reject a used
     // server (Closed) or a duplicate key (AlreadyExists). Routes are never replaced.
-    Core::Status RegisterRoute(std::string_view method, std::string_view path, Handler handler);
-    Core::Status RegisterAsyncRoute(std::string_view method, std::string_view path, AsyncHandler handler);
-    Core::Status RegisterStreamingRoute(std::string_view method, std::string_view path, AsyncHandler handler);
-    Core::Status RegisterWebSocket(std::string_view path, WebSocketCallbacks callbacks);
+    SERVERCORE_API Core::Status RegisterRoute(std::string_view method, std::string_view path, Handler handler);
+    SERVERCORE_API Core::Status RegisterAsyncRoute(std::string_view method, std::string_view path, AsyncHandler handler);
+    SERVERCORE_API Core::Status RegisterStreamingRoute(std::string_view method, std::string_view path, AsyncHandler handler);
+    SERVERCORE_API Core::Status RegisterWebSocket(std::string_view path, WebSocketCallbacks callbacks);
     // Opt-in patterns: /plugins/{id}, with whole, nonempty segment captures.
     // Names use [A-Za-z_][A-Za-z0-9_]* and cannot repeat within one pattern.
     // Exact raw paths win first; patterns prefer a static segment over a capture
@@ -276,43 +333,47 @@ public:
     // Pattern matching percent-decodes each segment once and validates UTF-8;
     // malformed escapes, controls, separators and dot segments are rejected.
     // Query strings are excluded; case, '+' and trailing slashes are preserved.
-    Core::Status RegisterRoutePattern(std::string_view method, std::string_view pattern, Handler handler);
-    Core::Status RegisterAsyncRoutePattern(std::string_view method, std::string_view pattern, AsyncHandler handler);
-    Core::Status RegisterStreamingRoutePattern(std::string_view method, std::string_view pattern, AsyncHandler handler);
+    SERVERCORE_API Core::Status RegisterRoutePattern(std::string_view method, std::string_view pattern, Handler handler);
+    SERVERCORE_API Core::Status RegisterAsyncRoutePattern(std::string_view method, std::string_view pattern, AsyncHandler handler);
+    SERVERCORE_API Core::Status RegisterStreamingRoutePattern(std::string_view method, std::string_view pattern, AsyncHandler handler);
     // Uses the same pattern rules. Captures are available in accept(request)
     // and onOpenWithRequest(connection, request).
     // HTTP and WebSocket routes can share a path; Upgrade: websocket requests
     // select the WebSocket table, ordinary requests select the HTTP table first.
-    Core::Status RegisterWebSocketPattern(std::string_view pattern, WebSocketCallbacks callbacks);
+    SERVERCORE_API Core::Status RegisterWebSocketPattern(std::string_view pattern, WebSocketCallbacks callbacks);
     [[deprecated("Use RegisterRoute instead")]]
-    Core::Status Route(std::string_view method, std::string_view path, Handler handler);
+    SERVERCORE_API Core::Status Route(std::string_view method, std::string_view path, Handler handler);
     [[deprecated("Use RegisterWebSocket instead")]]
-    Core::Status WebSocket(std::string_view path, WebSocketCallbacks callbacks);
-    Core::Status Start(const HttpServerOptions& options);
-    Core::Status SetRequestPolicy(RequestPolicy policy);
-    Core::Status SetLogger(std::shared_ptr<Core::ILogger> logger);
+    SERVERCORE_API Core::Status WebSocket(std::string_view path, WebSocketCallbacks callbacks);
+    SERVERCORE_API Core::Status Start(const HttpServerOptions& options);
+    SERVERCORE_API Core::Status SetRequestPolicy(RequestPolicy policy);
+    SERVERCORE_API Core::Status SetLogger(std::shared_ptr<Core::ILogger> logger);
     // Configure before Start. One owned terminal event per admitted routed HTTP
     // request, delivered on a dedicated bounded worker. No request content is
     // collected. Full queues drop events and increment droppedTraceEvents.
     // Callbacks run outside internal locks, must finish promptly, and may query
     // metrics. Stop from this callback is InvalidArgument. Exceptions are counted.
-    Core::Status SetRequestTraceHandler(Observability::RequestTraceHandler handler,
+    SERVERCORE_API Core::Status SetRequestTraceHandler(Observability::RequestTraceHandler handler,
         std::size_t maxPendingEvents = 256);
     // InvalidArgument from a callback/I/O thread, rather than self-joining.
-    Core::Status Stop();
+    SERVERCORE_API Core::Status Stop();
     // Stops new accepts/requests; admitted responses may finish. Idle HTTP peers
     // close and WebSockets begin a 1001 closing handshake. BeginDrain is
     // idempotent on a control thread; callbacks/I/O threads return InvalidArgument.
     // DrainStatus is nonblocking (WouldBlock/Ok).
-    Core::Status BeginDrain();
-    [[nodiscard]] Core::Status DrainStatus() const noexcept;
+    SERVERCORE_API Core::Status BeginDrain();
+    [[nodiscard]] SERVERCORE_API Core::Status DrainStatus() const noexcept;
+    // Call after BeginDrain. One waiter; completion means no admitted peers
+    // remain. Does not stop/join workers. Callback may run inline.
+    SERVERCORE_API Core::Result<Core::CompletionSubscription> WaitForDrain(
+        std::function<void(Core::Status)> callback, std::stop_token cancellation = {});
     // At deadline, cancel remaining connections then perform normal Stop.
     // Returns Timeout when forcing was necessary. Joining noncooperative user
     // callbacks retains the same limitation as Stop; call on a control thread.
-    Core::Status StopGracefully(std::chrono::steady_clock::time_point deadline);
-    [[nodiscard]] bool IsRunning() const noexcept;
-    [[nodiscard]] std::uint16_t Port() const noexcept;
-    [[nodiscard]] Observability::HttpServerMetricsSnapshot GetMetrics() const noexcept;
+    SERVERCORE_API Core::Status StopGracefully(std::chrono::steady_clock::time_point deadline);
+    [[nodiscard]] SERVERCORE_API bool IsRunning() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::uint16_t Port() const noexcept;
+    [[nodiscard]] SERVERCORE_API Observability::HttpServerMetricsSnapshot GetMetrics() const noexcept;
 
 private:
     class State;

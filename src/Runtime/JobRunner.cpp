@@ -13,7 +13,7 @@ using Core::ErrorCode;
 using Core::Status;
 struct QueuedJob
 {
-    std::function<void()> callback;
+    JobRunner::Job callback;
     std::size_t bytes = 0;
     bool control = false;
     std::chrono::steady_clock::time_point admitted{};
@@ -74,7 +74,7 @@ public:
         --(control ? mControlCount : mCount);
         (control ? mControlBytes : mBytes) -= bytes;
     }
-    Status Post(std::function<void()> callback, std::size_t bytes, bool control)
+    Status Post(Job callback, std::size_t bytes, bool control)
     {
         if (!callback)
             return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
@@ -124,18 +124,33 @@ public:
         }
         return Result::FromValue(Reservation(std::move(reserved)));
     }
-    Status PostReserved(ReservationState& reserved, std::function<void()> callback)
+    Status PostReserved(ReservationState& reserved, Job callback)
     {
         if (!callback)
             return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
+        if (reserved.node.empty())
+            return Status::FailWithoutMessage(ErrorCode::Closed);
+        // Operations on one reservation are caller-serialized. Fill its private
+        // node before locking: an inline callable's move/destructor may reenter
+        // this runner. Committing the node below needs no further callable move.
+        reserved.node.front().callback = std::move(callback);
+        bool posted = false;
         {
             const std::lock_guard guard(mMutex);
-            if (mStopRequested || reserved.node.empty())
-                return Status::FailWithoutMessage(ErrorCode::Closed);
-            reserved.node.front().callback = std::move(callback);
-            reserved.node.front().admitted = std::chrono::steady_clock::now();
-            Observability::Detail::Add(mMetrics.acceptedJobs);
-            mQueue.splice(mQueue.end(), reserved.node);
+            if (!mStopRequested)
+            {
+                reserved.node.front().admitted = std::chrono::steady_clock::now();
+                Observability::Detail::Add(mMetrics.acceptedJobs);
+                mQueue.splice(mQueue.end(), reserved.node);
+                posted = true;
+            }
+        }
+        if (!posted)
+        {
+            // Destroy captures outside the lock while their reservation is
+            // still charged; Reservation::Post releases that capacity next.
+            reserved.node.front().callback = {};
+            return Status::FailWithoutMessage(ErrorCode::Closed);
         }
         mWake.notify_one();
         return Status::Ok();
@@ -270,11 +285,12 @@ bool JobRunner::Reservation::IsValid() const noexcept
 {
     return mState && !mState->node.empty();
 }
-Core::Status JobRunner::Reservation::Post(std::function<void()> job)
+Core::Status JobRunner::Reservation::Post(Job job)
 {
-    if (!mState)
+    const auto state = mState;
+    if (!state)
         return Status::FailWithoutMessage(ErrorCode::Closed);
-    auto result = mState->owner->PostReserved(*mState, std::move(job));
+    auto result = state->owner->PostReserved(*state, std::move(job));
     if (result.IsOk() || result.Code() == ErrorCode::Closed)
         mState.reset();
     return result;
@@ -288,12 +304,12 @@ JobRunner::Lease::Lease(std::shared_ptr<SharedState> state, bool control) noexce
     , mControl(control)
 {
 }
-Core::Status JobRunner::Lease::Post(std::function<void()> job, std::size_t bytes) const
+Core::Status JobRunner::Lease::Post(Job job, std::size_t bytes) const
 {
     return mState ? mState->Post(std::move(job), bytes, mControl)
                   : Status::FailWithoutMessage(ErrorCode::Closed);
 }
-Core::Status JobRunner::Lease::PostControl(std::function<void()> job, std::size_t bytes) const
+Core::Status JobRunner::Lease::PostControl(Job job, std::size_t bytes) const
 {
     return mState ? mState->Post(std::move(job), bytes, true)
                   : Status::FailWithoutMessage(ErrorCode::Closed);
@@ -333,11 +349,11 @@ Core::Status JobRunner::Configure(const JobRunnerOptions& options)
 {
     return mState->Configure(options);
 }
-Core::Status JobRunner::Post(std::function<void()> job, std::size_t bytes)
+Core::Status JobRunner::Post(Job job, std::size_t bytes)
 {
     return mState->Post(std::move(job), bytes, false);
 }
-Core::Status JobRunner::PostControl(std::function<void()> job, std::size_t bytes)
+Core::Status JobRunner::PostControl(Job job, std::size_t bytes)
 {
     return mState->Post(std::move(job), bytes, true);
 }

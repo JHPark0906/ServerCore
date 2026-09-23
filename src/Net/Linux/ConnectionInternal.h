@@ -23,8 +23,9 @@ public:
     struct CreationKey {};
     // Ownership of descriptor transfers only after Create succeeds.
     [[nodiscard]] static std::shared_ptr<TcpConnection> Create(int descriptor,
-        IoContext& context, std::shared_ptr<SendBudget> budget);
-    TcpConnection(CreationKey, int descriptor, IoContext& context, std::shared_ptr<SendBudget> budget);
+        IoContext& context, std::shared_ptr<SendBudget> budget,Core::IpEndpoint local = {},Core::IpEndpoint remote = {});
+    TcpConnection(CreationKey, int descriptor, IoContext& context, std::shared_ptr<SendBudget> budget,
+        Core::IpEndpoint local,Core::IpEndpoint remote);
     ~TcpConnection() override;
 
     [[nodiscard]] Core::Status Start();
@@ -35,6 +36,8 @@ public:
     void SetObserver(std::weak_ptr<IConnectionObserver> observer) override;
     [[nodiscard]] bool IsOpen() const noexcept override;
     [[nodiscard]] std::size_t QueuedSendBytes() const noexcept override;
+    [[nodiscard]] Core::IpEndpoint LocalEndpoint() const noexcept override { return mLocalEndpoint; }
+    [[nodiscard]] Core::IpEndpoint RemoteEndpoint() const noexcept override { return mRemoteEndpoint; }
     Core::Status PauseReceive() override;
     Core::Status ResumeReceive() override;
     [[nodiscard]] bool IsReceivePaused() const noexcept override;
@@ -54,6 +57,8 @@ private:
     mutable std::mutex mMutex;
     IoContext& mContext;
     int mDescriptor;
+    const Core::IpEndpoint mLocalEndpoint;
+    const Core::IpEndpoint mRemoteEndpoint;
     std::uint64_t mRegistration = 0;
     std::weak_ptr<IConnectionObserver> mObserver;
     bool mObserverAssigned = false;

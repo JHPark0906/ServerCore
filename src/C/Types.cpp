@@ -1,6 +1,9 @@
 #include "C/Internal.h"
 #include "Core/Utf8Internal.h"
 #include "ServerCore/Observability/AsyncLogger.h"
+#include "ServerCore/Observability/ServerObservation.h"
+#include "C/ObservationInternal.h"
+#include <array>
 #include <filesystem>
 
 struct sc_logger { std::shared_ptr<ServerCore::Observability::AsyncLogger> value; };
@@ -29,12 +32,41 @@ sc_status MakeWait(const RegisterWait& registerWait, sc_wait** out) {
 extern "C" {
 uint32_t sc_abi_version(void) { return SC_ABI_VERSION; }
 uint32_t sc_capabilities(void) {
-    return SC_CAP_WEB | SC_CAP_TCP | SC_CAP_WEB_EXTENSIONS | SC_CAP_OBSERVABILITY;
+    return SC_CAP_WEB | SC_CAP_TCP | SC_CAP_WEB_EXTENSIONS | SC_CAP_OBSERVABILITY |
+        SC_CAP_READINESS | SC_CAP_CHANNEL | SC_CAP_RUNTIME | SC_CAP_ENDPOINT |
+        SC_CAP_REQUEST_LIMITER | SC_CAP_WEB_POLICIES | SC_CAP_WEB_DATA | SC_CAP_WS_EXTENSIONS |
+        SC_CAP_GAME_EXECUTION | SC_CAP_BINARY_IO | SC_CAP_DATAGRAM | SC_CAP_ATOMIC_FILE | SC_CAP_OPERATIONS;
 }
 const char* sc_status_name(sc_status value) {
     static const char* names[] = {"Ok", "InvalidArgument", "InvalidFormat", "TooLarge", "NotFound", "AlreadyExists",
         "Closed", "WouldBlock", "PlatformError", "Unimplemented", "UnknownType", "Timeout", "Cancelled"};
     return value >= 0 && value <= SC_CANCELLED ? names[value] : "UnknownStatus";
+}
+sc_status sc_notifier_create(size_t capacity, sc_notifier** out) {
+    if (!out) return SC_INVALID_ARGUMENT;
+    *out = nullptr;
+    if (!capacity || capacity > 4096) return SC_INVALID_ARGUMENT;
+    return ServerCore::CDetail::Protect([&]() -> sc_status {
+        auto value = std::make_unique<sc_notifier>();
+        value->state = std::make_shared<ServerCore::CDetail::NotifierState>(capacity);
+        *out = value.release(); return SC_OK;
+    });
+}
+sc_status sc_notifier_next(sc_notifier* notifier, uint32_t timeout, uint64_t* key) {
+    if (!notifier) { if (key) *key = 0; return SC_INVALID_ARGUMENT; }
+    return ServerCore::CDetail::Protect([&] { return notifier->state->Next(timeout, key); });
+}
+void sc_notifier_interrupt(sc_notifier* notifier) { if (notifier) notifier->state->Interrupt(); }
+void sc_notifier_close(sc_notifier* notifier) { if (notifier) notifier->state->Interrupt(true); }
+void sc_notifier_destroy(sc_notifier* notifier) { if (notifier) { sc_notifier_close(notifier); delete notifier; } }
+void sc_subscription_destroy(sc_subscription* subscription) { delete subscription; }
+sc_status sc_wait_subscribe(sc_wait* wait, sc_notifier* notifier, uint64_t key, sc_subscription** out) {
+    if (!wait) { if (out) *out = nullptr; return SC_INVALID_ARGUMENT; }
+    return ServerCore::CDetail::Protect([&] {
+        return ServerCore::CDetail::Subscribe(wait->state->readiness, [&] {
+            std::lock_guard guard(wait->state->mutex); return wait->state->result != SC_WOULD_BLOCK;
+        }, notifier, key, out);
+    });
 }
 sc_status sc_wait_result(const sc_wait* wait) {
     if (!wait) return SC_INVALID_ARGUMENT;
@@ -91,6 +123,28 @@ sc_status sc_logger_create(const sc_logger_options* options, sc_logger** out) {
 sc_status sc_logger_try_write(sc_logger* logger, uint32_t level, sc_bytes message) {
     if (!logger || level > SC_LOG_ERROR || !ServerCore::CDetail::Valid(message)) return SC_INVALID_ARGUMENT;
     return ServerCore::CDetail::Code(logger->value->TryWrite(static_cast<ServerCore::Core::LogLevel>(level), ServerCore::CDetail::Text(message)));
+}
+sc_status sc_logger_try_write_record(sc_logger* logger, const sc_log_record* record) {
+    namespace C = ServerCore::CDetail;
+    namespace Core = ServerCore::Core;
+    if (!logger || !C::Version(record) || record->reserved || record->level > SC_LOG_ERROR ||
+        !C::Valid(record->message) || record->field_count > Core::MaxLogFields ||
+        (record->field_count && !record->fields)) return SC_INVALID_ARGUMENT;
+    std::array<Core::LogField, Core::MaxLogFields> fields{};
+    for (size_t index = 0; index < record->field_count; ++index) {
+        if (!C::Valid(record->fields[index].name) || !C::Valid(record->fields[index].value)) return SC_INVALID_ARGUMENT;
+        fields[index] = {C::Text(record->fields[index].name), C::Text(record->fields[index].value)};
+    }
+    return C::Code(logger->value->TryWriteRecord({static_cast<Core::LogLevel>(record->level), C::Text(record->message),
+        {fields.data(), record->field_count}, {record->request_id, record->session_id, record->task_id, record->connection_id}}));
+}
+sc_status sc_observation_init(sc_observation* out, size_t size) {
+    if (!out || size < sizeof(*out)) return SC_INVALID_ARGUMENT;
+    *out = {}; out->abi_version = SC_ABI_VERSION; out->struct_size = sizeof(*out); return SC_OK;
+}
+sc_status sc_logger_get_observation(const sc_logger* logger, sc_observation* out) {
+    if (!logger) return SC_INVALID_ARGUMENT;
+    return ServerCore::CDetail::CopyObservation(ServerCore::Observability::Observe(*logger->value), out);
 }
 sc_status sc_logger_set_minimum_level(sc_logger* logger, uint32_t level) {
     if (!logger || level > SC_LOG_ERROR) return SC_INVALID_ARGUMENT;

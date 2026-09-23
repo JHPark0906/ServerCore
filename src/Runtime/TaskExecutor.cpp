@@ -1,5 +1,6 @@
 #include "ServerCore/Runtime/TaskExecutor.h"
 #include "Observability/MetricsInternal.h"
+#include "Runtime/CompletionSignalInternal.h"
 
 #include <condition_variable>
 #include <list>
@@ -88,6 +89,7 @@ public:
     bool terminal = false;
     Status result = Status::FailWithoutMessage(ErrorCode::WouldBlock);
     Clock::time_point admitted{};
+    CompletionSignal completionSignal;
 };
 
 class TaskExecutorState : public std::enable_shared_from_this<TaskExecutorState>
@@ -253,6 +255,8 @@ public:
         result.pendingTasks = pending;
         result.runningTasks = running;
         result.retainedBytes = retained;
+        result.lifecycle = joined ? Observability::Lifecycle::Stopped : stopping ? Observability::Lifecycle::Draining :
+            ready ? Observability::Lifecycle::Running : Observability::Lifecycle::Created;
         return result;
     }
 
@@ -275,6 +279,8 @@ private:
         if (coordinator.joinable())
             coordinator.join();
         workers.clear();
+        const std::lock_guard guard(mutex);
+        joined = true;
     }
 
     void Publish(const std::shared_ptr<TaskState>& task, Status result)
@@ -310,12 +316,14 @@ private:
             if (elapsed > metrics.maxLatencyNanoseconds)
                 metrics.maxLatencyNanoseconds = elapsed;
         }
+        const auto terminalCode = result.Code();
         {
             const std::lock_guard resultGuard(task->resultMutex);
             task->result = std::move(result);
             task->terminal = true;
         }
         task->finished.notify_all();
+        task->completionSignal.Complete(terminalCode);
         wake.notify_all();
     }
 
@@ -349,7 +357,6 @@ private:
                             task->phase = TaskPhase::Running;
                             --pending;
                             ++running;
-                            job = std::move(task->job);
                             break;
                         }
                         if (task)
@@ -358,6 +365,11 @@ private:
                     wake.wait(guard);
                 }
             }
+            // Running grants this worker exclusive callback ownership. Moving
+            // an inline callable can invoke user move/destructor code, so do it
+            // after releasing the scheduler lock. Cancellation only signals a
+            // running task; the coordinator cannot clear this callback.
+            job = std::move(task->job);
             Status result = Status::Ok();
             try
             {
@@ -446,6 +458,7 @@ private:
     bool started = false;
     bool ready = false;
     bool stopping = false;
+    bool joined = false;
     std::size_t pending = 0;
     std::size_t running = 0;
     std::size_t retained = 0;
@@ -537,6 +550,18 @@ TaskExecutor::TaskExecutor()
     : mState(std::make_shared<Detail::TaskExecutorState>())
 {
 }
+Core::Status TaskHandle::ObserveCompletion(Core::CompletionSource source) const noexcept
+{
+    if (!mState) return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+    return mState->completionSignal.Observe(std::move(source));
+}
+Core::Result<Core::CompletionSubscription> TaskHandle::WaitForCompletion(
+    std::function<void(Core::Status)> callback, std::stop_token cancellation) const
+{
+    if (!mState) return Core::Result<Core::CompletionSubscription>::FromStatus(
+        Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument));
+    return mState->completionSignal.Subscribe(std::move(callback), cancellation);
+}
 TaskExecutor::~TaskExecutor()
 {
     SERVERCORE_ASSERT(!Detail::ExecutorScope::Contains(mState.get()),
@@ -573,6 +598,10 @@ Core::Status TaskExecutor::Stop()
 bool TaskExecutor::IsStopRequested() const noexcept
 {
     return mState->IsStopRequested();
+}
+bool TaskExecutor::IsCurrentThreadWorker() const noexcept
+{
+    return Detail::ExecutorScope::Contains(mState.get());
 }
 std::size_t TaskExecutor::PendingCount() const noexcept
 {

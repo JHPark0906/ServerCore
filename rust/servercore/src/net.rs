@@ -21,6 +21,9 @@ pub struct Options {
     pub max_event_bytes: usize,
     pub connection_send_bytes: usize,
     pub total_send_bytes: usize,
+    /// Explicitly defaults to IPv6-only on both operating systems. False permits
+    /// IPv4-mapped peers on an IPv6 listener; ignored for IPv4 literals.
+    pub ipv6_only: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -40,6 +43,7 @@ impl Default for Options {
             max_event_bytes: raw.max_event_bytes,
             connection_send_bytes: raw.connection_send_bytes,
             total_send_bytes: raw.total_send_bytes,
+            ipv6_only: true,
         }
     }
 }
@@ -65,11 +69,14 @@ pub struct TcpServer(NonNull<sys::sc_tcp_server>, reactor::Lease);
 unsafe impl Send for TcpServer {}
 unsafe impl Sync for TcpServer {}
 impl TcpServer {
+    pub(crate) fn native_handle(&self) -> *mut sys::sc_tcp_server {
+        self.0.as_ptr()
+    }
     pub fn new(options: &Options) -> Result<Self> {
         verify_abi()?;
         let readiness = reactor::Lease::new()?;
         let mut out = std::ptr::null_mut();
-        check(unsafe { sys::sc_tcp_server_create(&options.raw(), &mut out) })?;
+        check(unsafe { sys::sc_tcp_server_create_ex(&options.raw(), u32::from(options.ipv6_only), &mut out) })?;
         Ok(Self(pointer(out)?, readiness))
     }
     pub fn start(&mut self) -> Result<()> {
@@ -77,6 +84,11 @@ impl TcpServer {
     }
     pub fn port(&self) -> u16 {
         unsafe { sys::sc_tcp_server_port(self.0.as_ptr()) }
+    }
+    pub fn local_endpoint(&self) -> Result<crate::endpoint::Endpoint> {
+        let mut raw = sys::sc_ip_endpoint::default();
+        check(unsafe { sys::sc_tcp_server_local_endpoint(self.0.as_ptr(), &mut raw) })?;
+        crate::endpoint::Endpoint::from_raw(raw).ok_or(Error::PLATFORM)
     }
     pub fn stop(&self) -> Result<()> {
         check(unsafe { sys::sc_tcp_server_stop(self.0.as_ptr()) })
@@ -92,7 +104,13 @@ impl TcpServer {
         })))
     }
     pub async fn accept(&mut self) -> Result<Connection> {
-        reactor::poll_fn(|| self.accept_timeout(Duration::ZERO))?.await
+        reactor::poll_fn(
+            || self.accept_timeout(Duration::ZERO),
+            |notifier, key, out| unsafe {
+                sys::sc_tcp_server_subscribe(self.native_handle(), notifier, key, out)
+            },
+        )?
+        .await
     }
 }
 impl Drop for TcpServer {
@@ -116,6 +134,17 @@ impl Drop for ConnectionInner {
 #[derive(Clone)]
 pub struct Connection(Arc<ConnectionInner>);
 impl Connection {
+    pub(crate) fn native_handle(&self) -> *mut sys::sc_tcp_connection {
+        self.0.handle.as_ptr()
+    }
+    /// Immutable transport metadata, still available after the socket closes.
+    pub fn endpoints(&self) -> Result<(crate::endpoint::Endpoint, crate::endpoint::Endpoint)> {
+        let mut local = sys::sc_ip_endpoint::default();
+        let mut remote = sys::sc_ip_endpoint::default();
+        check(unsafe { sys::sc_tcp_connection_endpoints(self.0.handle.as_ptr(), &mut local, &mut remote) })?;
+        Ok((crate::endpoint::Endpoint::from_raw(local).ok_or(Error::PLATFORM)?,
+            crate::endpoint::Endpoint::from_raw(remote).ok_or(Error::PLATFORM)?))
+    }
     pub fn id(&self) -> u64 {
         unsafe { sys::sc_tcp_connection_id(self.0.handle.as_ptr()) }
     }
@@ -163,7 +192,13 @@ impl Connection {
         Ok(event)
     }
     pub async fn next(&mut self) -> Result<Event> {
-        reactor::poll_fn(|| self.next_timeout(Duration::ZERO))?.await
+        reactor::poll_fn(
+            || self.next_timeout(Duration::ZERO),
+            |notifier, key, out| unsafe {
+                sys::sc_tcp_connection_subscribe(self.0.handle.as_ptr(), notifier, key, out)
+            },
+        )?
+        .await
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,5 +232,40 @@ impl Event {
 impl Drop for Event {
     fn drop(&mut self) {
         unsafe { sys::sc_tcp_event_destroy(self.handle.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+
+    #[test]
+    fn ipv6_and_dual_stack_endpoints_survive_close() {
+        for only in [true, false] {
+            let reserved = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+            let port = reserved.local_addr().unwrap().port();
+            drop(reserved);
+            let options = Options {
+                listen_address: if only { "::1" } else { "::" }.into(),
+                port,
+                ipv6_only: only,
+                ..Options::default()
+            };
+            let mut server = TcpServer::new(&options).unwrap();
+            server.start().unwrap();
+            assert_eq!(server.local_endpoint().unwrap().port, port);
+            let ip = if only { IpAddr::V6(Ipv6Addr::LOCALHOST) } else { IpAddr::V4(Ipv4Addr::LOCALHOST) };
+            let peer = TcpStream::connect(SocketAddr::new(ip, port)).unwrap();
+            let connection = server.accept_timeout(Duration::from_secs(3)).unwrap();
+            let endpoints = connection.endpoints().unwrap();
+            assert_eq!(endpoints.0.port, port);
+            assert_eq!(endpoints.1.port, peer.local_addr().unwrap().port());
+            assert!(endpoints.1.address.is_ipv6());
+            if !only { assert_eq!(endpoints.1.normalized().address, IpAddr::V4(Ipv4Addr::LOCALHOST)); }
+            connection.close();
+            server.stop().unwrap();
+            assert_eq!(connection.endpoints().unwrap(), endpoints);
+        }
     }
 }

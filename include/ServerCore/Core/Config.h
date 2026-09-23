@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include "ServerCore/Core/Error.h"
 
 #include <memory>
@@ -43,7 +45,7 @@ public:
     Config(Config&&) noexcept = default;
     Config& operator=(const Config&) = delete;
     Config& operator=(Config&&) = delete;
-    ~Config();
+    SERVERCORE_API ~Config();
 
     /// <summary>UTF-8 경로의 파일에서 설정을 읽는다.</summary>
     /// <returns>
@@ -51,18 +53,18 @@ public:
     /// 못하거나 저장소를 만들지 못하면 PlatformError, NUL 바이트를 포함하는 파일 또는 형식이 위
     /// 계약과 다르면 InvalidFormat이다. 값이 하나도 없는 파일은 실패가 아니라 빈 설정이다.
     /// </returns>
-    static Result<Config> LoadFromFile(std::string_view path);
+    SERVERCORE_API static Result<Config> LoadFromFile(std::string_view path);
 
     /// <summary>10진 int 값을 읽는다.</summary>
     /// <returns>
     /// 키 문법이 맞지 않으면 InvalidArgument, 키가 없으면 NotFound, 값이 int 범위의 10진 정수가
     /// 아니면 InvalidFormat이다. '+' 부호, 소수점, 접미사, 범위 밖 숫자는 정수가 아니다.
     /// </returns>
-    [[nodiscard]] Result<int> GetInt(std::string_view key) const;
+    [[nodiscard]] SERVERCORE_API Result<int> GetInt(std::string_view key) const;
 
     /// <summary>문자열 값을 읽는다.</summary>
     /// <returns>키 문법이 맞지 않으면 InvalidArgument, 키가 없으면 NotFound다.</returns>
-    [[nodiscard]] Result<std::string> GetString(std::string_view key) const;
+    [[nodiscard]] SERVERCORE_API Result<std::string> GetString(std::string_view key) const;
 
 private:
     struct Storage;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include "ServerCore/Net/Acceptor.h"
 
 #include <memory>
@@ -27,6 +29,6 @@ using SharedConnectionHandler =
 class AcceptorAccess
 {
 public:
-    static void SetSendBudget(Acceptor& acceptor, std::shared_ptr<SendBudget> sendBudget);
+    SERVERCORE_TEST_API static void SetSendBudget(Acceptor& acceptor, std::shared_ptr<SendBudget> sendBudget);
 };
 }

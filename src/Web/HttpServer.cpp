@@ -15,8 +15,10 @@
 #include "Observability/MetricsInternal.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
+#include <charconv>
 #include <map>
 #include <mutex>
 #include <set>
@@ -70,7 +72,8 @@ bool ValidOptions(const HttpServerOptions& options) noexcept
         options.maxStreamChunkBytes > 0 && options.maxStreamChunkBytes <= Net::SendQueueLimitBytes - 32 &&
         options.handlerTimeout.count() > 0 && options.sendStallTimeout.count() > 0 && options.streamIdleTimeout.count() > 0 &&
         options.maxRequestBodyBufferBytes > 0 && options.maxRequestBodyBufferBytes <= maximumBody &&
-        options.maxStreamedBodyBytes >= options.maxBodyBytes;
+        options.maxStreamedBodyBytes >= options.maxBodyBytes &&
+        options.webSocketPingInterval.count() >= 0 && options.webSocketPongTimeout.count() > 0;
 }
 
 bool ValidPath(std::string_view path) noexcept
@@ -83,7 +86,17 @@ bool ValidPath(std::string_view path) noexcept
 
 bool ValidWebSocketCallbacks(const WebSocketCallbacks& callbacks) noexcept
 {
-    return !(callbacks.onOpen && callbacks.onOpenWithRequest);
+    if ((callbacks.onOpen && callbacks.onOpenWithRequest) || callbacks.subprotocols.size() > 64) return false;
+    std::size_t bytes = 0;
+    for (std::size_t index = 0; index < callbacks.subprotocols.size(); ++index)
+    {
+        const auto& token = callbacks.subprotocols[index];
+        if (!Detail::IsToken(token) || token.size() > 4096 - bytes) return false;
+        bytes += token.size();
+        for (std::size_t previous = 0; previous < index; ++previous)
+            if (callbacks.subprotocols[previous] == token) return false;
+    }
+    return true;
 }
 
 // Both protocols use the same immutable-after-Start routing rules. A path group
@@ -292,6 +305,7 @@ public:
     Status Stop();
     Status BeginDrain();
     Status DrainStatus() const noexcept;
+    Core::Result<Core::CompletionSubscription> WaitForDrain(std::function<void(Status)> callback, std::stop_token cancellation);
     Status StopGracefully(Clock::time_point deadline);
     void Shutdown();
     void Accepted(std::shared_ptr<Net::Connection> connection) noexcept;
@@ -321,10 +335,12 @@ public:
     std::atomic<bool> running{false};
     std::atomic<bool> stopping{false};
     std::atomic<bool> draining{false};
+    std::atomic<bool> stopComplete{false};
     std::shared_ptr<const RequestPolicy> policy;
     std::shared_ptr<Core::ILogger> logger;
     mutable std::mutex peersMutex;
     std::condition_variable peersChanged;
+    Core::CompletionSource drainWait;
     std::unordered_map<std::uint64_t, std::shared_ptr<Peer>> peers;
     std::uint64_t nextId = 1;
     std::mutex sweepMutex;
@@ -335,9 +351,40 @@ public:
 class HttpServer::State::Peer final : public Net::IConnectionObserver,
                                     public WebSocketConnection,
                                     public WebSocketFlowControl,
+                                    public WebSocketMessageControl,
                                     public std::enable_shared_from_this<Peer>
 {
 public:
+    class MessageWriter final : public WebSocketMessageWriter
+    {
+    public:
+        MessageWriter(std::shared_ptr<Peer> owner, std::uint64_t id) : mPeer(std::move(owner)), mId(id) {}
+        ~MessageWriter() override { Abort(); }
+        Status Write(std::span<const std::byte> bytes, bool final) override
+        {
+            // A capacity callback can release the public writer/socket owner.
+            const auto peer = mPeer; const auto id = mId;
+            return peer->WriteMessage(id, bytes, final);
+        }
+        void Abort() noexcept override { const auto peer = mPeer; peer->AbortMessage(mId); }
+        std::size_t MaxWriteBytes() const noexcept override { return mPeer->mOptions.maxWebSocketFrameBytes; }
+        Core::Result<Net::SendCapacitySubscription> WaitForWriteCapacity(std::size_t bytes,
+            std::function<void(Status)> callback, std::stop_token cancellation) override
+        {
+            const auto peer = mPeer; const auto id = mId;
+            {
+                const std::lock_guard guard(peer->mInputMutex);
+                if (peer->mOutgoingId != id || !peer->IsOpen())
+                    return Core::Result<Net::SendCapacitySubscription>::FromStatus(Status::FailWithoutMessage(ErrorCode::Closed));
+                if (peer->mOutgoingWriting)
+                    return Core::Result<Net::SendCapacitySubscription>::FromStatus(Status::FailWithoutMessage(ErrorCode::WouldBlock));
+            }
+            return peer->WaitForSendCapacity(bytes, std::move(callback), cancellation);
+        }
+    private:
+        const std::shared_ptr<Peer> mPeer;
+        const std::uint64_t mId;
+    };
     Peer(std::weak_ptr<State> owner, std::uint64_t id, std::shared_ptr<Net::Connection> connection,
         const HttpServerOptions& options)
         : mOwner(std::move(owner)), mId(id), mConnection(std::move(connection)),
@@ -345,6 +392,25 @@ public:
           mParser(options.maxHeaderBytes, options.maxStreamedBodyBytes, true), mLastActivity(Now()), mLastSendProgress(Now()) {}
 
     std::uint64_t Id() const noexcept override { return mId; }
+    std::string_view Subprotocol() const noexcept override { return mSubprotocol; }
+    Core::Result<std::shared_ptr<WebSocketMessageWriter>> BeginMessage(WebSocketMessageType type) override
+    {
+        using Result = Core::Result<std::shared_ptr<WebSocketMessageWriter>>;
+        try
+        {
+            const std::lock_guard guard(mInputMutex);
+            if (!IsOpen()) return Result::FromStatus(Status::FailWithoutMessage(ErrorCode::Closed));
+            if (type != WebSocketMessageType::Text && type != WebSocketMessageType::Binary)
+                return Result::FromStatus(Status::FailWithoutMessage(ErrorCode::InvalidArgument));
+            if (mOutgoingId != 0 || mOutgoingWriting) return Result::FromStatus(Status::FailWithoutMessage(ErrorCode::AlreadyExists));
+            if (++mNextOutgoingId == 0) ++mNextOutgoingId;
+            auto writer = std::make_shared<MessageWriter>(shared_from_this(), mNextOutgoingId);
+            mOutgoingId = mNextOutgoingId; mOutgoingBytes = 0; mOutgoingStarted = false;
+            mOutgoingOpcode = type == WebSocketMessageType::Text ? 1 : 2; mOutgoingUtf8 = {};
+            return Result::FromValue(std::move(writer));
+        }
+        catch (...) { return Result::FromStatus(Status::AllocationFailure()); }
+    }
     bool IsOpen() const noexcept override { return mPhase.load() == Phase::WebSocket && mConnection->IsOpen(); }
     std::size_t RetainedSendBytes() const noexcept override { return mSender->flow->RetainedSendBytes(); }
     Core::Result<Net::SendCapacitySubscription> WaitForSendCapacity(std::size_t payloadBytes,
@@ -414,6 +480,7 @@ public:
 
     void CheckTimeout(std::int64_t now) noexcept
     {
+        const Detail::WebCompletionScope completions;
         bool expired = false;
         std::shared_ptr<Detail::HttpResponseState> timedOutResponse;
         try
@@ -422,6 +489,8 @@ public:
             auto phase = mPhase.load();
             if (phase == Phase::Closed) return;
             if (phase == Phase::Http && !(mPolicyDecision && now - mPolicyStarted >= mOptions.handlerTimeout.count())) ProcessInput();
+            phase = mPhase.load();
+            if (phase == Phase::WebSocket) CheckHeartbeat(now);
             phase = mPhase.load();
             const auto queued = mConnection->QueuedSendBytes();
             const auto admitted = mSender->admitted.load();
@@ -451,6 +520,7 @@ public:
 
     void OnBytesReceived(std::span<const std::byte> bytes) override
     {
+        const Detail::WebCompletionScope completions;
         try
         {
             const std::lock_guard guard(mInputMutex);
@@ -490,6 +560,7 @@ public:
         {
             const std::lock_guard guard(mInputMutex);
             mPhase.store(Phase::Closed);
+            mOutgoingId = 0; mHeartbeatPending = false;
             active = std::move(mActiveResponse);
             body = std::move(mBodyReader);
             decision = std::move(mPolicyDecision);
@@ -516,6 +587,67 @@ public:
 private:
     enum class Phase { Http, WebSocket, WsClosing, HttpClosing, Closed };
 
+    Status WriteMessage(std::uint64_t id, std::span<const std::byte> bytes, bool final)
+    {
+        try
+        {
+            const std::lock_guard guard(mInputMutex);
+            if (!IsOpen() || id != mOutgoingId) return Status::FailWithoutMessage(ErrorCode::Closed);
+            if (mOutgoingWriting) return Status::FailWithoutMessage(ErrorCode::WouldBlock);
+            if (bytes.size() > mOptions.maxWebSocketFrameBytes || bytes.size() > mOptions.maxWebSocketMessageBytes - mOutgoingBytes)
+                return Status::FailWithoutMessage(ErrorCode::TooLarge);
+            auto utf8 = mOutgoingUtf8;
+            if (mOutgoingOpcode == 1 && !utf8.Append(bytes, final))
+                return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
+            // Shared-budget notifications may invoke user code inside Send.
+            // A recursive input mutex alone does not serialize that reentry.
+            mOutgoingWriting = true;
+            struct EndWrite { bool& writing; ~EndWrite() { writing = false; } } endWrite{mOutgoingWriting};
+            const auto wire = Detail::EncodeServerFrame(mOutgoingStarted ? 0 : mOutgoingOpcode, bytes, final);
+            const auto result = mSender->Send(wire);
+            if (!result.IsOk()) return result;
+            if (mOutgoingId == id)
+            {
+                mOutgoingBytes += bytes.size(); mOutgoingUtf8 = utf8; mOutgoingStarted = true;
+                if (final) mOutgoingId = 0;
+            }
+            return result;
+        }
+        catch (...) { return Status::AllocationFailure(); }
+    }
+    void AbortMessage(std::uint64_t id) noexcept
+    {
+        const std::lock_guard guard(mInputMutex);
+        if (mOutgoingId != id) return;
+        mOutgoingId = 0;
+        if (mOutgoingStarted || mOutgoingWriting) mConnection->Close();
+    }
+    void CheckHeartbeat(std::int64_t now)
+    {
+        if (mOptions.webSocketPingInterval.count() == 0) return;
+        if (mHeartbeatPending)
+        {
+            if (now - mHeartbeatSent >= mOptions.webSocketPongTimeout.count()) (void)Close(1001, "pong timeout");
+            return;
+        }
+        if (now - mHeartbeatSent < mOptions.webSocketPingInterval.count()) return;
+        std::array<std::byte, 16> payload{};
+        const auto sequence = mHeartbeatSequence + 1;
+        for (std::size_t index = 0; index < 8; ++index)
+        {
+            const auto shift = static_cast<unsigned int>((7 - index) * 8);
+            payload[index] = static_cast<std::byte>((mId >> shift) & 255);
+            payload[index + 8] = static_cast<std::byte>((sequence >> shift) & 255);
+        }
+        const auto result = SendFrame(9, payload);
+        if (result.IsOk() && mPhase.load() == Phase::WebSocket)
+        {
+            mHeartbeatPayload = payload; mHeartbeatSequence = sequence;
+            mHeartbeatSent = now; mHeartbeatPending = true;
+        }
+        else if (!result.IsOk() && result.Code() != ErrorCode::WouldBlock) mConnection->Close();
+    }
+
     Status SendFrame(std::uint8_t opcode, std::span<const std::byte> payload, bool closingControl = false)
     {
         try
@@ -528,6 +660,7 @@ private:
                 return Status::FailWithoutMessage(ErrorCode::TooLarge);
             if (opcode == 1 && !Core::Detail::IsValidUtf8(Text(payload)))
                 return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
+            if (opcode < 8 && (mOutgoingId != 0 || mOutgoingWriting)) return Status::FailWithoutMessage(ErrorCode::AlreadyExists);
             const auto wire = Detail::EncodeServerFrame(opcode, payload);
             return mSender->Send(wire);
         }
@@ -542,6 +675,7 @@ private:
         if (phase != Phase::WebSocket) return Status::FailWithoutMessage(ErrorCode::Closed);
         mCloseStarted.store(Now());
         mPhase.store(Phase::WsClosing);
+        mOutgoingId = 0; mHeartbeatPending = false;
         try
         {
             const auto wire = Detail::EncodeServerFrame(8, payload);
@@ -562,7 +696,12 @@ private:
     void HttpError(unsigned int status, bool head = false)
     {
         if (const auto owner = mOwner.lock(); owner && owner->logger)
-        { const CallbackScope scope(owner.get()); owner->logger->Write(Core::LogLevel::Warn, Detail::ReasonPhrase(status)); }
+        {
+            const CallbackScope scope(owner.get());
+            char code[16]; const auto converted = std::to_chars(code, code + sizeof(code), status);
+            const Core::LogField field{"http_status", {code, static_cast<std::size_t>(converted.ptr - code)}};
+            (void)Core::WriteLog(*owner->logger, {Core::LogLevel::Warn, Detail::ReasonPhrase(status), {&field, 1}, {0, 0, 0, mId}});
+        }
         HttpResponse response;
         response.status = status;
         response.body = std::string(Detail::ReasonPhrase(status)) + "\n";
@@ -646,6 +785,11 @@ private:
             if (!mInput.empty() && mRequestStarted.load() == 0) mRequestStarted.store(Now());
             HttpRequest request;
             const auto result = mParser.Parse(mInput, request);
+            if (result.kind == Detail::HttpParseKind::Headers || result.kind == Detail::HttpParseKind::Complete)
+            {
+                request.localEndpoint = mConnection->LocalEndpoint();
+                request.remoteEndpoint = mConnection->RemoteEndpoint();
+            }
             if (result.kind == Detail::HttpParseKind::NeedMore)
             {
                 if (mReceivingBody && mActiveResponse && mActiveResponse->IsFinished()) mConnection->Close();
@@ -892,6 +1036,8 @@ private:
         if (request.Header("sec-websocket-version") != "13") { HttpError(426); return; }
         std::string accept;
         if (!Detail::WebSocketAccept(request.Header("sec-websocket-key"), accept)) { HttpError(400); return; }
+        std::string subprotocol;
+        if (!Detail::SelectWebSocketSubprotocol(request, callbacks->subprotocols, subprotocol)) { HttpError(400); return; }
         if (!authorized)
         {
             const auto state = mOwner.lock();
@@ -906,9 +1052,11 @@ private:
             catch (...) { HttpError(500); return; }
         }
         std::string wire = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n";
+        if (!subprotocol.empty()) wire += "Sec-WebSocket-Protocol: " + subprotocol + "\r\n";
         for (const auto& [name, value] : mPolicyHeaders)
         {
-            if (Detail::EqualInsensitive(name, "sec-websocket-accept") || Detail::EqualInsensitive(name, "upgrade"))
+            if (Detail::EqualInsensitive(name, "sec-websocket-accept") || Detail::EqualInsensitive(name, "upgrade") ||
+                Detail::EqualInsensitive(name, "sec-websocket-protocol") || Detail::EqualInsensitive(name, "sec-websocket-extensions"))
             { HttpError(500); return; }
             wire += name + ": " + value + "\r\n";
         }
@@ -919,6 +1067,7 @@ private:
         mCallbacks = std::move(callbacks);
         HttpHeaders{}.swap(mPolicyHeaders); HttpHeaders{}.swap(mPolicyAttributes);
         mUpgraded = true;
+        mSubprotocol = std::move(subprotocol); mHeartbeatSent = Now();
         mPhase.store(Phase::WebSocket);
         if (mCallbacks->onOpenWithRequest || mCallbacks->onOpen)
         {
@@ -966,7 +1115,13 @@ private:
             if (!SendFrame(10, frame.payload, true).IsOk()) mConnection->Close();
             return true;
         }
-        if (frame.opcode == 10) return true;
+        if (frame.opcode == 10)
+        {
+            if (mHeartbeatPending && frame.payload.size() == mHeartbeatPayload.size() &&
+                std::equal(frame.payload.begin(), frame.payload.end(), mHeartbeatPayload.begin()))
+            { mHeartbeatPending = false; mHeartbeatSent = Now(); }
+            return true;
+        }
         if (mPhase.load() == Phase::WsClosing) return true;
         if (frame.opcode == 0)
         {
@@ -1034,6 +1189,16 @@ private:
     std::string mReceivedCloseReason;
     std::uint8_t mFragmentOpcode = 0;
     std::vector<std::byte> mMessage;
+    std::string mSubprotocol;
+    std::uint64_t mNextOutgoingId = 0, mOutgoingId = 0;
+    std::size_t mOutgoingBytes = 0;
+    std::uint8_t mOutgoingOpcode = 0;
+    bool mOutgoingStarted = false, mOutgoingWriting = false;
+    Detail::Utf8FragmentState mOutgoingUtf8;
+    bool mHeartbeatPending = false;
+    std::uint64_t mHeartbeatSequence = 0;
+    std::int64_t mHeartbeatSent = 0;
+    std::array<std::byte, 16> mHeartbeatPayload{};
 };
 
 Status HttpServer::State::Start(const HttpServerOptions& value)
@@ -1055,7 +1220,9 @@ Status HttpServer::State::Start(const HttpServerOptions& value)
             if (const auto state = weak.lock()) state->Accepted(std::move(connection));
             else connection->Close();
         });
-        result = acceptor.Listen(options.listenAddress, options.port, options.acceptBacklog);
+        const auto endpoint = Core::IpEndpoint::Parse(options.listenAddress, options.port);
+        if (!endpoint.IsOk()) return endpoint.GetStatus();
+        result = acceptor.Listen(endpoint.Value(), options.acceptBacklog, options.ipv6Only);
         if (!result.IsOk()) return result;
         result = io.Start(options.ioWorkerThreadCount);
         if (!result.IsOk()) { Shutdown(); stopped = true; return result; }
@@ -1127,6 +1294,35 @@ Status HttpServer::State::StopGracefully(Clock::time_point deadline)
         (drained ? Status::Ok() : Status::FailWithoutMessage(ErrorCode::Timeout));
 }
 
+Core::Result<Core::CompletionSubscription> HttpServer::State::WaitForDrain(
+    std::function<void(Status)> callback, std::stop_token cancellation)
+{
+    using Result = Core::Result<Core::CompletionSubscription>;
+    if (!callback) return Result::FromStatus(Status::FailWithoutMessage(ErrorCode::InvalidArgument));
+    try {
+    auto registered = Core::CompletionSubscription::Create(
+        [owner = static_cast<const void*>(this), callback = std::move(callback)](Status status) {
+            const CallbackScope scope(owner);
+            callback(std::move(status));
+        });
+    if (!registered.IsOk()) return registered;
+    auto source = registered.Value().GetSource();
+    bool ready;
+    {
+        const std::lock_guard guard(peersMutex);
+        if (!draining.load() && !stopping.load())
+            return Result::FromStatus(Status::FailWithoutMessage(ErrorCode::Closed));
+        if (drainWait.IsPending())
+            return Result::FromStatus(Status::FailWithoutMessage(ErrorCode::AlreadyExists));
+        ready = peers.empty();
+        if (!ready) drainWait = source;
+    }
+    registered.Value().BindCancellation(cancellation);
+    if (ready) (void)source.Complete();
+    return registered;
+    } catch (...) { return Result::FromStatus(Status::AllocationFailure()); }
+}
+
 void HttpServer::State::Shutdown()
 {
     stopping.store(true);
@@ -1154,6 +1350,7 @@ void HttpServer::State::Shutdown()
     (void)handlers.Stop();
     io.Stop();
     observation->Stop();
+    stopComplete.store(true);
 }
 
 void HttpServer::State::Accepted(std::shared_ptr<Net::Connection> connection) noexcept
@@ -1187,9 +1384,15 @@ void HttpServer::State::Accepted(std::shared_ptr<Net::Connection> connection) no
 
 void HttpServer::State::Disconnected(std::uint64_t id) noexcept
 {
-    const std::lock_guard<std::mutex> guard(peersMutex);
-    if (peers.erase(id)) Observability::Detail::Add(observation->closedConnections);
+    Core::CompletionSource complete;
+    {
+        const std::lock_guard<std::mutex> guard(peersMutex);
+        if (peers.erase(id)) Observability::Detail::Add(observation->closedConnections);
+        if (peers.empty()) { complete = drainWait; drainWait = {}; }
+    }
     peersChanged.notify_all();
+    const CallbackScope callback(this);
+    (void)complete.Complete();
 }
 
 Observability::HttpServerMetricsSnapshot HttpServer::State::GetMetrics() const noexcept
@@ -1206,6 +1409,9 @@ Observability::HttpServerMetricsSnapshot HttpServer::State::GetMetrics() const n
         result.retainedRequestBytes = requestBudget->retained;
     }
     result.handlers = handlers.GetMetrics();
+    result.lifecycle = stopComplete.load() ? Observability::Lifecycle::Stopped :
+        (draining.load() || stopping.load()) ? Observability::Lifecycle::Draining :
+        running.load() ? Observability::Lifecycle::Running : Observability::Lifecycle::Created;
     return result;
 }
 
@@ -1375,6 +1581,9 @@ Status HttpServer::Start(const HttpServerOptions& options)
 Status HttpServer::Stop() { return mState->Stop(); }
 Status HttpServer::BeginDrain() { return mState->BeginDrain(); }
 Status HttpServer::DrainStatus() const noexcept { return mState->DrainStatus(); }
+Core::Result<Core::CompletionSubscription> HttpServer::WaitForDrain(
+    std::function<void(Status)> callback, std::stop_token cancellation)
+{ return mState->WaitForDrain(std::move(callback), cancellation); }
 Status HttpServer::StopGracefully(Clock::time_point deadline) { return mState->StopGracefully(deadline); }
 Status HttpServer::SetRequestPolicy(RequestPolicy policy)
 {
@@ -1422,5 +1631,9 @@ Status HttpServer::SetRequestTraceHandler(Observability::RequestTraceHandler han
 std::shared_ptr<WebSocketFlowControl> GetWebSocketFlowControl(const std::shared_ptr<WebSocketConnection>& connection) noexcept
 {
     return std::dynamic_pointer_cast<WebSocketFlowControl>(connection);
+}
+std::shared_ptr<WebSocketMessageControl> GetWebSocketMessageControl(const std::shared_ptr<WebSocketConnection>& connection) noexcept
+{
+    return std::dynamic_pointer_cast<WebSocketMessageControl>(connection);
 }
 }

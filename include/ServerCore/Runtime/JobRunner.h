@@ -1,15 +1,19 @@
 #pragma once
+#include "ServerCore/Export.h"
 
 #include "ServerCore/Core/Error.h"
 #include "ServerCore/Observability/Metrics.h"
 
 #include <condition_variable>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
+#include <utility>
 
 namespace ServerCore::Runtime
 {
@@ -60,6 +64,9 @@ private:
     class ReservationState;
 
 public:
+    // Queued jobs transfer ownership; pass a named Job with std::move.
+    using Job = std::move_only_function<void()>;
+
     // A move-only completion slot. Reserve before starting asynchronous work.
     // Post consumes its preallocated queue node; unused slots release on drop.
     // CloseAdmission preserves slots; RequestStop rejects their later Post.
@@ -72,14 +79,20 @@ public:
         Reservation& operator=(Reservation&&) noexcept = default;
         Reservation(const Reservation&) = delete;
         Reservation& operator=(const Reservation&) = delete;
-        [[nodiscard]] bool IsValid() const noexcept;
-        Core::Status Post(std::function<void()> job);
-        void Cancel() noexcept;
+        [[nodiscard]] SERVERCORE_API bool IsValid() const noexcept;
+        SERVERCORE_API Core::Status Post(Job job);
+        template<class Callback>
+            requires std::same_as<std::remove_cvref_t<Callback>, std::function<void()>>
+        Core::Status Post(Callback&& job)
+        {
+            return Post(JobRunner::FromLegacyJob(std::forward<Callback>(job)));
+        }
+        SERVERCORE_API void Cancel() noexcept;
 
     private:
         friend class JobRunner;
         friend class SharedState;
-        explicit Reservation(std::shared_ptr<ReservationState> state) noexcept;
+        SERVERCORE_API explicit Reservation(std::shared_ptr<ReservationState> state) noexcept;
         std::shared_ptr<ReservationState> mState;
     };
     /// <summary>
@@ -104,44 +117,68 @@ public:
 
         /// <summary>소유 실행자가 아직 있으면 작업을 넣는다.</summary>
         /// <returns>실행자가 이미 소멸했거나 멈췄으면 Closed다.</returns>
-        Core::Status Post(std::function<void()> job, std::size_t retainedBytes = 0) const;
-        Core::Status PostControl(std::function<void()> job, std::size_t retainedBytes = 0) const;
-        Core::Result<Reservation> Reserve(std::size_t retainedBytes = 0) const;
+        SERVERCORE_API Core::Status Post(Job job, std::size_t retainedBytes = 0) const;
+        SERVERCORE_API Core::Status PostControl(Job job, std::size_t retainedBytes = 0) const;
+        template<class Callback>
+            requires std::same_as<std::remove_cvref_t<Callback>, std::function<void()>>
+        Core::Status Post(Callback&& job, std::size_t retainedBytes = 0) const
+        {
+            return Post(JobRunner::FromLegacyJob(std::forward<Callback>(job)), retainedBytes);
+        }
+        template<class Callback>
+            requires std::same_as<std::remove_cvref_t<Callback>, std::function<void()>>
+        Core::Status PostControl(Callback&& job, std::size_t retainedBytes = 0) const
+        {
+            return PostControl(JobRunner::FromLegacyJob(std::forward<Callback>(job)), retainedBytes);
+        }
+        SERVERCORE_API Core::Result<Reservation> Reserve(std::size_t retainedBytes = 0) const;
 
         /// <summary>소유 실행자가 없거나 더는 새 작업을 받지 않으면 true다.</summary>
-        [[nodiscard]] bool IsStopRequested() const noexcept;
+        [[nodiscard]] SERVERCORE_API bool IsStopRequested() const noexcept;
 
     private:
         friend class JobRunner;
         friend class PeriodicRunner;
-        explicit Lease(std::shared_ptr<SharedState> state, bool control = false) noexcept;
+        SERVERCORE_API explicit Lease(std::shared_ptr<SharedState> state, bool control = false) noexcept;
 
-        void RecordSkippedPeriodicPeriods(std::uint64_t count) const noexcept;
+        SERVERCORE_API void RecordSkippedPeriodicPeriods(std::uint64_t count) const noexcept;
 
         std::shared_ptr<SharedState> mState;
         bool mControl = false;
     };
 
-    JobRunner();
-    ~JobRunner();
+    SERVERCORE_API JobRunner();
+    SERVERCORE_API ~JobRunner();
 
     JobRunner(const JobRunner&) = delete;
     JobRunner& operator=(const JobRunner&) = delete;
 
     // Configure before the first post/reservation/run. Reapplying identical
     // options is always a no-op; changing used or closed runners is Closed.
-    Core::Status Configure(const JobRunnerOptions& options);
+    SERVERCORE_API Core::Status Configure(const JobRunnerOptions& options);
     // Empty callback: InvalidArgument. Closed admission: Closed. Oversized
     // declared bytes: TooLarge. Occupied count/byte capacity: WouldBlock.
-    Core::Status Post(std::function<void()> job, std::size_t retainedBytes = 0);
-    Core::Status PostControl(std::function<void()> job, std::size_t retainedBytes = 0);
-    Core::Result<Reservation> Reserve(std::size_t retainedBytes = 0);
+    SERVERCORE_API Core::Status Post(Job job, std::size_t retainedBytes = 0);
+    SERVERCORE_API Core::Status PostControl(Job job, std::size_t retainedBytes = 0);
+    template<class Callback>
+        requires std::same_as<std::remove_cvref_t<Callback>, std::function<void()>>
+    Core::Status Post(Callback&& job, std::size_t retainedBytes = 0)
+    {
+        return Post(FromLegacyJob(std::forward<Callback>(job)), retainedBytes);
+    }
+    template<class Callback>
+        requires std::same_as<std::remove_cvref_t<Callback>, std::function<void()>>
+    Core::Status PostControl(Callback&& job, std::size_t retainedBytes = 0)
+    {
+        return PostControl(FromLegacyJob(std::forward<Callback>(job)), retainedBytes);
+    }
+    SERVERCORE_API Core::Result<Reservation> Reserve(std::size_t retainedBytes = 0);
     // Stop external admission while already accepted completions and bounded
     // transport/control work continue. Does not stop the execution thread.
-    void CloseAdmission() noexcept;
+    SERVERCORE_API void CloseAdmission() noexcept;
 
     /// <summary>멈추라는 요청이 올 때까지 이 스레드에서 작업을 계속 실행한다.</summary>
-    void RunUntilStopped();
+    SERVERCORE_API void RunUntilStopped();
 
     /// <summary>새 작업 수락을 닫고 실행 루프에 종료를 요청한다. 스레드 안전하다.</summary>
     /// <remarks>
@@ -151,24 +188,24 @@ public:
     /// RunUntilStopped를 아직 시작하지 않았어도 요청할 수 있으며, 그 뒤 실행 루프를 시작하면
     /// 앞서 수락한 작업을 비운 다음 반환한다.
     /// </remarks>
-    void RequestStop();
+    SERVERCORE_API void RequestStop();
 
     /// <summary>RequestStop으로 위임하는 호환 API다. 작업 완료를 기다리지 않는다.</summary>
     [[deprecated("Use RequestStop(); join the RunUntilStopped thread to wait for completion")]]
-    void Stop();
+    SERVERCORE_API void Stop();
 
     /// <summary>현재 호출자가 이 실행자의 작업을 실제로 실행 중인 스레드인지 답한다.</summary>
     /// <remarks>RunUntilStopped 전과 반환 뒤에는 언제나 false다.</remarks>
-    [[nodiscard]] bool IsCurrentThread() const noexcept;
+    [[nodiscard]] SERVERCORE_API bool IsCurrentThread() const noexcept;
 
     /// <summary>더는 새 작업을 받지 않는 상태인지 답한다.</summary>
-    [[nodiscard]] bool IsStopRequested() const noexcept;
+    [[nodiscard]] SERVERCORE_API bool IsStopRequested() const noexcept;
 
     /// <summary>아직 실행을 시작하지 않은 작업 수다.</summary>
-    [[nodiscard]] std::size_t PendingCount() const;
-    [[nodiscard]] std::size_t OutstandingCount() const noexcept;
-    [[nodiscard]] std::size_t RetainedBytes() const noexcept;
-    [[nodiscard]] Observability::JobRunnerMetricsSnapshot GetMetrics() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::size_t PendingCount() const;
+    [[nodiscard]] SERVERCORE_API std::size_t OutstandingCount() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::size_t RetainedBytes() const noexcept;
+    [[nodiscard]] SERVERCORE_API Observability::JobRunnerMetricsSnapshot GetMetrics() const noexcept;
 
     /// <summary>이 실행자의 Lease로 만든 PeriodicRunner들이 건너뛴 주기 수의 합이다.</summary>
     /// <remarks>
@@ -176,7 +213,7 @@ public:
     /// 합이다. ServerHost가 L5 스냅숏에 넣기 위해 읽으며, 독립 실행자에서도 같은 규칙으로
     /// 쓸 수 있다.
     /// </remarks>
-    [[nodiscard]] std::uint64_t PeriodicSkippedCount() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::uint64_t PeriodicSkippedCount() const noexcept;
 
     /// <summary>
     /// 실행자 수명에 묶인 작업 투입 손잡이를 만든다.
@@ -187,13 +224,18 @@ public:
     /// RunUntilStopped가 없으므로, ServerHost가 소유한 실행자의 종료 순서를 호출자가 바꿀 수
     /// 없다.
     /// </remarks>
-    [[nodiscard]] Lease AcquireLease() const noexcept;
+    [[nodiscard]] SERVERCORE_API Lease AcquireLease() const noexcept;
     // For transport maintenance (for example drain timers). Its Post uses the
     // control budget and IsStopRequested follows RequestStop, not CloseAdmission.
     // Reserve always reserves a normal completion, independent of lease kind.
-    [[nodiscard]] Lease AcquireControlLease() const noexcept;
+    [[nodiscard]] SERVERCORE_API Lease AcquireControlLease() const noexcept;
 
 private:
+    static Job FromLegacyJob(std::function<void()> job)
+    {
+        return job ? Job(std::move(job)) : Job{};
+    }
+
     std::shared_ptr<SharedState> mState;
 };
 }

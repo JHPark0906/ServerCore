@@ -10,6 +10,45 @@ pub struct sc_owned_text {
 pub const SC_CAP_WEB_EXTENSIONS: u32 = 8;
 pub const SC_CAP_OBSERVABILITY: u32 = 16;
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct sc_observation {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub protocol: u32,
+    pub lifecycle: u32,
+    pub available: u64,
+    pub connections: u64,
+    pub pending_work: u64,
+    pub receive_bytes: u64,
+    pub send_bytes: u64,
+    pub retained_bytes: u64,
+    pub drain_remaining: u64,
+    pub closed: [u64; 8],
+    pub rejected: [u64; 8],
+    pub timed_out: u64,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct sc_log_field {
+    pub name: sc_bytes,
+    pub value: sc_bytes,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct sc_log_record {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub level: u32,
+    pub reserved: u32,
+    pub message: sc_bytes,
+    pub fields: *const sc_log_field,
+    pub field_count: usize,
+    pub request_id: u64,
+    pub session_id: u64,
+    pub task_id: u64,
+    pub connection_id: u64,
+}
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct sc_logger_options {
     pub abi_version: u32,
@@ -80,6 +119,27 @@ pub struct sc_web_metrics {
     pub handlers: sc_task_metrics,
 }
 extern "C" {
+    pub fn sc_logger_try_write_record(
+        logger: *mut sc_logger,
+        record: *const sc_log_record,
+    ) -> sc_status;
+    pub fn sc_observation_init(out: *mut sc_observation, size: usize) -> sc_status;
+    pub fn sc_logger_get_observation(
+        logger: *const sc_logger,
+        out: *mut sc_observation,
+    ) -> sc_status;
+    pub fn sc_web_server_get_observation(
+        server: *const sc_web_server,
+        out: *mut sc_observation,
+    ) -> sc_status;
+    pub fn sc_tcp_server_get_observation(
+        server: *const sc_tcp_server,
+        out: *mut sc_observation,
+    ) -> sc_status;
+    pub fn sc_executor_get_observation(
+        executor: *const sc_executor,
+        out: *mut sc_observation,
+    ) -> sc_status;
     pub fn sc_logger_options_init(options: *mut sc_logger_options, size: usize) -> sc_status;
     pub fn sc_logger_create(
         options: *const sc_logger_options,

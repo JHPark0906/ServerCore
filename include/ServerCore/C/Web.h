@@ -2,6 +2,7 @@
 #define SERVERCORE_C_WEB_H
 #include "ServerCore/C/Types.h"
 #include "ServerCore/C/Observability.h"
+#include "ServerCore/C/Endpoint.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -11,6 +12,7 @@ typedef struct sc_web_event sc_web_event;
 typedef struct sc_http_response sc_http_response;
 typedef struct sc_websocket sc_websocket;
 typedef struct sc_websocket_event sc_websocket_event;
+typedef struct sc_websocket_message sc_websocket_message;
 typedef struct sc_http_body sc_http_body;
 typedef struct sc_body_chunk sc_body_chunk;
 typedef struct sc_request_decision sc_request_decision;
@@ -56,6 +58,10 @@ typedef struct sc_request_view {
     const sc_header* parameters;
     size_t parameter_count;
 } sc_request_view;
+typedef struct sc_request_endpoints {
+    uint32_t abi_version, struct_size;
+    sc_ip_endpoint local_endpoint, remote_endpoint;
+} sc_request_endpoints;
 enum { SC_RESPONSE_CLOSE = 1u, SC_RESPONSE_HAS_LENGTH = 2u };
 typedef struct sc_response_head {
     uint32_t abi_version, struct_size;
@@ -68,9 +74,26 @@ typedef struct sc_response_head {
 SC_API sc_status sc_web_options_init(sc_web_options* options, size_t size);
 SC_API sc_status sc_response_head_init(sc_response_head* head, size_t size);
 SC_API sc_status sc_web_server_create(const sc_web_options* options, sc_web_server** out);
+/* Before Start; IPv6-only defaults true. False explicitly permits dual stack. */
+SC_API sc_status sc_web_server_set_ipv6_only(sc_web_server* server, uint32_t ipv6_only);
 /* pattern=0 means exact path; pattern=1 means explicit {parameter} segments. */
 SC_API sc_status sc_web_server_route(sc_web_server* server, sc_bytes method, sc_bytes path, uint32_t pattern);
 SC_API sc_status sc_web_server_websocket(sc_web_server* server, sc_bytes path, uint32_t pattern);
+typedef struct sc_websocket_options {
+    uint32_t abi_version, struct_size;
+    size_t max_frame_bytes, max_message_bytes;
+    uint32_t ping_interval_ms, pong_timeout_ms; /* interval 0 disables heartbeat. */
+} sc_websocket_options;
+enum { SC_WS_AUTHORIZE = 1u };
+typedef struct sc_websocket_route_options {
+    uint32_t abi_version, struct_size, flags;
+    const sc_bytes* subprotocols; /* Server preference order; copied. */
+    size_t subprotocol_count;
+} sc_websocket_route_options;
+SC_API sc_status sc_websocket_options_init(sc_websocket_options*, size_t);
+SC_API sc_status sc_websocket_route_options_init(sc_websocket_route_options*, size_t);
+SC_API sc_status sc_web_server_set_websocket_options(sc_web_server*, const sc_websocket_options*);
+SC_API sc_status sc_web_server_websocket_ex(sc_web_server*, sc_bytes path, uint32_t pattern, const sc_websocket_route_options*);
 /* Opt-in bounded upload streaming. Initial request body is empty; claim the
  * reader. All limits/configuration are set before Start. */
 SC_API sc_status sc_body_options_init(sc_body_options* options, size_t size);
@@ -99,6 +122,7 @@ SC_API void sc_web_server_destroy(sc_web_server* server);
 SC_API uint32_t sc_web_event_kind(const sc_web_event* event);
 /* Borrowed views remain valid until event_destroy, even after server_stop. */
 SC_API sc_status sc_web_event_request(const sc_web_event* event, sc_request_view* view);
+SC_API sc_status sc_web_event_endpoints(const sc_web_event* event, sc_request_endpoints* endpoints);
 /* Obtain independent owning handles. Dropping an unclaimed HTTP event aborts
  * its response. The last response handle aborts an unfinished response. */
 SC_API sc_status sc_web_event_response(sc_web_event* event, sc_http_response** out);
@@ -150,6 +174,19 @@ typedef struct sc_websocket_event_view {
 SC_API sc_status sc_websocket_retain(const sc_websocket* socket, sc_websocket** out);
 SC_API uint64_t sc_websocket_id(const sc_websocket* socket);
 SC_API sc_status sc_websocket_send(sc_websocket* socket, uint32_t kind, sc_bytes bytes);
+/* Immutable borrowed negotiated token; empty when none was selected. */
+SC_API sc_bytes sc_websocket_subprotocol(const sc_websocket* socket);
+SC_API sc_status sc_websocket_ping(sc_websocket* socket, sc_bytes bytes);
+/* One writer reserves the data lane; other data sends return AlreadyExists.
+ * Each write admits one bounded fragment; final=1 completes the message.
+ * WouldBlock accepts nothing. Drop after partial admission aborts transport.
+ * Control frames may interleave. The message retains its socket owner. */
+SC_API sc_status sc_websocket_begin_message(sc_websocket*, uint32_t kind, sc_websocket_message** out);
+SC_API sc_status sc_websocket_message_write(sc_websocket_message*, sc_bytes, uint32_t final);
+SC_API size_t sc_websocket_message_max_write(const sc_websocket_message*);
+SC_API sc_status sc_websocket_message_wait_capacity(sc_websocket_message*, size_t bytes, sc_wait** out);
+SC_API void sc_websocket_message_abort(sc_websocket_message*);
+SC_API void sc_websocket_message_destroy(sc_websocket_message*);
 SC_API sc_status sc_websocket_close(sc_websocket* socket, uint16_t code, sc_bytes reason);
 SC_API sc_status sc_websocket_next(sc_websocket* socket, uint32_t timeout_ms, sc_websocket_event** out);
 SC_API sc_status sc_websocket_wait_capacity(sc_websocket* socket, size_t bytes, sc_wait** out);
@@ -157,6 +194,16 @@ SC_API sc_status sc_websocket_event_get_view(const sc_websocket_event* event, sc
 SC_API void sc_websocket_event_destroy(sc_websocket_event* event);
 /* Last socket handle requests close. Held message events remain readable. */
 SC_API void sc_websocket_destroy(sc_websocket* socket);
+
+/* Persistent queue notifications; register before nonblocking next. Body/drain
+ * waits are one-shot: re-register before retrying after an advisory wake.
+ * Each body and server drain permits one pending readiness waiter. */
+SC_API sc_status sc_web_server_subscribe(sc_web_server*, sc_notifier*, uint64_t key, sc_subscription** out);
+SC_API sc_status sc_web_server_subscribe_drain(sc_web_server*, sc_notifier*, uint64_t key, sc_subscription** out);
+SC_API sc_status sc_http_body_subscribe(sc_http_body*, sc_notifier*, uint64_t key, sc_subscription** out);
+SC_API sc_status sc_http_response_subscribe_cancelled(sc_http_response*, sc_notifier*, uint64_t key, sc_subscription** out);
+SC_API sc_status sc_request_decision_subscribe_cancelled(sc_request_decision*, sc_notifier*, uint64_t key, sc_subscription** out);
+SC_API sc_status sc_websocket_subscribe(sc_websocket*, sc_notifier*, uint64_t key, sc_subscription** out);
 
 #ifdef __cplusplus
 }

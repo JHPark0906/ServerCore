@@ -7,6 +7,7 @@
       "hidden": true,
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": { "SERVERCORE_BUILD_SHARED": "OFF" },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
     },
     {
@@ -22,12 +23,25 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
     },
     {
+      "name": "linux-shared-debug",
+      "displayName": "Linux Debug shared library (Ninja)",
+      "inherits": "linux-debug",
+      "cacheVariables": { "SERVERCORE_BUILD_SHARED": "ON" }
+    },
+    {
+      "name": "linux-shared-release",
+      "displayName": "Linux Release shared library (Ninja)",
+      "inherits": "linux-release",
+      "cacheVariables": { "SERVERCORE_BUILD_SHARED": "ON" }
+    },
+    {
       "name": "msvc-base",
       "hidden": true,
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
-        "CMAKE_CXX_COMPILER": "cl"
+        "CMAKE_CXX_COMPILER": "cl",
+        "SERVERCORE_BUILD_SHARED": "OFF"
       }
     },
     {
@@ -41,13 +55,29 @@
       "displayName": "MSVC Release (Ninja)",
       "inherits": "msvc-base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "msvc-shared-debug",
+      "displayName": "MSVC Debug shared library (Ninja)",
+      "inherits": "msvc-debug",
+      "cacheVariables": { "SERVERCORE_BUILD_SHARED": "ON" }
+    },
+    {
+      "name": "msvc-shared-release",
+      "displayName": "MSVC Release shared library (Ninja)",
+      "inherits": "msvc-release",
+      "cacheVariables": { "SERVERCORE_BUILD_SHARED": "ON" }
     }
   ],
   "buildPresets": [
     { "name": "linux-debug", "configurePreset": "linux-debug" },
     { "name": "linux-release", "configurePreset": "linux-release" },
+    { "name": "linux-shared-debug", "configurePreset": "linux-shared-debug" },
+    { "name": "linux-shared-release", "configurePreset": "linux-shared-release" },
     { "name": "msvc-debug", "configurePreset": "msvc-debug" },
-    { "name": "msvc-release", "configurePreset": "msvc-release" }
+    { "name": "msvc-release", "configurePreset": "msvc-release" },
+    { "name": "msvc-shared-debug", "configurePreset": "msvc-shared-debug" },
+    { "name": "msvc-shared-release", "configurePreset": "msvc-shared-release" }
   ],
   "testPresets": [
     {
@@ -61,6 +91,16 @@
       "output": { "outputOnFailure": true }
     },
     {
+      "name": "linux-shared-debug",
+      "configurePreset": "linux-shared-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-shared-release",
+      "configurePreset": "linux-shared-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
       "name": "msvc-debug",
       "configurePreset": "msvc-debug",
       "output": { "outputOnFailure": true }
@@ -68,6 +108,16 @@
     {
       "name": "msvc-release",
       "configurePreset": "msvc-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "msvc-shared-debug",
+      "configurePreset": "msvc-shared-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "msvc-shared-release",
+      "configurePreset": "msvc-shared-release",
       "output": { "outputOnFailure": true }
     }
   ]

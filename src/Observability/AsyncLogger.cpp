@@ -1,6 +1,7 @@
 #include "ServerCore/Observability/AsyncLogger.h"
 #include "Observability/MetricsInternal.h"
 #include <chrono>
+#include <algorithm>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -24,7 +25,7 @@ std::mutex consoleMutex;
 class AsyncLogger::State
 {
 public:
-    struct Record { LogLevel level; std::string message; std::int64_t timestamp; };
+    struct Record { LogLevel level; std::string message; std::int64_t timestamp; bool structured = false; };
     Status Start(const LoggerOptions& value)
     {
         if (!ValidLevel(value.minimumLevel) || (!value.console && value.file.empty()) ||
@@ -58,7 +59,7 @@ public:
         }
         catch (...) { return Status::AllocationFailure(); }
     }
-    Status Write(LogLevel level, std::string_view message) noexcept
+    Status Write(LogLevel level, std::string_view message, const Core::LogRecord* structured = nullptr) noexcept
     {
         try
         {
@@ -67,13 +68,23 @@ public:
             if (!ValidLevel(level)) return reject(ErrorCode::InvalidArgument);
             if (!ready || stopping) return reject(ErrorCode::Closed);
             if (level < options.minimumLevel) { Detail::Add(metrics.filteredMessages); return Status::Ok(); }
+            std::string encoded;
+            if (structured)
+            {
+                auto formatted = Core::FormatLogRecord(*structured, (std::min)(options.maxMessageBytes, Core::MaxStructuredLogBytes));
+                if (!formatted.IsOk()) return reject(formatted.GetStatus().Code());
+                encoded = std::move(formatted).Value(); message = encoded;
+            }
             if (message.size() > options.maxMessageBytes) return reject(ErrorCode::TooLarge);
             if (queue.size() >= options.maxQueuedMessages || message.size() > options.maxRetainedBytes - metrics.retainedBytes)
                 return reject(ErrorCode::WouldBlock);
             const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
-            queue.push_back({level, std::string(message), now});
-            metrics.retainedBytes += message.size();
+            const auto retainedSize = message.size();
+            // Copy the exact view: retaining the formatter's spare capacity
+            // would let a small charged record retain a much larger allocation.
+            queue.push_back({level, std::string(message), now, structured != nullptr});
+            metrics.retainedBytes += retainedSize;
             Detail::Add(metrics.acceptedMessages);
             wake.notify_one();
             return Status::Ok();
@@ -101,6 +112,7 @@ public:
         if (worker.joinable()) worker.join();
         if (file.is_open()) file.close();
         const std::lock_guard guard(mutex);
+        stopped = true;
         return metrics.outputErrors ? Fail(ErrorCode::PlatformError) : Status::Ok();
     }
     LoggerMetricsSnapshot Snapshot() const noexcept
@@ -108,11 +120,15 @@ public:
         const std::lock_guard guard(mutex);
         auto result = metrics;
         result.pendingMessages = queue.size();
+        result.outstandingMessages = queue.size() + (writing ? 1u : 0u);
+        result.lifecycle = stopped ? Lifecycle::Stopped : stopping ? Lifecycle::Draining : ready ? Lifecycle::Running : Lifecycle::Created;
         return result;
     }
 private:
     static std::string Format(const Record& record)
     {
+        if (record.structured)
+            return "{\"timestamp_ms\":" + std::to_string(record.timestamp) + "," + record.message.substr(1) + "\n";
         static constexpr const char* names[] = {"TRACE", "DEBUG", "INFO", "WARN", "ERROR"};
         std::string line = std::to_string(record.timestamp) + " " + names[static_cast<unsigned>(record.level)] + " ";
         constexpr char hex[] = "0123456789abcdef";
@@ -185,6 +201,7 @@ private:
                 if (queue.empty() && stopping) break;
                 record = std::move(queue.front());
                 queue.pop_front();
+                writing = true;
             }
             bool success = false;
             try { success = Output(Format(record)); } catch (...) {}
@@ -195,6 +212,7 @@ private:
             {
                 const std::lock_guard guard(mutex);
                 metrics.retainedBytes -= bytes;
+                writing = false;
                 if (success) Detail::Add(metrics.writtenMessages);
                 else Detail::Add(metrics.outputErrors);
             }
@@ -210,13 +228,14 @@ private:
     std::thread worker;
     std::ofstream file;
     std::uint64_t fileBytes = 0;
-    bool used = false, ready = false, stopping = false;
+    bool used = false, ready = false, stopping = false, stopped = false, writing = false;
 };
 AsyncLogger::AsyncLogger() : mState(std::make_unique<State>()) {}
 AsyncLogger::~AsyncLogger() { (void)mState->Stop(); }
 Core::Status AsyncLogger::Start(const LoggerOptions& options) { return mState->Start(options); }
 void AsyncLogger::Write(Core::LogLevel level, std::string_view message) noexcept { (void)mState->Write(level, message); }
 Core::Status AsyncLogger::TryWrite(Core::LogLevel level, std::string_view message) noexcept { return mState->Write(level, message); }
+Core::Status AsyncLogger::TryWriteRecord(const Core::LogRecord& record) noexcept { return mState->Write(record.level, record.message, &record); }
 Core::Status AsyncLogger::SetMinimumLevel(Core::LogLevel level) noexcept { return mState->SetLevel(level); }
 void AsyncLogger::RequestStop() noexcept { mState->RequestStop(); }
 Core::Status AsyncLogger::Stop() { return mState->Stop(); }

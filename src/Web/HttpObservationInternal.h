@@ -1,4 +1,5 @@
 #pragma once
+#include "ServerCore/Export.h"
 #include "ServerCore/Observability/Metrics.h"
 #include "ServerCore/Observability/RequestTrace.h"
 #include <atomic>
@@ -18,11 +19,11 @@ public:
         : mOwner(owner)
     {
     }
-    Core::Status Configure(Observability::RequestTraceHandler callback, std::size_t maximum);
-    Core::Status Start();
-    void Stop();
-    void Terminal(Observability::RequestTrace trace) noexcept;
-    Observability::HttpServerMetricsSnapshot Snapshot() const noexcept;
+    SERVERCORE_TEST_API Core::Status Configure(Observability::RequestTraceHandler callback, std::size_t maximum);
+    SERVERCORE_TEST_API Core::Status Start();
+    SERVERCORE_TEST_API void Stop();
+    SERVERCORE_TEST_API void Terminal(Observability::RequestTrace trace) noexcept;
+    SERVERCORE_TEST_API Observability::HttpServerMetricsSnapshot Snapshot() const noexcept;
     std::atomic<std::uint64_t> acceptedConnections{ 0 }, closedConnections{ 0 },
         rejectedConnections{ 0 };
     std::atomic<std::uint64_t> acceptedRequests{ 0 }, completedRequests{ 0 }, failedRequests{ 0 };
@@ -30,7 +31,7 @@ public:
         protocolErrors{ 0 };
 
 private:
-    void Run() noexcept;
+    SERVERCORE_TEST_API void Run() noexcept;
     const void* mOwner;
     mutable std::mutex mMutex;
     std::condition_variable mWake;
@@ -47,10 +48,10 @@ private:
 class RequestObservation
 {
 public:
-    RequestObservation(std::shared_ptr<HttpObservation> owner, std::uint64_t id,
+    SERVERCORE_TEST_API RequestObservation(std::shared_ptr<HttpObservation> owner, std::uint64_t id,
         std::uint64_t connection, std::string_view method);
     ~RequestObservation() { Finish(Core::ErrorCode::PlatformError, 0); }
-    void Finish(Core::ErrorCode result, unsigned status) noexcept;
+    SERVERCORE_TEST_API void Finish(Core::ErrorCode result, unsigned status) noexcept;
 
 private:
     std::shared_ptr<HttpObservation> mOwner;

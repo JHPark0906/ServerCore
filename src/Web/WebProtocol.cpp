@@ -1,5 +1,6 @@
 #include "Web/WebProtocol.h"
 #include "Web/ResponseEncoding.h"
+#include "Core/Utf8Internal.h"
 
 #include <algorithm>
 #include <array>
@@ -610,11 +611,87 @@ FrameParseResult ParseClientFrame(std::span<const std::byte> input,
     return {FrameParseKind::Complete, header + 4 + payloadSize, 1000};
 }
 
-std::vector<std::byte> EncodeServerFrame(std::uint8_t opcode, std::span<const std::byte> payload)
+bool SelectWebSocketSubprotocol(const HttpRequest& request,
+    const std::vector<std::string>& supported, std::string& selected)
+{
+    std::vector<std::string_view> offered;
+    std::size_t offeredBytes = 0;
+    for (const auto& [name, value] : request.headers)
+    {
+        if (name != "sec-websocket-protocol") continue;
+        std::string_view rest(value);
+        for (;;)
+        {
+            const auto comma = rest.find(',');
+            auto token = rest.substr(0, comma);
+            while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) token.remove_prefix(1);
+            while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) token.remove_suffix(1);
+            if (!IsToken(token) || offered.size() == 64 || token.size() > 4096 - offeredBytes ||
+                std::find(offered.begin(), offered.end(), token) != offered.end()) return false;
+            offeredBytes += token.size();
+            offered.push_back(token);
+            if (comma == std::string_view::npos) break;
+            rest.remove_prefix(comma + 1);
+        }
+    }
+    selected.clear();
+    for (const auto& token : supported)
+        if (std::find(offered.begin(), offered.end(), token) != offered.end()) { selected = token; break; }
+    return true;
+}
+
+bool Utf8FragmentState::Append(std::span<const std::byte> bytes, bool final) noexcept
+{
+    auto text = bytes.empty() ? std::string_view{} : std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    const auto width = [](unsigned char ch) -> std::size_t {
+        if (ch < 0x80) return 1;
+        if (ch >= 0xc2 && ch <= 0xdf) return 2;
+        if (ch >= 0xe0 && ch <= 0xef) return 3;
+        if (ch >= 0xf0 && ch <= 0xf4) return 4;
+        return 0;
+    };
+    const auto validPartial = [&]() {
+        const auto expected = width(static_cast<unsigned char>(pending[0]));
+        if (expected == 0) return false;
+        auto padded = std::array<char, 4>{};
+        std::copy_n(pending, size, padded.data());
+        for (auto index = size; index < expected; ++index)
+            padded[index] = static_cast<char>(index == 1 && static_cast<unsigned char>(pending[0]) == 0xe0 ? 0xa0 :
+                index == 1 && static_cast<unsigned char>(pending[0]) == 0xf0 ? 0x90 : 0x80);
+        return Core::Detail::IsValidUtf8(std::string_view(padded.data(), expected));
+    };
+    if (size != 0)
+    {
+        const auto expected = width(static_cast<unsigned char>(pending[0]));
+        const auto take = (std::min)(expected - size, text.size());
+        std::copy_n(text.data(), take, pending + size);
+        size += take; text.remove_prefix(take);
+        if (size != expected) return !final && validPartial();
+        if (!Core::Detail::IsValidUtf8(std::string_view(pending, size))) return false;
+        size = 0;
+    }
+    if (!text.empty())
+    {
+        auto last = text.size() - 1;
+        while (last != 0 && (static_cast<unsigned char>(text[last]) & 0xc0) == 0x80) --last;
+        const auto expected = width(static_cast<unsigned char>(text[last]));
+        if (expected > text.size() - last)
+        {
+            size = text.size() - last;
+            std::copy_n(text.data() + last, size, pending);
+            text = text.substr(0, last);
+            if (!validPartial()) return false;
+        }
+        if (!Core::Detail::IsValidUtf8(text)) return false;
+    }
+    return !final || size == 0;
+}
+
+std::vector<std::byte> EncodeServerFrame(std::uint8_t opcode, std::span<const std::byte> payload, bool final)
 {
     std::vector<std::byte> result;
     result.reserve(payload.size() + 10);
-    result.push_back(static_cast<std::byte>(0x80u | opcode));
+    result.push_back(static_cast<std::byte>((final ? 0x80u : 0u) | opcode));
     if (payload.size() < 126) result.push_back(static_cast<std::byte>(payload.size()));
     else if (payload.size() <= 65535)
     {

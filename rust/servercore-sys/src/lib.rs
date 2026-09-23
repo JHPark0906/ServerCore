@@ -3,9 +3,28 @@
 #![allow(non_camel_case_types)]
 
 use std::ffi::c_char;
+mod channel;
+pub mod binary;
+pub mod files;
+pub mod datagram;
+pub mod game_execution;
+pub use datagram::*;
+pub use game_execution::*;
 mod observability;
+mod readiness;
+mod runtime;
+pub mod request_limiter;
+mod endpoint;
+pub mod web_data;
+pub mod web_policy;
+pub use web_policy::*;
+pub use endpoint::*;
+pub use web_data::*;
 mod web_extensions;
+pub use channel::*;
 pub use observability::*;
+pub use readiness::*;
+pub use runtime::*;
 pub use web_extensions::*;
 pub const SC_ABI_VERSION: u32 = 1;
 pub type sc_status = i32;
@@ -24,6 +43,16 @@ pub const SC_TIMEOUT: sc_status = 11;
 pub const SC_CANCELLED: sc_status = 12;
 pub const SC_CAP_WEB: u32 = 1;
 pub const SC_CAP_TCP: u32 = 2;
+pub const SC_CAP_ENDPOINT: u32 = 256;
+pub const SC_CAP_REQUEST_LIMITER: u32 = 512;
+pub const SC_CAP_WEB_POLICIES: u32 = 1024;
+pub const SC_CAP_WEB_DATA: u32 = 2048;
+pub const SC_CAP_WS_EXTENSIONS: u32 = 4096;
+pub const SC_CAP_GAME_EXECUTION: u32 = 8192;
+pub const SC_CAP_BINARY_IO: u32 = 16384;
+pub const SC_CAP_DATAGRAM: u32 = 32768;
+pub const SC_CAP_ATOMIC_FILE: u32 = 65536;
+pub const SC_CAP_OPERATIONS: u32 = 131072;
 // Capability value 4 is reserved; existing capability values must not shift.
 
 #[repr(C)]

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include <cstddef>
 #include <span>
 #include <vector>
@@ -51,24 +53,24 @@ public:
     /// Write가 0을 돌려주는 것은 "가득 찼다"와 구분되지 않으므로 진행 불가 상태가 정상 반환으로
     /// 위장된다.
     /// </param>
-    explicit ByteBuffer(std::size_t capacity);
+    SERVERCORE_API explicit ByteBuffer(std::size_t capacity);
 
     /// <summary>바이트를 뒤에 붙인다.</summary>
     /// <returns>실제로 담은 바이트 수. 공간이 모자라면 요청보다 작을 수 있다.</returns>
-    std::size_t Write(std::span<const std::byte> bytes);
+    SERVERCORE_API std::size_t Write(std::span<const std::byte> bytes);
 
     /// <summary>담긴 바이트를 복사 없이 들여다본다.</summary>
-    [[nodiscard]] std::span<const std::byte> Peek() const;
+    [[nodiscard]] SERVERCORE_API std::span<const std::byte> Peek() const;
 
     /// <summary>앞에서부터 지정한 만큼을 버린다. 담긴 것보다 많이 버리려 하면 계약 위반이다.</summary>
-    void Consume(std::size_t byteCount);
+    SERVERCORE_API void Consume(std::size_t byteCount);
 
-    [[nodiscard]] std::size_t Size() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::size_t Size() const noexcept;
 
-    [[nodiscard]] bool Empty() const noexcept;
+    [[nodiscard]] SERVERCORE_API bool Empty() const noexcept;
 
     /// <summary>만들 때 정해진 최대 바이트 수다. 살아 있는 동안 바뀌지 않는다.</summary>
-    [[nodiscard]] std::size_t Capacity() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::size_t Capacity() const noexcept;
 
 private:
     /// <summary>

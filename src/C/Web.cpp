@@ -3,6 +3,9 @@
 #include "ServerCore/Web/HttpServer.h"
 #include "ServerCore/Observability/Prometheus.h"
 #include "C/Internal.h"
+#include "C/EndpointInternal.h"
+#include "C/ObservationInternal.h"
+#include "ServerCore/Observability/ServerObservation.h"
 #include <atomic>
 #include <algorithm>
 #include <unordered_map>
@@ -10,9 +13,23 @@
 
 namespace C = ServerCore::CDetail;
 namespace W = ServerCore::Web;
-namespace ServerCore::CDetail { struct WebState; struct SocketState; struct ResponseOwner; struct SocketOwner; struct BodyOwner; struct DecisionOwner; }
+namespace ServerCore::CDetail {
+struct WebState; struct SocketState; struct ResponseOwner; struct SocketOwner; struct BodyOwner; struct DecisionOwner;
+struct EventStorageCharge {
+    std::shared_ptr<std::atomic<std::uint64_t>> counter;
+    std::uint64_t bytes = 0;
+    void Set(const std::shared_ptr<std::atomic<std::uint64_t>>& target, std::uint64_t amount) noexcept {
+        counter = target; bytes = amount; counter->fetch_add(bytes, std::memory_order_relaxed);
+    }
+    ~EventStorageCharge() { if (counter) counter->fetch_sub(bytes, std::memory_order_relaxed); }
+};
+}
 struct sc_http_response { std::shared_ptr<C::ResponseOwner> owner; };
 struct sc_websocket { std::shared_ptr<C::SocketOwner> owner; };
+struct sc_websocket_message {
+    std::shared_ptr<C::SocketOwner> owner;
+    std::shared_ptr<W::WebSocketMessageWriter> writer;
+};
 struct sc_http_body { std::shared_ptr<C::BodyOwner> owner; };
 struct sc_request_decision { std::shared_ptr<C::DecisionOwner> owner; };
 struct sc_body_chunk { std::shared_ptr<const std::vector<std::byte>> value; };
@@ -24,6 +41,8 @@ struct sc_websocket_event {
     std::string bytes;
 };
 struct sc_web_event {
+    // First member retires last, after all owned strings/views/context storage.
+    C::EventStorageCharge additionalStorage;
     std::shared_ptr<C::Budget::Lease> charge;
     uint32_t kind = SC_WEB_REQUEST;
     std::shared_ptr<const W::HttpRequestContext> context;
@@ -43,6 +62,9 @@ struct sc_web_event {
         for (const auto& [name, value] : Request().headers) headers.push_back({C::View(name), C::View(value)});
         for (const auto& [name, value] : Request().pathParameters) parameters.push_back({C::View(name), C::View(value)});
         if (context) for (const auto& [name, value] : context->attributes) attributes.push_back({C::View(name), C::View(value)});
+    }
+    size_t WrapperBytes() const noexcept {
+        return sizeof(sc_web_event) + (headers.capacity() + parameters.capacity() + attributes.capacity()) * sizeof(sc_header);
     }
     ~sc_web_event();
 };
@@ -125,6 +147,7 @@ struct WebState : std::enable_shared_from_this<WebState> {
             }
             auto event = std::make_unique<sc_web_event>(); event->context = context;
             event->charge = std::move(charge); event->Prepare();
+            event->additionalStorage.Set(eventStorage, event->WrapperBytes());
             (void)events.Push(std::move(event));
         } catch (...) { context->response->Abort(); }
     }
@@ -138,6 +161,7 @@ struct WebState : std::enable_shared_from_this<WebState> {
             }
             auto event = std::make_unique<sc_web_event>(); event->kind = SC_WEB_POLICY;
             event->policy = context; event->charge = std::move(charge); event->Prepare();
+            event->additionalStorage.Set(eventStorage, event->WrapperBytes());
             (void)events.Push(std::move(event));
         } catch (...) { context->decision->Abort(); }
     }
@@ -167,6 +191,8 @@ struct WebState : std::enable_shared_from_this<WebState> {
             socket->terminal = std::make_unique<sc_websocket_event>(); socket->terminal->slot = socket->slot;
             auto event = std::make_unique<sc_web_event>(); event->kind = SC_WEB_WEBSOCKET;
             event->handshake = request; event->socket = socket; event->charge = std::move(charge); event->Prepare();
+            // Upgrade metadata is copied, unlike HTTP/policy shared contexts.
+            event->additionalStorage.Set(eventStorage, RequestBytes(event->handshake));
             { std::lock_guard lock(socketMutex); sockets.emplace(connection->Id(), socket); }
             (void)events.Push(std::move(event));
         } catch (...) { (void)connection->Close(1011); }
@@ -184,14 +210,18 @@ struct WebState : std::enable_shared_from_this<WebState> {
     sc_status Stop() {
         std::lock_guard lock(lifecycle);
         stopped.store(true); events.Close();
-        return Code(server.Stop());
+        const auto status = server.Stop();
+        if (status.IsOk()) stopFinished.store(true);
+        return Code(status);
     }
     std::mutex lifecycle, socketMutex;
     std::atomic<bool> stopped{false};
+    std::atomic<bool> stopFinished{false};
     bool started = false;
     W::HttpServer server;
     W::HttpServerOptions options;
     std::shared_ptr<Budget> budget, socketBudget, socketSlots;
+    const std::shared_ptr<std::atomic<std::uint64_t>> eventStorage = std::make_shared<std::atomic<std::uint64_t>>(0);
     PullQueue<sc_web_event> events;
     std::unordered_map<uint64_t, std::shared_ptr<SocketState>> sockets;
 };
@@ -230,6 +260,32 @@ sc_web_event::~sc_web_event() {
 }
 
 extern "C" {
+sc_status sc_web_server_subscribe(sc_web_server* server, sc_notifier* notifier, uint64_t key, sc_subscription** out) {
+    if (!server) { if (out) *out = nullptr; return SC_INVALID_ARGUMENT; }
+    return C::Protect([&] { return server->state->events.Subscribe(notifier, key, out); });
+}
+sc_status sc_web_server_subscribe_drain(sc_web_server* server, sc_notifier* notifier, uint64_t key, sc_subscription** out) {
+    if (!server) { if (out) *out = nullptr; return SC_INVALID_ARGUMENT; }
+    return C::Protect([&] { return C::SubscribeCompletion([&](auto callback) {
+        return server->state->server.WaitForDrain(std::move(callback)); }, notifier, key, out); });
+}
+sc_status sc_http_body_subscribe(sc_http_body* body, sc_notifier* notifier, uint64_t key, sc_subscription** out) {
+    if (!body) { if (out) *out = nullptr; return SC_INVALID_ARGUMENT; }
+    return C::Protect([&] { return C::SubscribeCompletion([&](auto callback) {
+        return body->owner->body->WaitForReadReady(std::move(callback)); }, notifier, key, out); });
+}
+sc_status sc_http_response_subscribe_cancelled(sc_http_response* response, sc_notifier* notifier, uint64_t key, sc_subscription** out) {
+    if (!response) { if (out) *out = nullptr; return SC_INVALID_ARGUMENT; }
+    return C::Protect([&] { return C::SubscribeCancellation(response->owner->context->response->GetCancellationToken(), notifier, key, out); });
+}
+sc_status sc_request_decision_subscribe_cancelled(sc_request_decision* decision, sc_notifier* notifier, uint64_t key, sc_subscription** out) {
+    if (!decision) { if (out) *out = nullptr; return SC_INVALID_ARGUMENT; }
+    return C::Protect([&] { return C::SubscribeCancellation(decision->owner->decision->GetCancellationToken(), notifier, key, out); });
+}
+sc_status sc_websocket_subscribe(sc_websocket* socket, sc_notifier* notifier, uint64_t key, sc_subscription** out) {
+    if (!socket) { if (out) *out = nullptr; return SC_INVALID_ARGUMENT; }
+    return C::Protect([&] { return socket->owner->socket->events.Subscribe(notifier, key, out); });
+}
 sc_status sc_web_options_init(sc_web_options* value, size_t size) {
     if (!value || size < sizeof(*value)) return SC_INVALID_ARGUMENT;
     *value = {}; value->abi_version = SC_ABI_VERSION; value->struct_size = sizeof(*value);
@@ -267,11 +323,56 @@ sc_status sc_web_server_route(sc_web_server* server, sc_bytes method, sc_bytes p
             state->server.RegisterAsyncRoute(C::Text(method), C::Text(path), std::move(handler)));
     });
 }
+sc_status sc_web_server_set_ipv6_only(sc_web_server* server, uint32_t ipv6Only) {
+    if (!server || ipv6Only > 1) return SC_INVALID_ARGUMENT;
+    return C::Protect([&]() -> sc_status {
+        auto state = server->state; std::lock_guard lock(state->lifecycle);
+        if (state->started || state->stopped.load()) return SC_CLOSED;
+        state->options.ipv6Only = ipv6Only != 0; return SC_OK;
+    });
+}
 sc_status sc_web_server_websocket(sc_web_server* server, sc_bytes path, uint32_t pattern) {
+    sc_websocket_route_options options{};
+    (void)sc_websocket_route_options_init(&options, sizeof(options));
+    return sc_web_server_websocket_ex(server, path, pattern, &options);
+}
+sc_status sc_websocket_options_init(sc_websocket_options* options, size_t size) {
+    if (!options || size < sizeof(*options)) return SC_INVALID_ARGUMENT;
+    *options = {}; options->abi_version = SC_ABI_VERSION; options->struct_size = sizeof(*options);
+    options->max_frame_bytes = 64 * 1024; options->max_message_bytes = 256 * 1024;
+    options->pong_timeout_ms = 10000; return SC_OK;
+}
+sc_status sc_websocket_route_options_init(sc_websocket_route_options* options, size_t size) {
+    if (!options || size < sizeof(*options)) return SC_INVALID_ARGUMENT;
+    *options = {}; options->abi_version = SC_ABI_VERSION; options->struct_size = sizeof(*options); return SC_OK;
+}
+sc_status sc_web_server_set_websocket_options(sc_web_server* server, const sc_websocket_options* options) {
+    if (!server || !C::Version(options) || !options->max_frame_bytes ||
+        options->max_frame_bytes > ServerCore::Net::SendQueueLimitBytes - 14 ||
+        options->max_message_bytes < options->max_frame_bytes || options->max_message_bytes > 16 * 1024 * 1024 ||
+        !options->pong_timeout_ms) return SC_INVALID_ARGUMENT;
+    return C::Protect([&]() -> sc_status {
+        auto state = server->state; std::lock_guard lock(state->lifecycle);
+        if (state->started || state->stopped.load()) return SC_CLOSED;
+        state->options.maxWebSocketFrameBytes = options->max_frame_bytes;
+        state->options.maxWebSocketMessageBytes = options->max_message_bytes;
+        state->options.webSocketPingInterval = std::chrono::milliseconds(options->ping_interval_ms);
+        state->options.webSocketPongTimeout = std::chrono::milliseconds(options->pong_timeout_ms); return SC_OK;
+    });
+}
+sc_status sc_web_server_websocket_ex(sc_web_server* server, sc_bytes path, uint32_t pattern, const sc_websocket_route_options* options) {
     if (!server || !C::Valid(path) || path.len > 65536 || pattern > 1) return SC_INVALID_ARGUMENT;
+    if (!C::Version(options) || (options->flags & ~SC_WS_AUTHORIZE) != 0 || options->subprotocol_count > 64 ||
+        (options->subprotocol_count != 0 && !options->subprotocols)) return SC_INVALID_ARGUMENT;
     return C::Protect([&]() -> sc_status {
         auto state = server->state; std::lock_guard lock(state->lifecycle); if (state->stopped.load()) return SC_CLOSED;
-        auto callbacks = state->SocketCallbacks(false);
+        auto callbacks = state->SocketCallbacks((options->flags & SC_WS_AUTHORIZE) != 0);
+        size_t bytes = 0;
+        for (size_t index = 0; index < options->subprotocol_count; ++index) {
+            const auto token = options->subprotocols[index];
+            if (!C::Valid(token) || token.len > 4096 - bytes) return SC_INVALID_ARGUMENT;
+            bytes += token.len; callbacks.subprotocols.emplace_back(C::Text(token));
+        }
         return C::Code(pattern ? state->server.RegisterWebSocketPattern(C::Text(path), std::move(callbacks)) :
             state->server.RegisterWebSocket(C::Text(path), std::move(callbacks)));
     });
@@ -312,13 +413,9 @@ sc_status sc_web_server_enable_policy(sc_web_server* server) {
         return C::Code(state->server.SetRequestPolicy(state->PolicyHandler())); });
 }
 sc_status sc_web_server_websocket_policy(sc_web_server* server, sc_bytes path, uint32_t pattern) {
-    if (!server || !C::Valid(path) || path.len > 65536 || pattern > 1) return SC_INVALID_ARGUMENT;
-    return C::Protect([&]() -> sc_status {
-        auto state = server->state; std::lock_guard lock(state->lifecycle); if (state->stopped.load()) return SC_CLOSED;
-        auto callbacks = state->SocketCallbacks(true);
-        return C::Code(pattern ? state->server.RegisterWebSocketPattern(C::Text(path), std::move(callbacks)) :
-            state->server.RegisterWebSocket(C::Text(path), std::move(callbacks)));
-    });
+    sc_websocket_route_options options{};
+    (void)sc_websocket_route_options_init(&options, sizeof(options)); options.flags = SC_WS_AUTHORIZE;
+    return sc_web_server_websocket_ex(server, path, pattern, &options);
 }
 sc_status sc_web_server_begin_drain(sc_web_server* server) {
     if (!server) return SC_INVALID_ARGUMENT;
@@ -344,7 +441,7 @@ sc_status sc_web_server_stop_gracefully(sc_web_server* server, uint32_t timeout)
         const auto status = state->server.StopGracefully(deadline);
         if (status.IsOk() || status.Code() == ServerCore::Core::ErrorCode::Timeout) {
             std::lock_guard lock(state->lifecycle);
-            state->stopped.store(true); state->events.Close();
+            state->stopped.store(true); state->events.Close(); state->stopFinished.store(true);
         }
         return C::Code(status);
     });
@@ -379,6 +476,25 @@ sc_status sc_web_server_get_metrics(const sc_web_server* server, sc_web_metrics*
     std::copy(value.latencyHistogram.buckets.begin(), value.latencyHistogram.buckets.end(), out->latency_buckets);
     out->handlers = C::TaskMetrics(value.handlers); return SC_OK;
 }
+sc_status sc_web_server_get_observation(const sc_web_server* server, sc_observation* out) {
+    if (!server || !C::Version(out)) return SC_INVALID_ARGUMENT;
+    return C::Protect([&] {
+        const auto state = server->state;
+        auto value = ServerCore::Observability::Observe(state->server);
+        if (state->stopFinished.load()) {
+            value.lifecycle = ServerCore::Observability::Lifecycle::Stopped;
+            value.available |= ServerCore::Observability::DrainRemaining;
+        } else if (state->stopped.load()) value.lifecycle = ServerCore::Observability::Lifecycle::Draining;
+        // HTTP/policy contexts are already counted by native RequestBudget.
+        // Only independent wrapper/view storage, copied WS upgrade metadata,
+        // and copied WS message events add new retained bytes here.
+        auto additional = state->eventStorage->load(std::memory_order_relaxed);
+        { std::lock_guard guard(state->socketBudget->mutex); C::AddObservation(additional, state->socketBudget->bytes); }
+        C::AddObservation(value.receiveBytes, additional);
+        C::AddObservation(value.retainedBytes, additional);
+        return C::CopyObservation(value, out);
+    });
+}
 sc_status sc_web_server_metrics_prometheus(const sc_web_server* server, sc_owned_text** out) {
     if (!out) return SC_INVALID_ARGUMENT;
     *out = nullptr;
@@ -396,6 +512,11 @@ sc_status sc_web_event_request(const sc_web_event* event, sc_request_view* view)
     view->method = C::View(event->Request().method); view->target = C::View(event->Request().target); view->body = C::View(event->Request().body);
     view->headers = event->headers.data(); view->header_count = event->headers.size();
     view->parameters = event->parameters.data(); view->parameter_count = event->parameters.size(); return SC_OK;
+}
+sc_status sc_web_event_endpoints(const sc_web_event* event, sc_request_endpoints* endpoints) {
+    if (!event || !C::Version(endpoints)) return SC_INVALID_ARGUMENT;
+    endpoints->local_endpoint = C::FromEndpoint(event->Request().localEndpoint);
+    endpoints->remote_endpoint = C::FromEndpoint(event->Request().remoteEndpoint); return SC_OK;
 }
 sc_status sc_web_event_response(sc_web_event* event, sc_http_response** out) {
     if (!out) return SC_INVALID_ARGUMENT;
@@ -551,6 +672,42 @@ sc_status sc_websocket_send(sc_websocket* socket, uint32_t kind, sc_bytes bytes)
     return C::Protect([&] { auto& connection = socket->owner->socket->connection;
         return C::Code(kind == SC_WS_TEXT ? connection->SendText(C::Text(bytes)) : connection->SendBinary(C::Bytes(bytes))); });
 }
+sc_bytes sc_websocket_subprotocol(const sc_websocket* socket) {
+    if (!socket) return {};
+    const auto control = W::GetWebSocketMessageControl(socket->owner->socket->connection);
+    return control ? C::View(control->Subprotocol()) : sc_bytes{};
+}
+sc_status sc_websocket_ping(sc_websocket* socket, sc_bytes bytes) {
+    if (!socket || !C::Valid(bytes)) return SC_INVALID_ARGUMENT;
+    return C::Protect([&] { return C::Code(socket->owner->socket->connection->Ping(C::Bytes(bytes))); });
+}
+sc_status sc_websocket_begin_message(sc_websocket* socket, uint32_t kind, sc_websocket_message** out) {
+    if (!out) return SC_INVALID_ARGUMENT;
+    *out = nullptr;
+    if (!socket || (kind != SC_WS_TEXT && kind != SC_WS_BINARY)) return SC_INVALID_ARGUMENT;
+    return C::Protect([&]() -> sc_status {
+        const auto control = W::GetWebSocketMessageControl(socket->owner->socket->connection);
+        if (!control) return SC_UNIMPLEMENTED;
+        auto result = std::make_unique<sc_websocket_message>(); result->owner = socket->owner;
+        auto writer = control->BeginMessage(kind == SC_WS_TEXT ? W::WebSocketMessageType::Text : W::WebSocketMessageType::Binary);
+        if (!writer.IsOk()) return C::Code(writer.GetStatus());
+        result->writer = std::move(writer).Value(); *out = result.release(); return SC_OK;
+    });
+}
+sc_status sc_websocket_message_write(sc_websocket_message* message, sc_bytes bytes, uint32_t final) {
+    if (!message || !C::Valid(bytes) || final > 1) return SC_INVALID_ARGUMENT;
+    return C::Protect([&] { return C::Code(message->writer->Write(C::Bytes(bytes), final != 0)); });
+}
+size_t sc_websocket_message_max_write(const sc_websocket_message* message) {
+    return message ? message->writer->MaxWriteBytes() : 0;
+}
+sc_status sc_websocket_message_wait_capacity(sc_websocket_message* message, size_t bytes, sc_wait** out) {
+    if (!message) { if (out) *out = nullptr; return SC_INVALID_ARGUMENT; }
+    return C::Protect([&] { return C::MakeWait([&](auto callback) {
+        return message->writer->WaitForWriteCapacity(bytes, std::move(callback)); }, out); });
+}
+void sc_websocket_message_abort(sc_websocket_message* message) { if (message) message->writer->Abort(); }
+void sc_websocket_message_destroy(sc_websocket_message* message) { delete message; }
 sc_status sc_websocket_close(sc_websocket* socket, uint16_t code, sc_bytes reason) {
     if (!socket || !C::Valid(reason)) return SC_INVALID_ARGUMENT;
     return C::Protect([&] { return C::Code(socket->owner->socket->connection->Close(code, C::Text(reason))); });

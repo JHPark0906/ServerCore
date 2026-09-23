@@ -54,5 +54,9 @@ struct ServerMetricsSnapshot
     std::uint64_t skippedPeriodCount = 0;
     std::vector<SessionSendQueueSnapshot> sessionSendQueues;
     Observability::JobRunnerMetricsSnapshot jobs;
+    Observability::Lifecycle lifecycle = Observability::Lifecycle::Created;
+    // Payload allocations retained until send completion, distinct from the
+    // remaining wire bytes in sessionSendQueues (partial sends retain storage).
+    std::uint64_t retainedSendBytes = 0;
 };
 }

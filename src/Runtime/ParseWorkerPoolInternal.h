@@ -20,6 +20,8 @@ namespace ServerCore::Runtime
 class ParseWorkerPool final
 {
 public:
+    using Job = std::move_only_function<void()>;
+
     ParseWorkerPool();
     ~ParseWorkerPool();
 
@@ -33,7 +35,7 @@ public:
 
     /// <summary>입력 큐에 작업 하나를 넣는다.</summary>
     /// <returns>StopAndDiscard 뒤에는 Closed, 빈 작업은 InvalidArgument다.</returns>
-    [[nodiscard]] Core::Status Post(std::function<void()> job);
+    [[nodiscard]] Core::Status Post(Job job);
 
     /// <summary>새 작업을 닫고 대기 작업을 버린 뒤 실행 중인 worker를 모두 join한다.</summary>
     void StopAndDiscard();

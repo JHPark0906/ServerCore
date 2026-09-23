@@ -1,4 +1,5 @@
 #pragma once
+#include "ServerCore/Export.h"
 
 #include "ServerCore/Runtime/TaskExecutor.h"
 #include "ServerCore/Web/HttpServer.h"
@@ -25,10 +26,10 @@ struct SseEvent
 // UTF-8 event framing only; start a chunked text/event-stream response separately.
 // data accepts CR/LF/CRLF and emits one data field per line. Metadata cannot
 // inject additional lines. The encoded event, including framing, must fit maxBytes.
-Core::Result<std::string> EncodeSseEvent(const SseEvent& event, std::size_t maxBytes);
+SERVERCORE_API Core::Result<std::string> EncodeSseEvent(const SseEvent& event, std::size_t maxBytes);
 // One bounded write, with no internal retry. On WouldBlock, wait for write
 // capacity then retry this event. Success means queued, not received by a client.
-Core::Status WriteSseEvent(HttpResponseWriter& writer, const SseEvent& event);
+SERVERCORE_API Core::Status WriteSseEvent(HttpResponseWriter& writer, const SseEvent& event);
 
 // Serve a regular file through a caller-owned bounded executor.
 // Call before starting the response, and let the helper own its writes/finish.
@@ -55,7 +56,7 @@ Core::Status WriteSseEvent(HttpResponseWriter& writer, const SseEvent& event);
 // The TaskHandle reports file/transport failure or cancellation independently of
 // the HTTP error response. Success means the complete response was queued locally.
 // Cancelling an admitted queued task also aborts its response before releasing it.
-Core::Result<Runtime::TaskHandle> SendFile(Runtime::TaskExecutor& executor,
+SERVERCORE_API Core::Result<Runtime::TaskHandle> SendFile(Runtime::TaskExecutor& executor,
     std::shared_ptr<const HttpRequestContext> context, std::filesystem::path path,
     HttpResponseHead head = {});
 }

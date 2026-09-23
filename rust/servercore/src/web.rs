@@ -13,6 +13,7 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct Options {
     pub listen_address: String,
+    pub ipv6_only: bool,
     pub port: u16,
     pub io_threads: u32,
     pub handler_threads: u32,
@@ -41,6 +42,7 @@ impl Default for Options {
         );
         let raw = unsafe { raw.assume_init() };
         Self {
+            ipv6_only: true,
             listen_address: String::from_utf8_lossy(unsafe { borrowed_bytes(raw.listen_address) })
                 .into_owned(),
             port: raw.port,
@@ -93,6 +95,32 @@ impl Options {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct WebSocketOptions {
+    pub max_frame_bytes: usize,
+    pub max_message_bytes: usize,
+    /// Zero disables automatic Pings. Matching Pongs are required while enabled.
+    pub ping_interval: Duration,
+    pub pong_timeout: Duration,
+}
+impl Default for WebSocketOptions {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: 64 * 1024,
+            max_message_bytes: 256 * 1024,
+            ping_interval: Duration::ZERO,
+            pong_timeout: Duration::from_secs(10),
+        }
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct WebSocketRouteOptions {
+    /// Unique ASCII tokens, in server preference order; no match selects none.
+    pub subprotocols: Vec<String>,
+    /// Emit a route-specific policy event before sending the 101 response.
+    pub authorize: bool,
+}
+
 /// Registration precedes `start`; polling dispatches immutable events to Rust.
 /// `stop` and Drop join native workers. Previously returned events stay valid.
 pub struct HttpServer {
@@ -104,15 +132,22 @@ pub struct HttpServer {
 unsafe impl Send for HttpServer {}
 unsafe impl Sync for HttpServer {}
 impl HttpServer {
+    pub(crate) fn native_handle(&self) -> *mut sys::sc_web_server {
+        self.handle.as_ptr()
+    }
     pub fn new(options: &Options) -> Result<Self> {
         verify_abi()?;
         let readiness = reactor::Lease::new()?;
         let mut out = std::ptr::null_mut();
         check(unsafe { sys::sc_web_server_create(&options.raw()?, &mut out) })?;
-        Ok(Self {
+        let server = Self {
             handle: pointer(out)?,
             _readiness: readiness,
-        })
+        };
+        check(unsafe {
+            sys::sc_web_server_set_ipv6_only(server.handle.as_ptr(), options.ipv6_only.into())
+        })?;
+        Ok(server)
     }
     pub fn route(&mut self, method: &str, path: &str) -> Result<()> {
         self.register_route(method, path, false)
@@ -193,6 +228,62 @@ impl HttpServer {
             )
         })
     }
+    pub fn set_websocket_options(&mut self, options: &WebSocketOptions) -> Result<()> {
+        let raw = sys::sc_websocket_options {
+            abi_version: sys::SC_ABI_VERSION,
+            struct_size: size_of::<sys::sc_websocket_options>() as u32,
+            max_frame_bytes: options.max_frame_bytes,
+            max_message_bytes: options.max_message_bytes,
+            ping_interval_ms: timeout_ms(options.ping_interval)?,
+            pong_timeout_ms: timeout_ms(options.pong_timeout)?,
+        };
+        check(unsafe { sys::sc_web_server_set_websocket_options(self.handle.as_ptr(), &raw) })
+    }
+    pub fn websocket_with_options(
+        &mut self,
+        path: &str,
+        options: &WebSocketRouteOptions,
+    ) -> Result<()> {
+        self.register_websocket_options(path, false, options)
+    }
+    pub fn websocket_pattern_with_options(
+        &mut self,
+        pattern: &str,
+        options: &WebSocketRouteOptions,
+    ) -> Result<()> {
+        self.register_websocket_options(pattern, true, options)
+    }
+    fn register_websocket_options(
+        &mut self,
+        path: &str,
+        pattern: bool,
+        options: &WebSocketRouteOptions,
+    ) -> Result<()> {
+        let protocols: Vec<_> = options
+            .subprotocols
+            .iter()
+            .map(|value| bytes(value.as_bytes()))
+            .collect();
+        let raw = sys::sc_websocket_route_options {
+            abi_version: sys::SC_ABI_VERSION,
+            struct_size: size_of::<sys::sc_websocket_route_options>() as u32,
+            flags: if options.authorize {
+                sys::SC_WS_AUTHORIZE
+            } else {
+                0
+            },
+            subprotocols: protocols.as_ptr(),
+            subprotocol_count: protocols.len(),
+        };
+        check(unsafe {
+            sys::sc_web_server_websocket_ex(
+                self.handle.as_ptr(),
+                bytes(path.as_bytes()),
+                pattern.into(),
+                &raw,
+            )
+        })
+    }
     pub fn start(&mut self) -> Result<()> {
         check(unsafe { sys::sc_web_server_start(self.handle.as_ptr()) })
     }
@@ -223,13 +314,19 @@ impl HttpServer {
             .checked_add(timeout)
             .ok_or(Error::INVALID_ARGUMENT)?;
         self.begin_drain()?;
-        reactor::poll_fn(move || match self.drain_status() {
-            Ok(()) => self.stop(),
-            Err(Error::WOULD_BLOCK) if std::time::Instant::now() >= deadline => {
-                self.stop_gracefully(Duration::ZERO)
-            }
-            result => result,
-        })?
+        reactor::poll_fn_deadline(
+            move || match self.drain_status() {
+                Ok(()) => self.stop(),
+                Err(Error::WOULD_BLOCK) if std::time::Instant::now() >= deadline => {
+                    self.stop_gracefully(Duration::ZERO)
+                }
+                result => result,
+            },
+            |notifier, key, out| unsafe {
+                sys::sc_web_server_subscribe_drain(self.native_handle(), notifier, key, out)
+            },
+            Some(deadline),
+        )?
         .await
     }
     pub fn set_logger(&mut self, logger: &crate::observability::Logger) -> Result<()> {
@@ -261,7 +358,13 @@ impl HttpServer {
         Ok(Event(pointer(out)?))
     }
     pub async fn next(&mut self) -> Result<Event> {
-        reactor::poll_fn(|| self.next_timeout(Duration::ZERO))?.await
+        reactor::poll_fn(
+            || self.next_timeout(Duration::ZERO),
+            |notifier, key, out| unsafe {
+                sys::sc_web_server_subscribe(self.native_handle(), notifier, key, out)
+            },
+        )?
+        .await
     }
 }
 impl Drop for HttpServer {
@@ -282,6 +385,9 @@ pub struct Event(NonNull<sys::sc_web_event>);
 unsafe impl Send for Event {}
 unsafe impl Sync for Event {}
 impl Event {
+    pub(crate) fn native_handle(&self) -> *const sys::sc_web_event {
+        self.0.as_ptr()
+    }
     pub fn kind(&self) -> Result<EventKind> {
         match unsafe { sys::sc_web_event_kind(self.0.as_ptr()) } {
             sys::SC_WEB_REQUEST => Ok(EventKind::Request),
@@ -295,6 +401,10 @@ impl Event {
         view.abi_version = sys::SC_ABI_VERSION;
         view.struct_size = size_of::<sys::sc_request_view>() as u32;
         check(unsafe { sys::sc_web_event_request(self.0.as_ptr(), &mut view) })?;
+        let mut endpoints: sys::sc_request_endpoints = unsafe { std::mem::zeroed() };
+        endpoints.abi_version = sys::SC_ABI_VERSION;
+        endpoints.struct_size = size_of::<sys::sc_request_endpoints>() as u32;
+        check(unsafe { sys::sc_web_event_endpoints(self.0.as_ptr(), &mut endpoints) })?;
         // Immutable view remains alive through this Event's borrow.
         unsafe {
             Ok(Request {
@@ -305,6 +415,8 @@ impl Event {
                 body: borrowed_bytes(view.body),
                 headers: Headers::from_raw(view.headers, view.header_count),
                 parameters: Headers::from_raw(view.parameters, view.parameter_count),
+                local_endpoint: crate::endpoint::Endpoint::from_raw(endpoints.local_endpoint),
+                remote_endpoint: crate::endpoint::Endpoint::from_raw(endpoints.remote_endpoint),
             })
         }
     }
@@ -370,6 +482,9 @@ pub struct Request<'a> {
     pub body: &'a [u8],
     pub headers: Headers<'a>,
     pub parameters: Headers<'a>,
+    /// Actual transport addresses; forwarding headers cannot override these.
+    pub local_endpoint: Option<crate::endpoint::Endpoint>,
+    pub remote_endpoint: Option<crate::endpoint::Endpoint>,
 }
 
 #[derive(Clone, Debug)]
@@ -395,13 +510,22 @@ pub struct Body {
 unsafe impl Send for Body {}
 unsafe impl Sync for Body {}
 impl Body {
+    fn native_handle(&self) -> *mut sys::sc_http_body {
+        self.handle.as_ptr()
+    }
     pub fn try_read(&self) -> Result<Option<BodyChunk>> {
         let mut out = std::ptr::null_mut();
         check(unsafe { sys::sc_http_body_read(self.handle.as_ptr(), &mut out) })?;
         Ok(NonNull::new(out).map(|handle| BodyChunk { handle }))
     }
     pub async fn next(&mut self) -> Result<Option<BodyChunk>> {
-        reactor::poll_fn(|| self.try_read())?.await
+        reactor::poll_fn(
+            || self.try_read(),
+            |notifier, key, out| unsafe {
+                sys::sc_http_body_subscribe(self.native_handle(), notifier, key, out)
+            },
+        )?
+        .await
     }
     pub fn retained_bytes(&self) -> usize {
         unsafe { sys::sc_http_body_retained_bytes(self.handle.as_ptr()) }
@@ -452,6 +576,9 @@ impl Drop for DecisionInner {
 #[derive(Clone)]
 pub struct Decision(Arc<DecisionInner>);
 impl Decision {
+    pub(crate) fn native_handle(&self) -> *mut sys::sc_request_decision {
+        self.0.handle.as_ptr()
+    }
     pub fn allow(&self, response_headers: &[Header], attributes: &[Header]) -> Result<()> {
         let response_headers = raw_headers(response_headers);
         let attributes = raw_headers(attributes);
@@ -483,13 +610,23 @@ impl Decision {
     }
     /// Waits for disconnect/timeout/abort, not normal decision completion.
     pub async fn cancelled(&self) -> Result<()> {
-        reactor::poll_fn(|| {
-            if self.is_cancelled() {
-                Ok(())
-            } else {
-                Err(Error::WOULD_BLOCK)
-            }
-        })?
+        reactor::poll_fn(
+            || {
+                if self.is_cancelled() {
+                    Ok(())
+                } else {
+                    Err(Error::WOULD_BLOCK)
+                }
+            },
+            |notifier, key, out| unsafe {
+                sys::sc_request_decision_subscribe_cancelled(
+                    self.0.handle.as_ptr(),
+                    notifier,
+                    key,
+                    out,
+                )
+            },
+        )?
         .await
     }
 }
@@ -584,13 +721,23 @@ impl Response {
     /// against an outbound operation and drop that operation when cancelled.
     /// Normal Finish does not cancel user work; this is not a completion wait.
     pub async fn cancelled(&self) -> Result<()> {
-        reactor::poll_fn(|| {
-            if self.is_cancelled() {
-                Ok(())
-            } else {
-                Err(Error::WOULD_BLOCK)
-            }
-        })?
+        reactor::poll_fn(
+            || {
+                if self.is_cancelled() {
+                    Ok(())
+                } else {
+                    Err(Error::WOULD_BLOCK)
+                }
+            },
+            |notifier, key, out| unsafe {
+                sys::sc_http_response_subscribe_cancelled(
+                    self.0.handle.as_ptr(),
+                    notifier,
+                    key,
+                    out,
+                )
+            },
+        )?
         .await
     }
     pub fn is_head(&self) -> bool {
@@ -661,6 +808,51 @@ impl WebSocket {
     pub fn id(&self) -> u64 {
         unsafe { sys::sc_websocket_id(self.0.handle.as_ptr()) }
     }
+    /// Negotiated immutable ASCII token, or empty when no protocol matched.
+    pub fn subprotocol(&self) -> &str {
+        let value =
+            unsafe { borrowed_bytes(sys::sc_websocket_subprotocol(self.0.handle.as_ptr())) };
+        std::str::from_utf8(value).expect("native WebSocket subprotocol is an ASCII token")
+    }
+    pub fn ping(&self, payload: &[u8]) -> Result<()> {
+        check(unsafe { sys::sc_websocket_ping(self.0.handle.as_ptr(), bytes(payload)) })
+    }
+    /// Reserves one message lane; other data sends return AlreadyExists until
+    /// final write/abort. Control frames can still interleave.
+    pub fn begin_message(&self, kind: WebSocketMessageType) -> Result<WebSocketMessageWriter> {
+        let mut out = std::ptr::null_mut();
+        check(unsafe {
+            sys::sc_websocket_begin_message(self.0.handle.as_ptr(), kind.raw(), &mut out)
+        })?;
+        Ok(WebSocketMessageWriter {
+            handle: pointer(out)?,
+            _socket: self.0.clone(),
+        })
+    }
+    /// Streams bounded fragments. Dropping this future after partial admission
+    /// aborts the incomplete message and closes its socket.
+    pub async fn send_fragmented(
+        &self,
+        kind: WebSocketMessageType,
+        data: &[u8],
+        fragment_bytes: usize,
+    ) -> Result<()> {
+        if fragment_bytes == 0 {
+            return Err(Error::INVALID_ARGUMENT);
+        }
+        let mut writer = self.begin_message(kind)?;
+        if fragment_bytes > writer.max_write_bytes() {
+            return Err(Error::TOO_LARGE);
+        }
+        if data.is_empty() {
+            return writer.write(&[], true).await;
+        }
+        let count = data.len().div_ceil(fragment_bytes);
+        for (index, chunk) in data.chunks(fragment_bytes).enumerate() {
+            writer.write(chunk, index + 1 == count).await?;
+        }
+        Ok(())
+    }
     pub fn send_text(&self, text: &str) -> Result<()> {
         self.send(sys::SC_WS_TEXT, text.as_bytes())
     }
@@ -706,7 +898,73 @@ impl WebSocket {
         event.initialize()
     }
     pub async fn next(&mut self) -> Result<WebSocketEvent> {
-        reactor::poll_fn(|| self.next_timeout(Duration::ZERO))?.await
+        reactor::poll_fn(
+            || self.next_timeout(Duration::ZERO),
+            |notifier, key, out| unsafe {
+                sys::sc_websocket_subscribe(self.0.handle.as_ptr(), notifier, key, out)
+            },
+        )?
+        .await
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebSocketMessageType {
+    Text,
+    Binary,
+}
+impl WebSocketMessageType {
+    fn raw(self) -> u32 {
+        match self {
+            Self::Text => sys::SC_WS_TEXT,
+            Self::Binary => sys::SC_WS_BINARY,
+        }
+    }
+}
+/// Owned exclusive message lane. UTF-8 may span fragments; final requires a
+/// complete scalar sequence. Invalid input and WouldBlock leave state unchanged.
+/// Drop before the first admitted fragment releases the lane; after it, Drop
+/// aborts the connection unless a final frame has already been admitted.
+pub struct WebSocketMessageWriter {
+    handle: NonNull<sys::sc_websocket_message>,
+    _socket: Arc<SocketInner>,
+}
+unsafe impl Send for WebSocketMessageWriter {}
+unsafe impl Sync for WebSocketMessageWriter {}
+impl WebSocketMessageWriter {
+    pub fn max_write_bytes(&self) -> usize {
+        unsafe { sys::sc_websocket_message_max_write(self.handle.as_ptr()) }
+    }
+    pub fn try_write(&mut self, data: &[u8], final_fragment: bool) -> Result<()> {
+        check(unsafe {
+            sys::sc_websocket_message_write(
+                self.handle.as_ptr(),
+                bytes(data),
+                final_fragment.into(),
+            )
+        })
+    }
+    pub fn wait_capacity(&self, bytes: usize) -> Result<CapacityWait> {
+        let mut out = std::ptr::null_mut();
+        check(unsafe {
+            sys::sc_websocket_message_wait_capacity(self.handle.as_ptr(), bytes, &mut out)
+        })?;
+        CapacityWait::from_raw(out)
+    }
+    pub async fn write(&mut self, data: &[u8], final_fragment: bool) -> Result<()> {
+        loop {
+            match self.try_write(data, final_fragment) {
+                Err(Error::WOULD_BLOCK) => self.wait_capacity(data.len())?.wait().await?,
+                result => return result,
+            }
+        }
+    }
+    pub fn abort(&mut self) {
+        unsafe { sys::sc_websocket_message_abort(self.handle.as_ptr()) };
+    }
+}
+impl Drop for WebSocketMessageWriter {
+    fn drop(&mut self) {
+        unsafe { sys::sc_websocket_message_destroy(self.handle.as_ptr()) };
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

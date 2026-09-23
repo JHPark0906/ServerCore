@@ -68,7 +68,11 @@ function(RunAndExpectMsvcRuntimeMismatch stage)
     string(FIND "${diagnostic}" "LNK2038" lnk2038Position)
     string(FIND "${diagnostic}" "RuntimeLibrary" runtimeLibraryPosition)
 
-    if (lnk2038Position EQUAL -1 OR runtimeLibraryPosition EQUAL -1)
+    if (SERVERCORE_PACKAGE_SHARED)
+        if (NOT diagnostic MATCHES "ServerCore C\\+\\+ ABI RuntimeLibrary mismatch")
+            message(FATAL_ERROR "${stage} failed without the shared C++ CRT guard.\n${diagnostic}")
+        endif ()
+    elseif (lnk2038Position EQUAL -1 OR runtimeLibraryPosition EQUAL -1)
         message(FATAL_ERROR
                 "${stage} failed, but not with the expected MSVC CRT mismatch diagnostic.\n"
                 "stdout:\n${output}\n"
@@ -131,7 +135,8 @@ function(CreatePackageConsumerConfigureCommand outputVariable buildDirectory pac
 
     list(APPEND command
             "-DSERVERCORE_PACKAGE_PREFIX=${packagePrefix}"
-            "-DSERVERCORE_PACKAGE_VERSION=${SERVERCORE_PACKAGE_VERSION}")
+            "-DSERVERCORE_PACKAGE_VERSION=${SERVERCORE_PACKAGE_VERSION}"
+            "-DSERVERCORE_EXPECT_SHARED=${SERVERCORE_PACKAGE_SHARED}")
 
     if (SERVERCORE_PACKAGE_IS_MSVC AND NOT "${runtimeLibrary}" STREQUAL "")
         list(APPEND command "-DCMAKE_MSVC_RUNTIME_LIBRARY=${runtimeLibrary}")
@@ -168,7 +173,9 @@ function(CreateSourceTreeConsumerConfigureCommand outputVariable buildDirectory)
                 "-DCMAKE_MT=${SERVERCORE_PACKAGE_MT}")
     endif ()
 
-    list(APPEND command "-DSERVERCORE_SOURCE_DIR=${SERVERCORE_PACKAGE_SOURCE_DIR}")
+    list(APPEND command "-DSERVERCORE_SOURCE_DIR=${SERVERCORE_PACKAGE_SOURCE_DIR}"
+            "-DSERVERCORE_BUILD_SHARED=${SERVERCORE_PACKAGE_SHARED}"
+            "-DSERVERCORE_EXPECT_SHARED=${SERVERCORE_PACKAGE_SHARED}")
 
     set("${outputVariable}" "${command}" PARENT_SCOPE)
 endfunction()
@@ -356,6 +363,7 @@ if (SERVERCORE_PACKAGE_IS_MSVC)
             "-DCMAKE_RC_COMPILER=${SERVERCORE_PACKAGE_RC_COMPILER}"
             "-DCMAKE_MT=${SERVERCORE_PACKAGE_MT}"
             -DSERVERCORE_BUILD_TESTS=OFF
+            "-DSERVERCORE_BUILD_SHARED=${SERVERCORE_PACKAGE_SHARED}"
             "-DCMAKE_MSVC_RUNTIME_LIBRARY=${mismatchedMsvcRuntimeLibrary}")
 
     RunOrFail("Configuring ServerCore with an incompatible global MSVC runtime"

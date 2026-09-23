@@ -632,8 +632,11 @@ public:
     Core::Status SetBinaryHandler(ServerHost::BinaryHandler handler);
     Core::Status AttachDatagramTransport(std::shared_ptr<DatagramTransport> transport);
     Core::Result<Protocol::DatagramCodec::Token> GetDatagramToken(Session::SessionId id) const;
-    void LogStatus(Core::LogLevel level, const Core::Status& status) const noexcept
-    { if (mLogger) mLogger->Write(level, status.Message()); }
+    void LogStatus(Core::LogLevel level, const Core::Status& status, Session::SessionId session = Session::SessionId::Invalid) const noexcept
+    {
+        if (!mLogger) return;
+        (void)Core::WriteLog(*mLogger, {level, status.Message(), {}, {0, static_cast<std::uint64_t>(session), 0, 0}});
+    }
     Dispatch::Dispatcher& GetDispatcher() noexcept;
     const Session::SessionRegistry& GetSessions() const noexcept;
     [[nodiscard]] JobRunner::Lease GetJobRunner() const noexcept;
@@ -985,6 +988,9 @@ public:
         if (state == ServerCore::Session::SessionState::Closing || state == ServerCore::Session::SessionState::Closed)
             mCancellation.request_stop();
     }
+
+    [[nodiscard]] Core::IpEndpoint LocalEndpoint() const noexcept override { return mConnection->LocalEndpoint(); }
+    [[nodiscard]] Core::IpEndpoint RemoteEndpoint() const noexcept override { return mConnection->RemoteEndpoint(); }
 
     Core::Status SendBinary(const std::uint32_t type, const std::span<const std::byte> payload) override
     {
@@ -1542,6 +1548,48 @@ public:
     {
         return mConnection->QueuedSendBytes();
     }
+    [[nodiscard]] std::size_t RetainedSendBytes() const noexcept
+    {
+        const auto flow = Net::GetConnectionFlowControl(mConnection);
+        return flow ? flow->RetainedSendBytes() : 0;
+    }
+
+    Core::Result<Core::CompletionSubscription> WaitForSendCapacity(std::size_t requiredBytes,
+        std::function<void(Core::Status)> callback, std::stop_token cancellation) override
+    {
+        using Result = Core::Result<Core::CompletionSubscription>;
+        if (!callback || requiredBytes == 0)
+            return Result::FromStatus(Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument));
+        const auto state = State();
+        if (state == ServerCore::Session::SessionState::Closing || state == ServerCore::Session::SessionState::Closed)
+            return Result::FromStatus(Core::Status::FailWithoutMessage(Core::ErrorCode::Closed));
+        const auto flow = Net::GetConnectionFlowControl(mConnection);
+        if (!flow) return Result::FromStatus(Core::Status::FailWithoutMessage(Core::ErrorCode::Unimplemented));
+        struct LinkedCancellation
+        {
+            struct Forward
+            {
+                mutable std::stop_source source;
+                void operator()() const noexcept { (void)source.request_stop(); }
+            };
+            std::stop_source source;
+            std::stop_callback<Forward> session;
+            std::stop_callback<Forward> caller;
+            LinkedCancellation(std::stop_token lifetime, std::stop_token token)
+                : session(lifetime, Forward{source}), caller(token, Forward{source}) {}
+        };
+        try
+        {
+            auto linked = std::make_shared<LinkedCancellation>(GetCancellationToken(), cancellation);
+            const auto token = linked->source.get_token();
+            // No session mutex spans registration: immediate readiness/cancel
+            // may invoke user code synchronously, including another send/close.
+            return flow->WaitForSendCapacity(requiredBytes,
+                [linked = std::move(linked), callback = std::move(callback)](Core::Status status)
+                { callback(std::move(status)); }, token);
+        }
+        catch (...) { return Result::FromStatus(Core::Status::AllocationFailure()); }
+    }
 
     void DrainSends()
     {
@@ -1843,7 +1891,7 @@ private:
                 try { dispatched = host->mBinaryHandler(shared_from_this(), message.Value()); }
                 catch (...) { CompleteLifecycleNotification(); throw; }
                 CompleteLifecycleNotification();
-                if (!dispatched.IsOk()) { host->RecordError(dispatched); host->LogStatus(Core::LogLevel::Warn, dispatched); }
+                if (!dispatched.IsOk()) { host->RecordError(dispatched); host->LogStatus(Core::LogLevel::Warn, dispatched, mId); }
                 const auto state = State();
                 if (state == ServerCore::Session::SessionState::Closing || state == ServerCore::Session::SessionState::Closed) return;
                 continue;
@@ -1877,7 +1925,7 @@ private:
                 host->RecordError(dispatched);
                 // L4는 handler 거부, type별 body 상한, body 없는 error 봉투를 연결 종료로
                 // 번역하지 않는다. UnknownType의 Disconnect 정책도 Dispatcher가 이미 처리한다.
-                host->LogStatus(Core::LogLevel::Warn, dispatched);
+                host->LogStatus(Core::LogLevel::Warn, dispatched, mId);
             }
 
             const ServerCore::Session::SessionState afterDispatch =
@@ -2186,7 +2234,7 @@ private:
         if (!dispatched.IsOk())
         {
             host->RecordError(dispatched);
-            host->LogStatus(Core::LogLevel::Warn, dispatched);
+            host->LogStatus(Core::LogLevel::Warn, dispatched, mId);
         }
 
         const ServerCore::Session::SessionState afterDispatch =
@@ -2252,7 +2300,7 @@ private:
             const Core::Status unregistered = host->mRegistry.Unregister(mId);
             if (!unregistered.IsOk() && unregistered.Code() != Core::ErrorCode::NotFound)
             {
-                host->LogStatus(Core::LogLevel::Warn, unregistered);
+                host->LogStatus(Core::LogLevel::Warn, unregistered, mId);
             }
         }
         else
@@ -2570,7 +2618,7 @@ void ServerHost::State::NetworkSession::FinalizeAfterRunnerFailure() noexcept
             const Core::Status unregistered = host->mRegistry.Unregister(mId);
             if (!unregistered.IsOk() && unregistered.Code() != Core::ErrorCode::NotFound)
             {
-                host->LogStatus(Core::LogLevel::Warn, unregistered);
+                host->LogStatus(Core::LogLevel::Warn, unregistered, mId);
             }
         }
         catch (...)
@@ -3099,8 +3147,10 @@ Core::Status ServerHost::State::Start()
 
         try
         {
-            Core::Status listened =
-                mAcceptor->Listen(options.listenAddress, options.port, options.acceptBacklog);
+            auto endpoint=Core::IpEndpoint::Parse(options.listenAddress,options.port);
+            Core::Status listened = endpoint.IsOk() ?
+                mAcceptor->Listen(endpoint.Value(),options.acceptBacklog,options.ipv6Only) :
+                std::move(endpoint).TakeStatus();
             if (!listened.IsOk())
             {
                 CompleteFailedStart();
@@ -3500,6 +3550,12 @@ Core::Result<ServerMetricsSnapshot> ServerHost::State::SnapshotMetrics() const
     try
     {
         ServerMetricsSnapshot snapshot;
+        {
+            const std::lock_guard guard(mLifecycleMutex);
+            snapshot.lifecycle = mLifecycle == Lifecycle::Stopped ? Observability::Lifecycle::Stopped :
+                (mLifecycle == Lifecycle::Stopping || mDraining.load()) ? Observability::Lifecycle::Draining :
+                mLifecycle == Lifecycle::Running ? Observability::Lifecycle::Running : Observability::Lifecycle::Created;
+        }
         snapshot.configuredIoWorkerThreadCount =
             static_cast<std::uint32_t>(mOptions.ioWorkerThreadCount);
         snapshot.configuredParseWorkerThreadCount =
@@ -3530,6 +3586,9 @@ Core::Result<ServerMetricsSnapshot> ServerHost::State::SnapshotMetrics() const
                 }
                 snapshot.sessionSendQueues.push_back(
                     SessionSendQueueSnapshot{ session->Id(), networkSession->QueuedSendBytes() });
+                const auto retained = networkSession->RetainedSendBytes();
+                const auto maximum = (std::numeric_limits<std::uint64_t>::max)();
+                snapshot.retainedSendBytes = retained > maximum - snapshot.retainedSendBytes ? maximum : snapshot.retainedSendBytes + retained;
             });
         std::sort(snapshot.sessionSendQueues.begin(), snapshot.sessionSendQueues.end(),
             [](const SessionSendQueueSnapshot& left, const SessionSendQueueSnapshot& right)

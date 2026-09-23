@@ -1,4 +1,7 @@
 #include "ServerCore/Core/Logging.h"
+#include "Core/Utf8Internal.h"
+#include <algorithm>
+#include <charconv>
 
 #include <atomic>
 #include <memory>
@@ -6,6 +9,81 @@
 
 namespace ServerCore::Core
 {
+Result<std::string> FormatLogRecord(const LogRecord& record, std::size_t maximum) noexcept
+{
+    using ResultType = Result<std::string>;
+    const auto fail = [](ErrorCode code) { return ResultType::FromStatus(Status::FailWithoutMessage(code)); };
+    if (record.level < LogLevel::Trace || record.level > LogLevel::Error ||
+        !maximum || maximum > MaxStructuredLogBytes || record.fields.size() > MaxLogFields)
+        return fail(ErrorCode::InvalidArgument);
+    if (record.message.size() > maximum) return fail(ErrorCode::TooLarge);
+    if (!Detail::IsValidUtf8(record.message)) return fail(ErrorCode::InvalidArgument);
+    for (std::size_t i = 0; i < record.fields.size(); ++i)
+    {
+        const auto& field = record.fields[i];
+        if (field.name.empty() || field.name.size() > MaxLogFieldNameBytes) return fail(ErrorCode::InvalidArgument);
+        if (field.value.size() > maximum) return fail(ErrorCode::TooLarge);
+        if (!Detail::IsValidUtf8(field.value)) return fail(ErrorCode::InvalidArgument);
+        for (const unsigned char c : field.name)
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-')) return fail(ErrorCode::InvalidArgument);
+        for (std::size_t previous = 0; previous < i; ++previous)
+            if (record.fields[previous].name == field.name) return fail(ErrorCode::InvalidArgument);
+    }
+    try
+    {
+        std::string text;
+        text.reserve((std::min)(maximum, std::size_t{1024}));
+        bool tooLarge = false;
+        const auto append = [&](std::string_view value) {
+            if (value.size() > maximum - text.size()) { tooLarge = true; return; }
+            text.append(value);
+        };
+        const auto quoted = [&](std::string_view value) {
+            append("\"");
+            constexpr char hex[] = "0123456789abcdef";
+            for (const unsigned char c : value)
+            {
+                if (tooLarge) break;
+                if (c == '"' || c == '\\') { const char escaped[]{'\\', static_cast<char>(c)}; append({escaped, 2}); }
+                else if (c < 32 || c == 127) { const char escaped[]{'\\','u','0','0',hex[c >> 4],hex[c & 15]}; append({escaped, 6}); }
+                else { const char byte = static_cast<char>(c); append({&byte, 1}); }
+            }
+            append("\"");
+        };
+        static constexpr std::string_view levels[]{"trace", "debug", "info", "warn", "error"};
+        append("{\"level\":"); quoted(levels[static_cast<unsigned>(record.level)]);
+        append(",\"message\":"); quoted(record.message);
+        const auto id = [&](std::string_view name, std::uint64_t value) {
+            if (!value) return;
+            append(","); quoted(name); append(":");
+            char number[20]; const auto converted = std::to_chars(number, number + sizeof(number), value);
+            append({number, static_cast<std::size_t>(converted.ptr - number)});
+        };
+        id("request_id", record.correlation.requestId); id("session_id", record.correlation.sessionId);
+        id("task_id", record.correlation.taskId); id("connection_id", record.correlation.connectionId);
+        append(",\"fields\":{");
+        for (std::size_t i = 0; i < record.fields.size(); ++i)
+        {
+            if (i) append(",");
+            quoted(record.fields[i].name); append(":"); quoted(record.fields[i].value);
+        }
+        append("}}");
+        if (tooLarge) return fail(ErrorCode::TooLarge);
+        return ResultType::FromValue(std::move(text));
+    }
+    catch (...) { return ResultType::FromStatus(Status::AllocationFailure()); }
+}
+
+Status WriteLog(ILogger& logger, const LogRecord& record) noexcept
+{
+    if (auto* structured = dynamic_cast<IStructuredLogger*>(&logger)) return structured->TryWriteRecord(record);
+    auto encoded = FormatLogRecord(record);
+    if (!encoded.IsOk()) return std::move(encoded).TakeStatus();
+    logger.Write(record.level, encoded.Value());
+    return Status::Ok();
+}
+
 namespace
 {
 /// <summary>아무 데도 쓰지 않는 로거다. 설치된 것이 없을 때 이것을 준다.</summary>

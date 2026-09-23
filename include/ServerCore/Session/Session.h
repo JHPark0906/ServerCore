@@ -1,6 +1,8 @@
 #pragma once
 
 #include "ServerCore/Core/Error.h"
+#include "ServerCore/Core/Endpoint.h"
+#include "ServerCore/Core/CompletionSubscription.h"
 #include "ServerCore/Protocol/Message.h"
 #include "ServerCore/Protocol/BinaryMessage.h"
 
@@ -88,6 +90,8 @@ public:
     /// Cancellation follows closing/disconnect. Custom sessions may return a non-stoppable token.
     /// Stop callbacks must not block or join this session's Host; they may run on its worker thread.
     [[nodiscard]] virtual std::stop_token GetCancellationToken() const noexcept { return {}; }
+    [[nodiscard]] virtual Core::IpEndpoint LocalEndpoint() const noexcept { return {}; }
+    [[nodiscard]] virtual Core::IpEndpoint RemoteEndpoint() const noexcept { return {}; }
 
     /// Available on explicitly binary-mode Host sessions; copies bytes into the bounded send queue.
     [[nodiscard]] virtual Core::Status SendBinary(std::uint32_t, std::span<const std::byte>)
@@ -121,6 +125,18 @@ public:
     /// <summary>전송 큐의 미완료 바이트 관측값이다. 예약이나 이후 송신 성공을 보장하지 않는다.</summary>
     /// <remarks>사용자 정의 세션의 기본 구현은 계측을 제공하지 않아 0을 반환한다.</remarks>
     [[nodiscard]] virtual std::size_t QueuedSendBytes() const noexcept { return 0; }
+
+    // Advisory, one-shot readiness for a complete encoded frame, INCLUDING the
+    // four-byte framing prefix. Not a reservation or delivery acknowledgement.
+    // Retry Send on Ok; another producer may consume capacity first. One pending
+    // wait per session; callback runs outside transport/session locks and must
+    // dispatch state changes to the application's executor. Closing/disconnect
+    // cancels the wait. Reset the subscription to quiesce capture access.
+    // Custom session implementations may opt out with Unimplemented.
+    [[nodiscard]] virtual Core::Result<Core::CompletionSubscription> WaitForSendCapacity(
+        std::size_t, std::function<void(Core::Status)>, std::stop_token = {})
+    { return Core::Result<Core::CompletionSubscription>::FromStatus(
+        Core::Status::FailWithoutMessage(Core::ErrorCode::Unimplemented)); }
 
     /// <summary>마지막 봉투를 보낼 큐에 넣고, 그 큐를 비운 뒤 이 세션을 닫는다.</summary>
     /// <param name="fields">type, body, seq, error를 담은 마지막 직렬화 전 봉투 필드.</param>

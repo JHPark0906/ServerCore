@@ -26,8 +26,8 @@ public:
         using Result = Core::Result<std::shared_ptr<const std::vector<std::byte>>>;
         const std::lock_guard guard(mMutex);
         if (mError != Core::ErrorCode::Ok) return Result::FromStatus(Core::Status::FailWithoutMessage(mError));
-        if (!mQueue.empty())
-        { auto value = std::move(mQueue.front()); mQueue.pop_front(); return Result::FromValue(std::move(value)); }
+        if (mQueue && !mQueue->empty())
+        { auto value = std::move(mQueue->front()); mQueue->pop_front(); return Result::FromValue(std::move(value)); }
         if (mDone) return Result::FromValue({});
         return Result::FromStatus(Core::Status::FailWithoutMessage(Core::ErrorCode::WouldBlock));
     }
@@ -38,10 +38,40 @@ public:
     std::stop_token GetCancellationToken() const noexcept override { return mCancellation.get_token(); }
     std::size_t RetainedBytes() const noexcept override { return mCredit->retained.load(); }
     std::size_t Available() const noexcept { return mMaximum - mCredit->retained.load(); }
+    Core::Result<Core::CompletionSubscription> WaitForReadReady(
+        std::function<void(Core::Status)> callback, std::stop_token cancellation = {}) override
+    {
+        using Result = Core::Result<Core::CompletionSubscription>;
+        if (!callback) return Result::FromStatus(Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument));
+        try {
+            auto registered = Core::CompletionSubscription::Create(
+                [owner = mOwner, callback = std::move(callback)](Core::Status status) {
+                    const WebCallbackScope scope(owner);
+                    callback(std::move(status));
+                });
+            if (!registered.IsOk()) return registered;
+            auto notification = std::make_shared<WebCompletion>();
+            notification->source = registered.Value().GetSource();
+            notification->owner = mOwner;
+            bool ready;
+            {
+                const std::lock_guard guard(mMutex);
+                if (mReadWait && mReadWait->source.IsPending())
+                    return Result::FromStatus(Core::Status::FailWithoutMessage(Core::ErrorCode::AlreadyExists));
+                ready = mDone || mError != Core::ErrorCode::Ok || (mQueue && !mQueue->empty());
+                if (!ready) mReadWait = notification;
+            }
+            registered.Value().BindCancellation(cancellation);
+            if (ready) WebCompletionScope::Complete(std::move(notification));
+            return registered;
+        } catch (...) { return Result::FromStatus(Core::Status::AllocationFailure()); }
+    }
     void Push(std::span<const std::byte> bytes)
     {
+        std::shared_ptr<WebCompletion> ready;
+        {
         const std::lock_guard guard(mMutex);
-        if (mDone || mError != Core::ErrorCode::Ok || bytes.empty()) return;
+        if (mDone || mError != Core::ErrorCode::Ok || !mQueue || bytes.empty()) return;
         if (bytes.size() > Available()) throw std::bad_alloc();
         auto owned = std::make_unique<std::vector<std::byte>>(bytes.begin(), bytes.end());
         mCredit->retained.fetch_add(bytes.size());
@@ -50,20 +80,28 @@ public:
             delete data;
             credit->retained.fetch_sub(size);
         });
-        mQueue.push_back(std::move(value));
+        mQueue->push_back(std::move(value));
+        ready = std::move(mReadWait);
+        }
+        WebCompletionScope::Complete(std::move(ready));
     }
     bool End(Core::ErrorCode error = Core::ErrorCode::Ok) noexcept
     {
-        std::deque<std::shared_ptr<const std::vector<std::byte>>> discarded;
+        // Detach the admission-allocated container; constructing an empty deque
+        // can allocate on MSVC and must not happen in this noexcept close path.
+        std::unique_ptr<std::deque<std::shared_ptr<const std::vector<std::byte>>>> discarded;
+        std::shared_ptr<WebCompletion> ready;
         {
             const std::lock_guard guard(mMutex);
             if (mDone || mError != Core::ErrorCode::Ok) return false;
             mDone = error == Core::ErrorCode::Ok;
             mError = error;
-            if (error != Core::ErrorCode::Ok) discarded.swap(mQueue);
+            if (error != Core::ErrorCode::Ok) discarded = std::move(mQueue);
+            ready = std::move(mReadWait);
         }
         if (error != Core::ErrorCode::Ok)
         { const WebCallbackScope callback(mOwner); (void)mCancellation.request_stop(); }
+        WebCompletionScope::Complete(std::move(ready));
         return true;
     }
 private:
@@ -72,8 +110,10 @@ private:
     const std::function<void()> mAbort;
     const void* const mOwner;
     mutable std::mutex mMutex;
-    std::deque<std::shared_ptr<const std::vector<std::byte>>> mQueue;
+    std::unique_ptr<std::deque<std::shared_ptr<const std::vector<std::byte>>>> mQueue =
+        std::make_unique<std::deque<std::shared_ptr<const std::vector<std::byte>>>>();
     std::stop_source mCancellation;
+    std::shared_ptr<WebCompletion> mReadWait;
     Core::ErrorCode mError = Core::ErrorCode::Ok;
     bool mDone = false;
 };

@@ -1,5 +1,81 @@
 use crate::*;
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct sc_request_endpoints {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub local_endpoint: sc_ip_endpoint,
+    pub remote_endpoint: sc_ip_endpoint,
+}
+extern "C" {
+    pub fn sc_web_server_set_ipv6_only(server: *mut sc_web_server, ipv6_only: u32) -> sc_status;
+    pub fn sc_web_event_endpoints(
+        event: *const sc_web_event,
+        endpoints: *mut sc_request_endpoints,
+    ) -> sc_status;
+}
+#[repr(C)]
+pub struct sc_websocket_message {
+    _private: [u8; 0],
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct sc_websocket_options {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub max_frame_bytes: usize,
+    pub max_message_bytes: usize,
+    pub ping_interval_ms: u32,
+    pub pong_timeout_ms: u32,
+}
+pub const SC_WS_AUTHORIZE: u32 = 1;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct sc_websocket_route_options {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub flags: u32,
+    pub subprotocols: *const sc_bytes,
+    pub subprotocol_count: usize,
+}
+extern "C" {
+    pub fn sc_websocket_options_init(options: *mut sc_websocket_options, size: usize) -> sc_status;
+    pub fn sc_websocket_route_options_init(
+        options: *mut sc_websocket_route_options,
+        size: usize,
+    ) -> sc_status;
+    pub fn sc_web_server_set_websocket_options(
+        server: *mut sc_web_server,
+        options: *const sc_websocket_options,
+    ) -> sc_status;
+    pub fn sc_web_server_websocket_ex(
+        server: *mut sc_web_server,
+        path: sc_bytes,
+        pattern: u32,
+        options: *const sc_websocket_route_options,
+    ) -> sc_status;
+    pub fn sc_websocket_subprotocol(socket: *const sc_websocket) -> sc_bytes;
+    pub fn sc_websocket_ping(socket: *mut sc_websocket, bytes: sc_bytes) -> sc_status;
+    pub fn sc_websocket_begin_message(
+        socket: *mut sc_websocket,
+        kind: u32,
+        out: *mut *mut sc_websocket_message,
+    ) -> sc_status;
+    pub fn sc_websocket_message_write(
+        message: *mut sc_websocket_message,
+        bytes: sc_bytes,
+        final_fragment: u32,
+    ) -> sc_status;
+    pub fn sc_websocket_message_max_write(message: *const sc_websocket_message) -> usize;
+    pub fn sc_websocket_message_wait_capacity(
+        message: *mut sc_websocket_message,
+        bytes: usize,
+        out: *mut *mut sc_wait,
+    ) -> sc_status;
+    pub fn sc_websocket_message_abort(message: *mut sc_websocket_message);
+    pub fn sc_websocket_message_destroy(message: *mut sc_websocket_message);
+}
+#[repr(C)]
 pub struct sc_http_body {
     _private: [u8; 0],
 }

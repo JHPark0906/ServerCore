@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -330,6 +331,58 @@ void TaskExecutorShutdownAndReentrancy()
     TaskExecutorNestedCancellation();
 }
 
+void TaskExecutorCompletionSubscriptions()
+{
+    auto gate = std::make_shared<Gate>();
+    auto capture = std::make_shared<int>(7);
+    const std::weak_ptr<int> lifetime = capture;
+    std::atomic<unsigned> completed{0}, cancelled{0}, dropped{0};
+    std::atomic<bool> observedCleanup{true};
+    TaskExecutor executor;
+    ExpectTrue(executor.Start({1, 1, 8}).IsOk(), "completion subscription executor starts");
+    const auto task = Accepted(executor, [gate, capture](std::stop_token token) {
+        (void)capture;
+        gate->Enter(token);
+        return Status::Ok();
+    });
+    capture.reset();
+    ExpectTrue(gate->WaitForEntered(), "completion subscriptions register before terminal publication");
+    std::vector<ServerCore::Core::CompletionSubscription> subscriptions;
+    const auto callback = [&, task](Status status) {
+        if (status.Code() == ErrorCode::Cancelled) { ++cancelled; return; }
+        if (!status.IsOk() || !lifetime.expired() || !task.IsFinished() || !task.GetStatus().IsOk())
+            observedCleanup = false;
+        ++completed;
+    };
+    for (unsigned index = 0; index < 16; ++index)
+    {
+        auto registered = task.WaitForCompletion(callback);
+        ExpectTrue(registered.IsOk(), "bounded terminal observer is accepted");
+        if (registered.IsOk()) subscriptions.push_back(std::move(registered.Value()));
+    }
+    ExpectCode(ErrorCode::WouldBlock, task.WaitForCompletion(callback).GetStatus(),
+        "task bounds simultaneous terminal observers");
+    if (!subscriptions.empty())
+        ExpectTrue(subscriptions.front().Cancel(), "cancelling an observer completes it independently of its task");
+    if (subscriptions.size() > 1) subscriptions[1].Reset();
+    auto discarded = task.WaitForCompletion([&](Status) { ++dropped; });
+    ExpectTrue(discarded.IsOk(), "cancelled and reset observers return registration capacity");
+    if (discarded.IsOk()) discarded.Value().Reset();
+    auto replacement = task.WaitForCompletion(callback);
+    ExpectTrue(replacement.IsOk(), "a reset registration can be replaced before completion");
+    ExpectTrue(completed == 0 && cancelled == 1 && dropped == 0,
+        "observer cancellation does not finish the running task or invoke a dropped callback");
+    gate->Open();
+    ExpectTrue(task.WaitUntil(Clock::now() + 2s).IsOk(), "observed task completes successfully");
+    ExpectTrue(executor.Stop().IsOk(), "worker joins after terminal notification delivery");
+    ExpectTrue(completed == 15 && cancelled == 1 && dropped == 0 && observedCleanup,
+        "terminal observers run once after capture cleanup and may query terminal status");
+    auto immediate = task.WaitForCompletion(callback);
+    ExpectTrue(immediate.IsOk() && completed == 16 && observedCleanup,
+        "an observer registered after completion runs immediately with the stable outcome");
+    if (immediate.IsOk()) ExpectTrue(!immediate.Value().Cancel(), "completed observer ignores late cancellation");
+}
+
 void TaskExecutorCompletionRace()
 {
     TaskExecutor executor;
@@ -351,8 +404,161 @@ void TaskExecutorCompletionRace()
         ExpectEqual(std::size_t{0}, executor.RetainedBytes(), "every race returns byte capacity exactly once");
     }
     ExpectTrue(executor.Stop().IsOk(), "race executor joins");
+    TaskExecutorCompletionSubscriptions();
 }
 
+void TaskExecutorMoveOnlyOwnership()
+{
+    struct ReentrantState
+    {
+        TaskExecutor* executor = nullptr;
+        std::atomic<int> moves{0};
+        std::atomic<int> destructions{0};
+        std::atomic<int> calls{0};
+    } reentrantState;
+    // A pointer-sized noexcept-movable target exercises implementations that
+    // keep move_only_function targets inline. Even moved-from destructors can
+    // run application code and must be able to query the executor safely.
+    struct ReentrantTask
+    {
+        explicit ReentrantTask(ReentrantState* value) : state(value) {}
+        ReentrantTask(ReentrantTask&& other) noexcept : state(other.state)
+        {
+            (void)state->executor->RetainedBytes();
+            ++state->moves;
+        }
+        ~ReentrantTask()
+        {
+            (void)state->executor->PendingCount();
+            ++state->destructions;
+        }
+        Status operator()(std::stop_token)
+        {
+            ++state->calls;
+            return Status::Ok();
+        }
+        ReentrantState* state;
+    };
+    struct Capture
+    {
+        explicit Capture(std::atomic<int>& count) : released(count) {}
+        ~Capture() { ++released; }
+        std::atomic<int>& released;
+    };
+    std::atomic<int> tasksReleased{0};
+    std::atomic<int> completionsReleased{0};
+    std::atomic<int> tasksCalled{0};
+    std::atomic<int> completionsCalled{0};
+    std::atomic<bool> completionAfterTaskRelease{false};
+    Gate gate;
+    TaskExecutor executor;
+    reentrantState.executor = &executor;
+    ExpectTrue(executor.Start({1, 2, 16}).IsOk(), "move-only executor starts");
+
+    auto completed = executor.SubmitWithCompletion(
+        [capture = std::make_unique<Capture>(tasksReleased), &tasksCalled](std::stop_token) {
+            (void)capture;
+            ++tasksCalled;
+            return Status::Ok();
+        },
+        [capture = std::make_unique<Capture>(completionsReleased), &tasksReleased,
+            &completionsCalled, &completionAfterTaskRelease](const Status& status) {
+            (void)capture;
+            completionAfterTaskRelease = status.IsOk() && tasksReleased.load() == 1;
+            ++completionsCalled;
+        }, TaskOptions{4});
+    ExpectTrue(completed.IsOk(), "unique-owned task and completion are admitted");
+    if (completed.IsOk())
+        ExpectTrue(completed.Value().WaitUntil(Clock::now() + 2s).IsOk(), "unique-owned task completes");
+    ExpectTrue(completionAfterTaskRelease.load(), "completion observes released task captures");
+    ExpectEqual(1, completionsReleased.load(), "terminal wait observes released completion captures");
+
+    const auto blocked = Accepted(executor, [&gate](std::stop_token token) {
+        gate.Enter(token);
+        return Status::Ok();
+    });
+    ExpectTrue(gate.WaitForEntered(), "worker is occupied before move-only queued cancellation");
+    auto cancelled = executor.SubmitWithCompletion(
+        [capture = std::make_unique<Capture>(tasksReleased), &tasksCalled](std::stop_token) {
+            (void)capture;
+            ++tasksCalled;
+            return Status::Ok();
+        },
+        [capture = std::make_unique<Capture>(completionsReleased), &tasksReleased,
+            &completionsCalled, &completionAfterTaskRelease](const Status& status) {
+            (void)capture;
+            completionAfterTaskRelease = status.Code() == ErrorCode::Cancelled && tasksReleased.load() == 2;
+            ++completionsCalled;
+        }, TaskOptions{4});
+    ExpectTrue(cancelled.IsOk(), "unique-owned queued task is admitted");
+    if (cancelled.IsOk())
+    {
+        ExpectTrue(cancelled.Value().RequestCancel(), "queued unique-owned task can be cancelled");
+        ExpectCode(ErrorCode::Cancelled, cancelled.Value().WaitUntil(Clock::now() + 2s),
+            "queued cancellation completes while worker is occupied");
+    }
+    ExpectTrue(completionAfterTaskRelease.load(), "cancel completion observes released queued task captures");
+    ExpectEqual(1, tasksCalled.load(), "cancelled queued task is never invoked");
+    ExpectEqual(2, completionsCalled.load(), "accepted task completions each run once");
+    ExpectEqual(2, completionsReleased.load(), "cancelled completion releases its unique capture");
+    ExpectEqual(std::size_t{0}, executor.RetainedBytes(), "queued cancellation returns retained capacity");
+
+    auto rejected = executor.SubmitWithCompletion(
+        [capture = std::make_unique<Capture>(tasksReleased)](std::stop_token) {
+            (void)capture;
+            return Status::Ok();
+        },
+        [capture = std::make_unique<Capture>(completionsReleased), &completionsCalled](const Status&) {
+            (void)capture;
+            ++completionsCalled;
+        }, TaskOptions{17});
+    ExpectCode(ErrorCode::TooLarge, rejected.GetStatus(), "oversized move-only submission is rejected");
+    ExpectEqual(3, tasksReleased.load(), "rejection releases unique task capture synchronously");
+    ExpectEqual(3, completionsReleased.load(), "rejection releases unique completion capture synchronously");
+    ExpectEqual(2, completionsCalled.load(), "rejection does not invoke completion");
+    gate.Open();
+    ExpectTrue(blocked.WaitUntil(Clock::now() + 2s).IsOk(), "occupied worker completes");
+
+    std::function<Status(std::stop_token)> legacyTask;
+    std::function<void(const Status&)> legacyCompletion;
+    ExpectCode(ErrorCode::InvalidArgument, executor.Submit(legacyTask).GetStatus(),
+        "empty legacy task retains InvalidArgument behavior");
+    ExpectCode(ErrorCode::InvalidArgument, executor.SubmitWithCompletion(legacyTask, {}).GetStatus(),
+        "empty legacy task and default completion retain InvalidArgument behavior");
+    ExpectCode(ErrorCode::InvalidArgument, executor.SubmitWithCompletion({}, legacyCompletion).GetStatus(),
+        "default task and legacy completion retain InvalidArgument behavior");
+    legacyTask = [&tasksCalled](std::stop_token) { ++tasksCalled; return Status::Ok(); };
+    auto legacy = executor.SubmitWithCompletion(legacyTask,
+        [capture = std::make_unique<Capture>(completionsReleased), &completionsCalled](const Status&) {
+            (void)capture;
+            ++completionsCalled;
+        });
+    ExpectTrue(legacy.IsOk(), "legacy lvalue task accepts a move-only completion");
+    if (legacy.IsOk())
+        ExpectTrue(legacy.Value().WaitUntil(Clock::now() + 2s).IsOk(), "mixed legacy task completes");
+    auto optionalCompletion = executor.SubmitWithCompletion(
+        [capture = std::make_unique<Capture>(tasksReleased)](std::stop_token) {
+            (void)capture;
+            return Status::Ok();
+        }, legacyCompletion);
+    ExpectTrue(optionalCompletion.IsOk(), "move-only task accepts an empty legacy optional completion");
+    if (optionalCompletion.IsOk())
+        ExpectTrue(optionalCompletion.Value().WaitUntil(Clock::now() + 2s).IsOk(),
+            "empty legacy completion does not prevent task completion");
+    auto reentrant = executor.Submit(ReentrantTask{&reentrantState});
+    ExpectTrue(reentrant.IsOk(), "small reentrant move-only task is accepted");
+    if (reentrant.IsOk())
+        ExpectTrue(reentrant.Value().WaitUntil(Clock::now() + 2s).IsOk(),
+            "callback moves and destruction can query the executor without deadlocking");
+    ExpectTrue(executor.Stop().IsOk(), "move-only executor stops");
+    ExpectEqual(1, reentrantState.calls.load(), "reentrant task runs exactly once");
+    ExpectTrue(reentrantState.moves.load() > 0 && reentrantState.destructions.load() > 0,
+        "move constructor and destructor both complete their executor queries");
+    ExpectEqual(4, tasksReleased.load(), "all owned task captures are released");
+    ExpectEqual(4, completionsReleased.load(), "all owned completion captures are released");
+}
+
+const ServerCoreTest::CheckRegistration moveOnly("Runtime.TaskExecutorMoveOnlyOwnership", TaskExecutorMoveOnlyOwnership);
 const ServerCoreTest::CheckRegistration bounded("Runtime.TaskExecutorBoundedAdmission", TaskExecutorBoundedAdmission);
 const ServerCoreTest::CheckRegistration cancellation("Runtime.TaskExecutorQueuedCancellation", TaskExecutorQueuedCancellation);
 const ServerCoreTest::CheckRegistration deadlines("Runtime.TaskExecutorDeadlinesAndExceptions", TaskExecutorDeadlinesAndExceptions);

@@ -11,6 +11,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <condition_variable>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -236,13 +238,13 @@ public:
         return wire;
     }
 
-    std::pair<unsigned int, std::string> Frame()
+    std::pair<unsigned int, std::string> Frame(bool final = true)
     {
         const auto head = Read(2);
         if (head.size() != 2) return {};
         const auto first = static_cast<unsigned char>(head[0]);
         const auto second = static_cast<unsigned char>(head[1]);
-        ExpectTrue((second & 128u) == 0 && (first & 128u) != 0, "server frames are final and unmasked");
+        ExpectTrue((second & 128u) == 0 && ((first & 128u) != 0) == final, "server frame FIN and mask bits match");
         std::uint64_t length = second & 127u;
         if (length >= 126)
         {
@@ -735,6 +737,170 @@ void ConnectionLimitAndActiveShutdown()
     ExpectTrue(draining.Stop().IsOk(), "drain-deadline server stops");
 }
 
+void WebSocketNegotiationAndFragments()
+{
+    using ServerCore::Core::ErrorCode;
+    ServerCoreTest::SocketRuntime runtime;
+    if (!runtime.IsReady()) { ExpectTrue(false, "socket runtime initializes"); return; }
+    Web::HttpServer server;
+    Web::WebSocketCallbacks invalid; invalid.subprotocols = {"same", "same"};
+    ExpectTrue(server.RegisterWebSocket("/bad", invalid).Code() == ErrorCode::InvalidArgument, "duplicate supported protocol rejects registration");
+    invalid.subprotocols = {"not a token"};
+    ExpectTrue(server.RegisterWebSocket("/bad", invalid).Code() == ErrorCode::InvalidArgument, "invalid supported protocol rejects registration");
+    Web::WebSocketCallbacks callbacks;
+    callbacks.subprotocols = {"v2", "v1"};
+    callbacks.onOpen = [](const auto& socket) {
+        ExpectTrue(socket->SendText(Web::GetWebSocketMessageControl(socket)->Subprotocol()).IsOk(), "negotiated protocol is exposed");
+    };
+    ExpectTrue(server.RegisterWebSocket("/ws", callbacks).IsOk(), "subprotocol route registers");
+    Web::WebSocketCallbacks fragmented;
+    fragmented.onOpen = [](const auto& socket) {
+        auto control = Web::GetWebSocketMessageControl(socket);
+        auto result = control->BeginMessage(Web::WebSocketMessageType::Text);
+        ExpectTrue(result.IsOk(), "text writer reserves the message lane"); if (!result.IsOk()) return;
+        auto writer = std::move(result).Value();
+        ExpectTrue(writer->Write(Bytes(std::string("A\xf0", 2)), false).IsOk(), "UTF8 prefix can span fragments");
+        ExpectTrue(socket->SendText("x").Code() == ErrorCode::AlreadyExists, "ordinary data cannot interleave");
+        ExpectTrue(control->BeginMessage(Web::WebSocketMessageType::Binary).GetStatus().Code() == ErrorCode::AlreadyExists,
+            "another writer cannot interleave");
+        ExpectTrue(socket->Ping(Bytes("p")).IsOk(), "control frame may interleave");
+        ExpectTrue(writer->Write(Bytes("x"), true).Code() == ErrorCode::InvalidArgument, "invalid continuation changes no state");
+        ExpectTrue(writer->Write(Bytes(std::string("\x9f\x98\x80" "B", 4)), true).IsOk(), "valid UTF8 continuation completes");
+        ExpectTrue(writer->Write({}, true).Code() == ErrorCode::Closed, "finished writer cannot send twice");
+        writer = std::move(control->BeginMessage(Web::WebSocketMessageType::Binary)).Value();
+        ExpectTrue(writer->Write(Bytes("1234"), false).IsOk(), "binary writer starts");
+        ExpectTrue(writer->Write(Bytes("567"), true).Code() == ErrorCode::TooLarge, "total message size is bounded");
+        ExpectTrue(writer->Write(Bytes("56"), true).IsOk(), "oversized attempt did not mutate message size");
+        ExpectTrue(socket->SendText("end").IsOk(), "finished writer releases data lane");
+    };
+    ExpectTrue(server.RegisterWebSocket("/fragments", std::move(fragmented)).IsOk(), "fragment route registers");
+    Web::WebSocketCallbacks aborted;
+    aborted.onMessage = [](const auto& socket, const auto&) {
+        auto writer = std::move(Web::GetWebSocketMessageControl(socket)->BeginMessage(Web::WebSocketMessageType::Binary)).Value();
+        ExpectTrue(writer->Write(Bytes("a"), false).IsOk(), "abandoned writer admits initial fragment");
+    };
+    ExpectTrue(server.RegisterWebSocket("/abandon", std::move(aborted)).IsOk(), "abandon route registers");
+    Web::HttpServerOptions options; options.port = FreePort(); options.maxWebSocketFrameBytes = 4; options.maxWebSocketMessageBytes = 6;
+    ExpectTrue(server.Start(options).IsOk(), "WebSocket feature server starts"); if (!server.IsRunning()) return;
+    for (const auto offered : {std::string("Sec-WebSocket-Protocol: v1, v2\r\n"),
+        std::string("Sec-WebSocket-Protocol: v1\r\nSec-WebSocket-Protocol: v2\r\n"), std::string("Sec-WebSocket-Protocol: other\r\n"), std::string{}})
+    {
+        Client client(server.Port()); auto request = handshake; request.insert(request.size() - 2, offered); client.Send(request);
+        const auto response = client.Response(); const bool matched = offered.find("v1") != std::string::npos;
+        ExpectTrue(response.starts_with("HTTP/1.1 101 "), "valid offered protocols upgrade");
+        ExpectTrue((response.find("Sec-WebSocket-Protocol: v2\r\n") != std::string::npos) == matched, "server preference wins and no match omits header");
+        ExpectEqual(matched ? std::string("v2") : std::string{}, client.Frame().second, "connection reports selected protocol");
+    }
+    for (const auto offered : {"Sec-WebSocket-Protocol: v1, v1\r\n", "Sec-WebSocket-Protocol: v1\r\nSec-WebSocket-Protocol: v1\r\n",
+        "Sec-WebSocket-Protocol: bad token\r\n", "Sec-WebSocket-Protocol: v1,\r\n"})
+    {
+        Client client(server.Port()); auto request = handshake; request.insert(request.size() - 2, offered); client.Send(request);
+        ExpectTrue(client.Response().starts_with("HTTP/1.1 400 "), "invalid/duplicate offered protocol rejects handshake");
+    }
+    {
+        Client client(server.Port()); auto request = handshake; request.replace(4, 3, "/fragments"); client.Send(request);
+        ExpectTrue(client.Response().starts_with("HTTP/1.1 101 "), "fragment connection upgrades");
+        auto frame = client.Frame(false); ExpectTrue(frame.first == 1 && frame.second == std::string("A\xf0", 2), "first frame has Text opcode and FIN clear");
+        frame = client.Frame(); ExpectTrue(frame.first == 9 && frame.second == "p", "Ping interleaves between data fragments");
+        frame = client.Frame(); ExpectTrue(frame.first == 0 && frame.second == std::string("\x9f\x98\x80" "B", 4), "last frame is final continuation");
+        frame = client.Frame(false); ExpectTrue(frame.first == 2 && frame.second == "1234", "binary message starts with Binary opcode");
+        frame = client.Frame(); ExpectTrue(frame.first == 0 && frame.second == "56", "message byte limit includes previous frames");
+        ExpectEqual(std::string("end"), client.Frame().second, "ordinary sends resume after final fragment");
+    }
+    {
+        Client client(server.Port()); auto request = handshake; request.replace(4, 3, "/abandon"); client.Send(request);
+        ExpectTrue(client.Response().starts_with("HTTP/1.1 101 "), "abandon connection upgrades before abort trigger");
+        client.Send(MaskedFrame(1, "go"));
+        char buffer[64]; while (ServerCoreTest::Receive(client.socket, buffer, sizeof(buffer)) > 0) {}
+        ExpectTrue(client.Closed(), "dropping a partially written message closes transport");
+    }
+    ExpectTrue(server.Stop().IsOk(), "feature server stops");
+    for (const auto invalidText : {std::string("\xe0\x80", 2), std::string("\xed\xa0", 2), std::string("\xf4\x90", 2), std::string("\xff", 1)})
+    {
+        Detail::Utf8FragmentState state;
+        ExpectTrue(!state.Append(Bytes(invalidText), false), "invalid partial scalar is rejected before wire admission");
+    }
+}
+
+void WebSocketHeartbeatCorrelation()
+{
+    ServerCoreTest::SocketRuntime runtime;
+    if (!runtime.IsReady()) { ExpectTrue(false, "socket runtime initializes"); return; }
+    Web::HttpServer server; ExpectTrue(server.RegisterWebSocket("/ws", {}).IsOk(), "heartbeat route registers");
+    Web::HttpServerOptions options; options.port = FreePort(); options.webSocketPingInterval = std::chrono::milliseconds(30);
+    options.webSocketPongTimeout = std::chrono::milliseconds(120); options.webSocketCloseTimeout = std::chrono::milliseconds(80);
+    ExpectTrue(server.Start(options).IsOk(), "heartbeat server starts"); if (!server.IsRunning()) return;
+    Client client(server.Port()); client.Send(handshake); ExpectTrue(client.Response().starts_with("HTTP/1.1 101 "), "heartbeat connection upgrades");
+    const auto first = client.Frame(); ExpectTrue(first.first == 9 && first.second.size() == 16, "automatic ping carries correlation payload");
+    client.Send(MaskedFrame(10, first.second));
+    const auto second = client.Frame(); ExpectTrue(second.first == 9 && second.second != first.second, "matching pong permits next distinct heartbeat");
+    client.Send(MaskedFrame(10, first.second));
+    const auto close = client.Frame(); ExpectTrue(close.first == 8 && close.second.size() >= 2 && close.second.substr(0, 2) == std::string("\x03\xe9", 2),
+        "stale pong does not postpone heartbeat timeout");
+    ExpectTrue(client.Closed(), "unresponsive peer closes within close deadline");
+    ExpectTrue(server.Stop().IsOk(), "heartbeat server stops");
+}
+
+void WebSocketFragmentBackpressure()
+{
+    using ServerCore::Core::ErrorCode;
+    ServerCoreTest::SocketRuntime runtime;
+    if (!runtime.IsReady()) { ExpectTrue(false, "socket runtime initializes"); return; }
+    std::mutex mutex; std::condition_variable changed;
+    std::shared_ptr<Web::WebSocketMessageWriter> writer;
+    std::size_t admitted = 0; bool blocked = false, finished = false;
+    Web::HttpServer server;
+    Web::WebSocketCallbacks callbacks;
+    callbacks.onOpen = [&](const auto& socket) {
+        auto created = Web::GetWebSocketMessageControl(socket)->BeginMessage(Web::WebSocketMessageType::Binary);
+        if (!created.IsOk()) { std::lock_guard lock(mutex); finished = true; changed.notify_all(); return; }
+        auto current = std::move(created).Value(); const std::string payload(64 * 1024, 'x');
+        std::size_t count = 0; bool pressure = false;
+        for (; count < 128; ++count) {
+            const auto result = current->Write(Bytes(payload), false);
+            if (!result.IsOk()) { pressure = result.Code() == ErrorCode::WouldBlock; break; }
+        }
+        { std::lock_guard lock(mutex); writer = std::move(current); admitted = count; blocked = pressure; finished = true; }
+        changed.notify_all();
+    };
+    ExpectTrue(server.RegisterWebSocket("/ws", std::move(callbacks)).IsOk(), "backpressure route registers");
+    Web::HttpServerOptions options; options.port = FreePort(); options.maxWebSocketMessageBytes = 16 * 1024 * 1024;
+    ExpectTrue(server.Start(options).IsOk(), "fragment pressure server starts"); if (!server.IsRunning()) return;
+    Client client(server.Port()); const int receiveBytes = 64 * 1024;
+    ExpectTrue(::setsockopt(client.socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&receiveBytes), sizeof(receiveBytes)) == 0,
+        "small receive window stops unbounded transport progress");
+    client.Send(handshake); ExpectTrue(client.Response().starts_with("HTTP/1.1 101 "), "pressure connection upgrades");
+    bool completed = false;
+    {
+        std::unique_lock lock(mutex);
+        completed = changed.wait_for(lock, std::chrono::seconds(3), [&] { return finished; });
+        ExpectTrue(completed, "bounded producer reports capacity pressure");
+    }
+    if (!completed) { (void)server.Stop(); return; }
+    ExpectTrue(blocked && admitted != 0 && writer, "unread peer yields WouldBlock before message limit");
+    if (!writer) { (void)server.Stop(); return; }
+    std::atomic<bool> ready{false};
+    auto wait = writer->WaitForWriteCapacity(64 * 1024, [&](auto status) { ready.store(status.IsOk()); });
+    ExpectTrue(wait.IsOk(), "fragment capacity notification registers");
+    for (std::size_t index = 0; index < admitted; ++index) {
+        const auto frame = client.Frame(false);
+        ExpectTrue(frame.first == (index == 0 ? 2u : 0u) && frame.second == std::string(64 * 1024, 'x'),
+            "each successful write appears exactly once");
+        if (frame.second.empty()) break;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!ready.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    ExpectTrue(ready.load(), "draining frames signals send capacity");
+    if (wait.IsOk()) wait.Value().Reset();
+    ExpectTrue(writer->Write(Bytes("done"), true).IsOk(), "retry after pressure completes same message");
+    const auto last = client.Frame(); ExpectTrue(last.first == 0 && last.second == "done", "rejected frame added no hidden bytes");
+    writer.reset();
+    ExpectTrue(server.Stop().IsOk(), "pressure server stops");
+}
+
+ServerCoreTest::CheckRegistration wsFeatures("Web.WebSocketNegotiationAndFragments", &WebSocketNegotiationAndFragments);
+ServerCoreTest::CheckRegistration wsHeartbeat("Web.WebSocketHeartbeatCorrelation", &WebSocketHeartbeatCorrelation);
+ServerCoreTest::CheckRegistration wsPressure("Web.WebSocketFragmentBackpressure", &WebSocketFragmentBackpressure);
 ServerCoreTest::CheckRegistration httpParser("Web.HttpParserConformance", &HttpParserConformance);
 ServerCoreTest::CheckRegistration httpRejected("Web.HttpParserRejectsAmbiguousRequests", &HttpParserRejectsAmbiguousRequests);
 ServerCoreTest::CheckRegistration wsProtocol("Web.WebSocketProtocolConformance", &WebSocketProtocolConformance);

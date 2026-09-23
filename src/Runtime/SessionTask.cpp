@@ -32,7 +32,7 @@ struct Bridge
 {
     JobRunner::Reservation reservation;
     std::shared_ptr<Payload> payload;
-    std::function<void()> invoke;
+    JobRunner::Job invoke;
     std::shared_ptr<LinkedCancellation> cancellation;
 };
 }

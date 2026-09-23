@@ -4,7 +4,7 @@
 #include "Net/ConnectionInternal.h"
 #include "Net/IoContextInternal.h"
 #include "Net/IoOperationInternal.h"
-#include "Net/Ipv4EndpointInternal.h"
+#include "Net/EndpointInternal.h"
 #include "Net/WinsockInternal.h"
 #include "ServerCore/Core/Assert.h"
 #include "ServerCore/Core/Logging.h"
@@ -35,9 +35,9 @@ constexpr std::size_t PendingAcceptCount = 4;
 /// <summary>AcceptEx가 주소 하나를 적는 데 필요한 자리다.</summary>
 /// <remarks>
 /// AcceptEx 규격이 실제 주소 크기보다 16바이트를 더 요구한다. 이 여유를 빼면 호출이
-/// WSAEINVAL로 실패한다. IPv4만 다루므로 sockaddr_in을 기준으로 잡는다.
+/// WSAEINVAL로 실패한다. IPv4와 IPv6를 모두 담도록 sockaddr_storage를 기준으로 잡는다.
 /// </remarks>
-constexpr std::size_t AcceptAddressSize = sizeof(sockaddr_in) + 16;
+constexpr std::size_t AcceptAddressSize = sizeof(sockaddr_storage) + 16;
 
 /// <summary>리슨 소켓을 닫은 뒤 남은 수락 요청의 취소 완료를 기다리는 시간 제한이다.</summary>
 /// <remarks>
@@ -97,7 +97,7 @@ public:
     void HandleAcceptedSocket(SOCKET accepted, SOCKET listenSocketAtAccept, IoContext& context,
         const std::function<void(std::shared_ptr<Connection>)>& handler,
         const std::shared_ptr<WinsockScope>& winsockScope,
-        const std::shared_ptr<SendBudget>& sendBudget) noexcept;
+        const std::shared_ptr<SendBudget>& sendBudget,Core::IpEndpoint local,Core::IpEndpoint remote) noexcept;
 
     /// <summary>완료 뒤 인계 몫을 내리고 다음 수락을 준비한다. 절대 I/O 루프 밖으로 던지지 않는다.</summary>
     void CompleteHandoff(AcceptOperation& operation) noexcept;
@@ -107,12 +107,15 @@ public:
 
     std::shared_ptr<WinsockScope> winsock;
     SOCKET listenSocket = INVALID_SOCKET;
+    int family = AF_INET;
+    Core::IpEndpoint localEndpoint;
 
     /// <summary>원자인 이유는 Port()가 noexcept라 잠금을 잡을 수 없기 때문이다.</summary>
     std::atomic<std::uint16_t> port{ 0 };
 
     IoContext* io = nullptr;
     LPFN_ACCEPTEX acceptEx = nullptr;
+    LPFN_GETACCEPTEXSOCKADDRS getAcceptAddresses = nullptr;
     SharedConnectionHandler connectionHandler;
     std::shared_ptr<Core::ILogger> logger;
     std::shared_ptr<SendBudget> sendBudget = std::make_shared<SendBudget>(SendQueueLimits{}.totalBytes);
@@ -145,7 +148,7 @@ Core::Status Acceptor::State::PostAcceptLocked(AcceptOperation& operation)
     }
 
     const SOCKET accepted =
-        ::WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
+        ::WSASocketW(family, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
     if (accepted == INVALID_SOCKET)
     {
         return MakeSocketFailure("WSASocketW(accept)", ::WSAGetLastError());
@@ -192,6 +195,7 @@ void Acceptor::State::CloseListenSocketLocked()
     ::closesocket(listenSocket);
     listenSocket = INVALID_SOCKET;
     port.store(0, std::memory_order_release);
+    localEndpoint = {};
 }
 
 void Acceptor::State::NotifyAcceptStateChangedLocked()
@@ -202,7 +206,7 @@ void Acceptor::State::NotifyAcceptStateChangedLocked()
 void Acceptor::State::HandleAcceptedSocket(SOCKET accepted, SOCKET listenSocketAtAccept,
     IoContext& context, const std::function<void(std::shared_ptr<Connection>)>& handler,
     const std::shared_ptr<WinsockScope>& winsockScope,
-    const std::shared_ptr<SendBudget>& sendBudgetValue) noexcept
+    const std::shared_ptr<SendBudget>& sendBudgetValue,Core::IpEndpoint local,Core::IpEndpoint remote) noexcept
 {
     std::shared_ptr<TcpConnection> connection;
     try
@@ -227,7 +231,7 @@ void Acceptor::State::HandleAcceptedSocket(SOCKET accepted, SOCKET listenSocketA
             return;
         }
 
-        connection = TcpConnection::Create(accepted, winsockScope, sendBudgetValue);
+        connection = TcpConnection::Create(accepted, winsockScope, sendBudgetValue,local,remote);
 
         // 처리기가 먼저다. 처리기 안에서 관찰자를 걸어야 첫 바이트를 놓치지 않는다.
         if (handler)
@@ -322,6 +326,7 @@ void Acceptor::State::OnIoCompleted(IoOperation& operation, DWORD, unsigned long
     SharedConnectionHandler handler;
     std::shared_ptr<WinsockScope> winsockScope;
     std::shared_ptr<SendBudget> sendBudgetValue;
+    Core::IpEndpoint local,remote;
     bool isStopping = false;
     bool handoffActive = false;
 
@@ -352,6 +357,13 @@ void Acceptor::State::OnIoCompleted(IoOperation& operation, DWORD, unsigned long
                 handler = connectionHandler;
                 winsockScope = winsock;
                 sendBudgetValue = sendBudget;
+                sockaddr *localAddress=nullptr,*remoteAddress=nullptr;
+                int localLength=0,remoteLength=0;
+                getAcceptAddresses(acceptOperation.addressBuffer.data(),0,
+                    static_cast<DWORD>(AcceptAddressSize),static_cast<DWORD>(AcceptAddressSize),
+                    &localAddress,&localLength,&remoteAddress,&remoteLength);
+                local=FromNativeEndpoint(localAddress,localLength);
+                remote=FromNativeEndpoint(remoteAddress,remoteLength);
             }
         }
 
@@ -361,7 +373,7 @@ void Acceptor::State::OnIoCompleted(IoOperation& operation, DWORD, unsigned long
         if (canHandOver)
         {
             HandleAcceptedSocket(
-                accepted, listenSocketAtAccept, *context, *handler, winsockScope, sendBudgetValue);
+                accepted, listenSocketAtAccept, *context, *handler, winsockScope, sendBudgetValue,local,remote);
         }
         else if (accepted != INVALID_SOCKET)
         {
@@ -424,6 +436,11 @@ Acceptor::~Acceptor()
 Core::Status Acceptor::Listen(
     const std::string_view listenAddress, const std::uint16_t port, const int backlog)
 {
+    const auto parsed=Core::IpEndpoint::Parse(listenAddress,port);
+    return Listen(parsed.IsOk()?parsed.Value():Core::IpEndpoint{},backlog);
+}
+Core::Status Acceptor::Listen(const Core::IpEndpoint& endpoint,const int backlog,const bool ipv6Only)
+{
     SERVERCORE_ASSERT(backlog > 0, "Listen() was given a backlog that is not positive");
 
     const std::lock_guard<std::mutex> guard(mState->mutex);
@@ -434,13 +451,13 @@ Core::Status Acceptor::Listen(
             Core::ErrorCode::AlreadyExists, "Listen() was called while already listening");
     }
 
-    if (port == 0)
+    if (endpoint.port == 0)
     {
         return Core::Status::Fail(Core::ErrorCode::InvalidArgument, "listen port must not be zero");
     }
 
-    sockaddr_in address{};
-    if (!TryParseIpv4Endpoint(listenAddress, port, address))
+    NativeEndpoint address;
+    if (!ToNativeEndpoint(endpoint,address))
         return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
 
     Core::Result<std::shared_ptr<WinsockScope>> winsock = AcquireWinsock();
@@ -450,10 +467,16 @@ Core::Status Acceptor::Listen(
     }
 
     const SOCKET listenSocket =
-        ::WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
+        ::WSASocketW(address.Family(), SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
     if (listenSocket == INVALID_SOCKET)
     {
         return MakeSocketFailure("WSASocketW(listen)", ::WSAGetLastError());
+    }
+    if (!SetIpv6Only(listenSocket,address.Family(),ipv6Only))
+    {
+        auto failure=MakeSocketFailure("setsockopt(IPV6_V6ONLY)",::WSAGetLastError());
+        ::closesocket(listenSocket);
+        return failure;
     }
 
     // SO_EXCLUSIVEADDRUSE를 켜고 SO_REUSEADDR는 켜지 않는다. Windows에서 SO_REUSEADDR는
@@ -469,7 +492,7 @@ Core::Status Acceptor::Listen(
         return std::move(failure);
     }
 
-    if (::bind(listenSocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) ==
+    if (::bind(listenSocket, address.Address(), address.length) ==
         SOCKET_ERROR)
     {
         Core::Status failure = MakeSocketFailure("bind", ::WSAGetLastError());
@@ -486,7 +509,9 @@ Core::Status Acceptor::Listen(
 
     mState->winsock = std::move(winsock.Value());
     mState->listenSocket = listenSocket;
-    mState->port.store(port, std::memory_order_release);
+    mState->family = address.Family();
+    mState->localEndpoint = ReadSocketEndpoint(listenSocket,false);
+    mState->port.store(endpoint.port, std::memory_order_release);
     mState->stopping = false;
 
     return Core::Status::Ok();
@@ -523,6 +548,12 @@ Core::Status Acceptor::SetSendQueueLimits(const SendQueueLimits& limits)
     return Core::Status::Ok();
 }
 
+Core::IpEndpoint Acceptor::LocalEndpoint() const noexcept
+{
+    const std::lock_guard guard(mState->mutex);
+    return mState->localEndpoint;
+}
+
 Core::Status Acceptor::Start(IoContext& io)
 {
     const std::lock_guard<std::mutex> guard(mState->mutex);
@@ -553,6 +584,14 @@ Core::Status Acceptor::Start(IoContext& io)
             "WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER, AcceptEx)", ::WSAGetLastError());
     }
 
+    GUID addressesGuid=WSAID_GETACCEPTEXSOCKADDRS;
+    if (::WSAIoctl(mState->listenSocket,SIO_GET_EXTENSION_FUNCTION_POINTER,&addressesGuid,
+            sizeof addressesGuid,&mState->getAcceptAddresses,sizeof mState->getAcceptAddresses,
+            &returnedBytes,nullptr,nullptr)==SOCKET_ERROR)
+    {
+        mState->io=nullptr;
+        return MakeSocketFailure("WSAIoctl(GetAcceptExSockaddrs)",::WSAGetLastError());
+    }
     Core::Status attached = IoContextAccess::AssociateSocket(io, mState->listenSocket);
     if (!attached.IsOk())
     {

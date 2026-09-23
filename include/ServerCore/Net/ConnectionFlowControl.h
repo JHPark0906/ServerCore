@@ -1,6 +1,9 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include "ServerCore/Core/Error.h"
+#include "ServerCore/Core/CompletionSubscription.h"
 
 #include <cstddef>
 #include <functional>
@@ -12,30 +15,8 @@ namespace ServerCore::Net
 class Connection;
 class SendCapacityState;
 
-// A one-shot notification registration. Reset/destruction suppresses a pending
-// callback and waits for an already running callback, except from that callback
-// itself. Cancel completes an outstanding registration with Cancelled instead.
-// Serialize operations on the same movable subscription object. Token-driven
-// cancellation and transport completion are safe to race with Reset/Cancel.
-class SendCapacitySubscription
-{
-public:
-    class State;
-    SendCapacitySubscription() noexcept = default;
-    ~SendCapacitySubscription();
-    SendCapacitySubscription(SendCapacitySubscription&& other) noexcept;
-    SendCapacitySubscription& operator=(SendCapacitySubscription&& other) noexcept;
-    SendCapacitySubscription(const SendCapacitySubscription&) = delete;
-    SendCapacitySubscription& operator=(const SendCapacitySubscription&) = delete;
-    void Reset() noexcept;
-    bool Cancel() noexcept;
-    [[nodiscard]] bool IsPending() const noexcept;
-
-private:
-    friend class SendCapacityState;
-    explicit SendCapacitySubscription(std::shared_ptr<State> state) noexcept;
-    std::shared_ptr<State> mState;
-};
+// Compatibility spelling; lifetime is shared with Session and other layers.
+using SendCapacitySubscription = Core::CompletionSubscription;
 
 // Optional extension: existing Connection implementations need not change their
 // virtual interface. All TCP connections created by ServerCore implement this.
@@ -61,7 +42,7 @@ public:
         std::function<void(Core::Status)> callback, std::stop_token cancellation = {}) = 0;
 };
 
-[[nodiscard]] std::shared_ptr<ConnectionFlowControl> GetConnectionFlowControl(
+[[nodiscard]] SERVERCORE_API std::shared_ptr<ConnectionFlowControl> GetConnectionFlowControl(
     const std::shared_ptr<Connection>& connection) noexcept;
 
 // Payload storage limits, not total process/OS socket memory. Configure before

@@ -2,6 +2,10 @@
 #include "ServerCore/Net/Acceptor.h"
 #include "ServerCore/Net/IoContext.h"
 #include "C/Internal.h"
+#include "C/EndpointInternal.h"
+#include "C/ObservationInternal.h"
+#include "Observability/MetricsInternal.h"
+#include "C/GameExecutionInternal.h"
 #include <atomic>
 #include <unordered_map>
 
@@ -45,29 +49,57 @@ struct TcpOwner {
     ~TcpOwner() { peer->connection->Close(); peer->events.Close(); }
     std::shared_ptr<TcpPeer> peer;
 };
+TcpConnectionLease RetainTcpConnection(const sc_tcp_connection* value) noexcept
+{
+    return value ? TcpConnectionLease{value->owner, value->owner->peer->connection} : TcpConnectionLease{};
+}
 struct TcpState : std::enable_shared_from_this<TcpState> {
-    explicit TcpState(const sc_tcp_options& value) : address(Text(value.listen_address)), options(value),
+    explicit TcpState(const sc_tcp_options& value,bool only) : address(Text(value.listen_address)), options(value),ipv6Only(only),
         budget(std::make_shared<Budget>(value.max_event_count, value.max_event_bytes)),
         slots(std::make_shared<Budget>(value.max_connections, (std::numeric_limits<size_t>::max)())) {}
     void Accepted(std::shared_ptr<N::Connection> connection) noexcept {
         try {
             auto slot = slots->Acquire(1);
-            if (!slot || stopping.load()) { connection->Close(); return; }
+            if (!slot || stopping.load()) {
+                Rejected(stopping.load() ? Core::ErrorCode::Cancelled : Core::ErrorCode::WouldBlock);
+                connection->Close(); return;
+            }
             auto peer = std::make_shared<TcpPeer>(); peer->owner = weak_from_this(); peer->connection = connection;
             peer->flow = N::GetConnectionFlowControl(connection); peer->budget = budget; peer->slot = std::move(slot);
             peer->terminal = std::make_unique<sc_tcp_event>(); peer->terminal->slot = peer->slot;
             auto event = std::make_unique<sc_tcp_connection>(); event->owner = std::make_shared<TcpOwner>(peer);
             {
                 std::lock_guard lock(mutex);
-                if (nextId == 0) { connection->Close(); return; }
+                if (nextId == 0) { Rejected(Core::ErrorCode::TooLarge); connection->Close(); return; }
                 peer->id = nextId++; peers.emplace(peer->id, peer);
             }
             connection->SetObserver(peer);
             (void)accepted.Push(std::move(event));
-        } catch (...) { connection->Close(); }
+        } catch (...) { Rejected(Core::ErrorCode::PlatformError); connection->Close(); }
     }
-    void Disconnected(uint64_t id) noexcept {
+    void Rejected(Core::ErrorCode reason) noexcept {
+        Observability::Detail::Add(rejected[static_cast<size_t>(Observability::ClassifyReason(reason))]);
+    }
+    void Disconnected(uint64_t id, Core::ErrorCode reason) noexcept {
+        Observability::Detail::Add(closed[static_cast<size_t>(Observability::ClassifyReason(reason))]);
         { std::lock_guard lock(mutex); peers.erase(id); } changed.notify_all();
+    }
+    Observability::ObservationSnapshot Observe() {
+        using namespace Observability;
+        ObservationSnapshot value; value.protocol = Observability::Protocol::Tcp;
+        value.lifecycle = stopped.load() ? Lifecycle::Stopped : stopping.load() ? Lifecycle::Draining :
+            running.load() ? Lifecycle::Running : Lifecycle::Created;
+        value.available = Connections | PendingWork | ReceiveBytes | SendBytes | RetainedBytes | ClosedEvents | RejectedEvents | TimedOutEvents;
+        { std::lock_guard guard(mutex); value.connections = peers.size();
+          for (const auto& [id, peer] : peers) { (void)id; Detail::Add(value.sendBytes, peer->flow->RetainedSendBytes()); } }
+        { std::lock_guard guard(budget->mutex); value.pendingWork = budget->count; value.receiveBytes = budget->bytes; }
+        value.retainedBytes = value.receiveBytes; Detail::Add(value.retainedBytes, value.sendBytes);
+        for (size_t i = 0; i < EventReasonCount; ++i) { value.closed[i] = closed[i].load(); value.rejected[i] = rejected[i].load(); }
+        value.timedOut = value.closed[static_cast<size_t>(EventReason::Timeout)];
+        if (value.lifecycle == Lifecycle::Draining || value.lifecycle == Lifecycle::Stopped) {
+            value.available |= DrainRemaining; value.drainRemaining = value.connections;
+        }
+        return value;
     }
     sc_status Start() {
         std::lock_guard lock(lifecycle);
@@ -77,17 +109,19 @@ struct TcpState : std::enable_shared_from_this<TcpState> {
         if (!status.IsOk()) return Code(status);
         acceptor.SetConnectionHandler([weak = weak_from_this()](auto connection) {
             if (auto self = weak.lock()) self->Accepted(std::move(connection)); else connection->Close(); });
-        status = acceptor.Listen(address, options.port, 64);
+        auto endpoint=Core::IpEndpoint::Parse(address,options.port);
+        status = endpoint.IsOk() ? acceptor.Listen(endpoint.Value(),64,ipv6Only) : std::move(endpoint).TakeStatus();
         if (!status.IsOk()) return Code(status);
         status = io.Start(static_cast<int>(options.io_threads));
         if (!status.IsOk()) { acceptor.Stop(); return Code(status); }
         status = acceptor.Start(io);
         if (!status.IsOk()) { acceptor.Stop(); io.Stop(); }
+        else running.store(true);
         return Code(status);
     }
     sc_status Stop() {
         std::lock_guard lock(lifecycle);
-        stopping.store(true); acceptor.Stop(); accepted.Close();
+        stopping.store(true); running.store(false); acceptor.Stop(); accepted.Close();
         for (;;) {
             std::shared_ptr<TcpPeer> peer;
             { std::lock_guard peersLock(mutex); if (peers.empty()) break; peer = peers.begin()->second; }
@@ -95,14 +129,17 @@ struct TcpState : std::enable_shared_from_this<TcpState> {
             std::unique_lock peersLock(mutex);
             changed.wait(peersLock, [&] { return peers.find(peer->id) == peers.end(); });
         }
-        io.Stop(); return SC_OK;
+        io.Stop(); stopped.store(true); return SC_OK;
     }
     const std::string address;
     const sc_tcp_options options;
+    const bool ipv6Only;
     std::mutex lifecycle, mutex;
     std::condition_variable changed;
     bool used = false;
     std::atomic<bool> stopping{false};
+    std::atomic<bool> running{false}, stopped{false};
+    std::array<std::atomic<uint64_t>, Observability::EventReasonCount> closed{}, rejected{};
     uint64_t nextId = 1;
     N::IoContext io;
     N::Acceptor acceptor;
@@ -111,14 +148,19 @@ struct TcpState : std::enable_shared_from_this<TcpState> {
     PullQueue<sc_tcp_connection> accepted;
 };
 void TcpPeer::OnDisconnected(Core::Status reason) {
+    const auto outcome = failure.load() != SC_OK ? failure.load() : Code(reason);
     if (terminal) {
-        terminal->status = failure.load() != SC_OK ? failure.load() : Code(reason);
+        terminal->status = outcome;
         events.Finish(std::move(terminal));
     }
-    if (auto state = owner.lock()) state->Disconnected(id);
+    if (auto state = owner.lock()) state->Disconnected(id, static_cast<Core::ErrorCode>(outcome));
 }
 }
 extern "C" {
+sc_status sc_tcp_server_get_observation(const sc_tcp_server* server, sc_observation* out) {
+    if (!server || !C::Version(out)) return SC_INVALID_ARGUMENT;
+    return C::Protect([&] { return C::CopyObservation(server->state->Observe(), out); });
+}
 sc_status sc_tcp_options_init(sc_tcp_options* options, size_t size) {
     if (!options || size < sizeof(*options)) return SC_INVALID_ARGUMENT;
     *options = {}; options->abi_version = SC_ABI_VERSION; options->struct_size = sizeof(*options);
@@ -127,13 +169,29 @@ sc_status sc_tcp_options_init(sc_tcp_options* options, size_t size) {
     options->connection_send_bytes = 1024 * 1024; options->total_send_bytes = 256 * 1024 * 1024; return SC_OK;
 }
 sc_status sc_tcp_server_create(const sc_tcp_options* options, sc_tcp_server** out) {
+    return sc_tcp_server_create_ex(options,1,out);
+}
+sc_status sc_tcp_server_create_ex(const sc_tcp_options* options,uint32_t ipv6Only,sc_tcp_server** out) {
     if (!out) return SC_INVALID_ARGUMENT;
     *out = nullptr;
-    if (!C::Version(options) || !C::Valid(options->listen_address) || options->listen_address.len > 64 || options->reserved ||
+    if (ipv6Only>1 || !C::Version(options) || !C::Valid(options->listen_address) || options->listen_address.len > 64 || options->reserved ||
         !options->io_threads || options->io_threads > 64 || !options->max_connections || options->max_connections > 65536 ||
         !options->max_event_count || options->max_event_count > 65536 || !options->max_event_bytes) return SC_INVALID_ARGUMENT;
     return C::Protect([&]() -> sc_status { auto result = std::make_unique<sc_tcp_server>();
-        result->state = std::make_shared<C::TcpState>(*options); *out = result.release(); return SC_OK; });
+        result->state = std::make_shared<C::TcpState>(*options,ipv6Only!=0); *out = result.release(); return SC_OK; });
+}
+sc_status sc_tcp_server_local_endpoint(const sc_tcp_server* server,sc_ip_endpoint* out) {
+    if (!server||!out) return SC_INVALID_ARGUMENT;
+    const auto endpoint=server->state->acceptor.LocalEndpoint();
+    if (!endpoint.IsValid()) return SC_CLOSED;
+    *out=C::FromEndpoint(endpoint); return SC_OK;
+}
+sc_status sc_tcp_connection_endpoints(const sc_tcp_connection* connection,sc_ip_endpoint* local,sc_ip_endpoint* remote) {
+    if (!connection||!local||!remote) return SC_INVALID_ARGUMENT;
+    const auto& native=connection->owner->peer->connection;
+    *local=C::FromEndpoint(native->LocalEndpoint());
+    *remote=C::FromEndpoint(native->RemoteEndpoint());
+    return SC_OK;
 }
 sc_status sc_tcp_server_start(sc_tcp_server* server) {
     if (!server) return SC_INVALID_ARGUMENT;
@@ -158,7 +216,11 @@ sc_status sc_tcp_connection_retain(const sc_tcp_connection* connection, sc_tcp_c
 uint64_t sc_tcp_connection_id(const sc_tcp_connection* connection) { return connection ? connection->owner->peer->id : 0; }
 sc_status sc_tcp_connection_send(sc_tcp_connection* connection, sc_bytes bytes) {
     if (!connection || !C::Valid(bytes)) return SC_INVALID_ARGUMENT;
-    return C::Protect([&] { return C::Code(connection->owner->peer->connection->Send(C::Bytes(bytes))); });
+    return C::Protect([&] {
+        const auto result = connection->owner->peer->connection->Send(C::Bytes(bytes));
+        if (!result.IsOk()) if (auto owner = connection->owner->peer->owner.lock()) owner->Rejected(result.Code());
+        return C::Code(result);
+    });
 }
 sc_status sc_tcp_connection_next(sc_tcp_connection* connection, uint32_t timeout, sc_tcp_event** out) {
     if (!connection) { if (out) *out = nullptr; return SC_INVALID_ARGUMENT; }
@@ -184,4 +246,12 @@ sc_status sc_tcp_event_get_view(const sc_tcp_event* event, sc_tcp_event_view* vi
 }
 void sc_tcp_event_destroy(sc_tcp_event* event) { delete event; }
 void sc_tcp_connection_destroy(sc_tcp_connection* connection) { delete connection; }
+sc_status sc_tcp_server_subscribe(sc_tcp_server* server, sc_notifier* notifier, uint64_t key, sc_subscription** out) {
+    if (!server) { if (out) *out = nullptr; return SC_INVALID_ARGUMENT; }
+    return C::Protect([&] { return server->state->accepted.Subscribe(notifier, key, out); });
+}
+sc_status sc_tcp_connection_subscribe(sc_tcp_connection* connection, sc_notifier* notifier, uint64_t key, sc_subscription** out) {
+    if (!connection) { if (out) *out = nullptr; return SC_INVALID_ARGUMENT; }
+    return C::Protect([&] { return connection->owner->peer->events.Subscribe(notifier, key, out); });
+}
 }

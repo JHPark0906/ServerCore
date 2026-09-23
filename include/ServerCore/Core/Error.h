@@ -1,7 +1,10 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include "ServerCore/Core/Assert.h"
 
+#include <expected>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -94,12 +97,12 @@ class [[nodiscard]] Status
 {
 public:
     /// <summary>성공을 뜻하는 Status를 만든다.</summary>
-    static Status Ok() noexcept;
+    SERVERCORE_API static Status Ok() noexcept;
 
     /// <summary>실패를 뜻하는 Status를 만든다.</summary>
     /// <param name="code">실패 종류. ErrorCode::Ok를 넘기는 것은 계약 위반이다.</param>
     /// <param name="message">무엇이 기대와 달랐는지에 대한 설명.</param>
-    static Status Fail(ErrorCode code, std::string message);
+    SERVERCORE_API static Status Fail(ErrorCode code, std::string message);
 
     /// <summary>설명 문자열을 할당하지 않는 실패를 만든다.</summary>
     /// <param name="code">실패 종류. ErrorCode::Ok를 넘기는 것은 계약 위반이다.</param>
@@ -107,7 +110,7 @@ public:
     /// 종료나 자원 고갈처럼 새 문자열을 확보하지 않아야 하는 경로에서 쓴다. Message()는 빈
     /// 문자열을 돌려준다.
     /// </remarks>
-    static Status FailWithoutMessage(ErrorCode code) noexcept;
+    SERVERCORE_API static Status FailWithoutMessage(ErrorCode code) noexcept;
 
     /// <summary>할당 실패를 두 번째 할당 없이 나타내는 표준 실패다.</summary>
     /// <remarks>
@@ -115,15 +118,15 @@ public:
     /// 다시 할당에 실패할 수 있다. 이 함수는 PlatformError와 빈 설명을 가진 Status를 만들며
     /// 메모리 할당을 시도하지 않는다.
     /// </remarks>
-    static Status AllocationFailure() noexcept;
+    SERVERCORE_API static Status AllocationFailure() noexcept;
 
     /// <summary>구현되지 않은 연산의 표준 실패다.</summary>
     /// <param name="what">아직 구현되지 않은 대상의 이름.</param>
-    static Status Unimplemented(std::string_view what);
+    SERVERCORE_API static Status Unimplemented(std::string_view what);
 
-    [[nodiscard]] ErrorCode Code() const noexcept;
-    [[nodiscard]] bool IsOk() const noexcept;
-    [[nodiscard]] const std::string& Message() const noexcept;
+    [[nodiscard]] SERVERCORE_API ErrorCode Code() const noexcept;
+    [[nodiscard]] SERVERCORE_API bool IsOk() const noexcept;
+    [[nodiscard]] SERVERCORE_API const std::string& Message() const noexcept;
 
 private:
     ErrorCode mCode = ErrorCode::Ok;
@@ -145,13 +148,15 @@ private:
 ///   담긴 값이 쓰기 좋다는 뜻이 아니다.
 ///
 /// 왜 기본 생성자가 없는가:
-/// 기본 생성이 되면 Result&lt;int&gt; r; 이 성공을 담은 것처럼 보인다. mStatus의 기본값이 Ok이기
-/// 때문이다. 값을 넣은 적이 없는데 IsOk()가 참인 것은 그 자체로 결함이므로 막는다.
+/// 기본 생성이 되면 Result&lt;int&gt; r; 이 명시적으로 넣지 않은 값을 성공 결과처럼 보이게 한다.
+/// 값을 넣은 적이 없는데 IsOk()가 참인 것은 그 자체로 결함이므로 막는다.
 /// 만드는 길은 FromValue와 FromStatus 둘뿐이다.
 ///
+/// 저장과 소유권:
+/// - 성공일 때만 T를 만들고, 실패일 때는 Status만 만든다. T는 기본 생성 가능할 필요가 없다.
+/// - 이동 전용 T도 지원한다. Result의 복사·이동 가능 여부는 담긴 T의 계약을 따른다.
+///
 /// 알려진 제약:
-/// - T는 기본 생성 가능해야 하고, 실패일 때도 T가 하나 만들어진다. 그 값은 쓰이지 않지만
-///   자리는 차지한다.
 /// - T가 Status인 경우는 지원하지 않는다. 두 비공개 생성자가 구분되지 않아 컴파일이 실패한다.
 ///   조용히 잘못 도는 것이 아니라 그 자리에서 멈춘다.
 ///
@@ -170,6 +175,7 @@ public:
     static Result FromStatus(Status status);
 
     [[nodiscard]] bool IsOk() const noexcept;
+    /// <summary>이 결과가 소유한 실패 Status 또는 성공 Status를 준다.</summary>
     [[nodiscard]] const Status& GetStatus() const noexcept;
 
     /// <summary>실패 Status의 소유권을 꺼낸다.</summary>
@@ -187,16 +193,22 @@ public:
     [[nodiscard]] const T& Value() const;
 
 private:
-    /// <summary>성공 결과를 만든다. mStatus는 기본값 그대로 Ok다.</summary>
+    struct ValueStorage
+    {
+        explicit ValueStorage(T&& initialValue) : value(std::move(initialValue)) {}
+        T value;
+        Status status = Status::Ok();
+    };
+
+    /// <summary>성공 결과를 만든다.</summary>
     // FromValue already owns its parameter; bind it directly rather than creating
-    // a second owning temporary before constructing mValue.
+    // a second owning temporary before constructing the stored value.
     explicit Result(T&& value);
 
-    /// <summary>실패 결과를 만든다. mValue는 기본 생성된 채로 남고 쓰이지 않는다.</summary>
+    /// <summary>실패 결과를 만든다. T는 생성하지 않는다.</summary>
     explicit Result(Status status);
 
-    Status mStatus;
-    T mValue{};
+    std::expected<ValueStorage, Status> mStorage;
 };
 
 // Result의 멤버 정의가 소스 파일이 아니라 여기 있는 이유:
@@ -206,14 +218,13 @@ private:
 
 template <typename T>
 Result<T>::Result(T&& value)
-    : mStatus(Status::Ok())
-    , mValue(std::move(value))
+    : mStorage(std::in_place, std::move(value))
 {
 }
 
 template <typename T>
 Result<T>::Result(Status status)
-    : mStatus(std::move(status))
+    : mStorage(std::unexpect, std::move(status))
 {
 }
 
@@ -230,29 +241,29 @@ template <typename T> Result<T> Result<T>::FromStatus(Status status)
 
 template <typename T> bool Result<T>::IsOk() const noexcept
 {
-    return mStatus.IsOk();
+    return mStorage.has_value();
 }
 
 template <typename T> const Status& Result<T>::GetStatus() const noexcept
 {
-    return mStatus;
+    return IsOk() ? mStorage->status : mStorage.error();
 }
 
 template <typename T> Status Result<T>::TakeStatus() && noexcept
 {
     SERVERCORE_ASSERT(!IsOk(), "TakeStatus() was called while IsOk() is true");
-    return std::move(mStatus);
+    return std::move(mStorage.error());
 }
 
 template <typename T> T& Result<T>::Value()
 {
     SERVERCORE_ASSERT(IsOk(), "Value() was called while IsOk() is false");
-    return mValue;
+    return mStorage->value;
 }
 
 template <typename T> const T& Result<T>::Value() const
 {
     SERVERCORE_ASSERT(IsOk(), "Value() was called while IsOk() is false");
-    return mValue;
+    return mStorage->value;
 }
 }

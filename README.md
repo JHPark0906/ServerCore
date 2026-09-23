@@ -1,68 +1,36 @@
 # ServerCore
 
-Windows와 Linux 서버의 구조와 구현을 학습하기 위한 **C++20 서버 코어 라이브러리**입니다. Windows IOCP·Linux epoll 기반 TCP, 비차단 UDP, HTTP/1.1·WebSocket, 메시지 프레이밍과 JSON, 세션, 디스패치, 작업 실행과 자원 예산을 제공하며, 애플리케이션별 백엔드가 그 위에 자신의 규칙을 구현합니다.
+Windows와 Linux에서 웹·게임 백엔드를 만들기 위한 **C++23 서버 라이브러리**입니다. Windows IOCP·Linux epoll 기반 네트워크, HTTP/1.1·WebSocket, 메시지 처리와 제한된 작업 실행을 제공하며 애플리케이션이 그 위에 자신의 규칙을 구현합니다.
 
-개발 과정에서 생성형 AI의 도움을 받은 프로젝트입니다.
+현재 버전은 **0.2.0**입니다. C++와 선택적 C ABI를 하나의 정적 라이브러리 또는 DLL/SO로 빌드합니다. Rust에서는 같은 C ABI를 사용하는 소유권 기반 래퍼를 제공합니다. 프로젝트 코드는 [MIT-0](LICENSE) 라이선스이며 개발 과정에서 생성형 AI의 도움을 받았습니다.
 
-현재 라이브러리 버전은 `0.2.0`입니다. 다른 엔진·게임 저장소 없이 빌드할 수 있는 정적 라이브러리이며, 특정 게임의 규칙이나 게임 서버 진입점을 포함하지 않습니다. 프로젝트 코드는 [MIT-0](LICENSE) 라이선스로 제공합니다. 버전별 변경과 호환 범위는 [변경 기록](CHANGELOG.md)을 참고합니다.
+표준 라이브러리·컴파일러 런타임·OS API만 사용하고 서드파티 라이브러리에 의존하지 않습니다. Rust workspace에도 crates.io 의존성이 없으며 Tokio 같은 비동기 실행기를 강제하지 않습니다.
 
-ServerCore는 표준 라이브러리·컴파일러 런타임·OS API만 사용하며 서드파티 라이브러리에 의존하지 않습니다. 서버의 요청 수신·응답과 게임 통신을 제공하고, 외부 서비스로 보내는 HTTP 요청은 소비 애플리케이션이 선택한 도구로 처리합니다. 자세한 기준은 [의존성 정책](docs/DEPENDENCIES.md)을 따릅니다.
+## 제공하는 기능과 범위
 
-## 문서 안내
-
-| 문서 | 내용 |
+| 영역 | 제공하는 기능 |
 | --- | --- |
-| [아키텍처](docs/ARCHITECTURE.md) | 모듈 경계, 소유권, 부팅·메시지·종료 흐름 |
-| [실행·취소·흐름 제어](docs/EXECUTION_AND_FLOW_CONTROL.md) | 웹·게임 공통 계약, 제한된 작업 실행, TCP 송수신 제어 |
-| [프로토콜](docs/PROTOCOL.md) | 프레임 형식, JSON 봉투, 디스패치와 오류 계약 |
-| [HTTP·WebSocket](docs/WEB.md) | 웹 서버 API, 사용 예와 지원 범위 |
-| [Rust](docs/RUST.md) · [C ABI](docs/C_ABI.md) | Cargo 소비, 안전한 소유 handle, Future와 네이티브 배포 |
-| [운영 도구](docs/OPERATIONS.md) | 비동기 로그·회전, 작업·HTTP 메트릭, 요청 종료 추적 |
-| [빌드·테스트·배포](docs/BUILD_TEST_DEPLOY.md) | 요구 사항, CMake, 소스·설치 패키지 소비, 검증 |
-| [의존성 정책](docs/DEPENDENCIES.md) | 표준 라이브러리·OS 의존성, 서버와 소비 애플리케이션의 범위 |
-| [지원 범위와 설정](docs/SUPPORT_AND_LIMITS.md) | 기본값, 설정 파일, 자원 상한, 미지원 기능 |
-| [공개 API 이전](docs/API_MIGRATION.md) | Deprecated API, 대체 이름과 종료·직렬화 계약 |
-| [검증 결과](docs/VALIDATION.md) | 검증한 소스·도구 환경, 빌드와 테스트 결과 |
+| 네트워크 | IPv4·IPv6 TCP 수락, 부분 송수신, 연결 수명, 비차단 UDP와 제한된 수신·송신 예산 |
+| 웹 | HTTP/1.1, 정확·패턴 라우팅과 경로 매개변수, 비동기 처리기, 요청·응답 스트리밍, SSE, 파일 전송·단일 Range·ETag |
+| WebSocket | 업그레이드 전 인증, subprotocol 협상, text·binary·분할 송신, Ping/Pong heartbeat, 흐름 제어 |
+| HTTP 도구 | 요청 제한, CORS·공통 헤더·요청 ID·JSON 오류, 명시적 신뢰 프록시, query·form·cookie·multipart 파싱 |
+| 게임 통신 | 길이 프레임, JSON 봉투 또는 바이너리, 세션·디스패치, 준비된 메시지 재사용, 토큰·순번 기반 UDP |
+| 실행 | 작업·바이트 상한, 협력적 취소·마감 시간, 키별 직렬 실행, 타이머·작업 그룹, FIFO·최신 값 채널 |
+| 게임 실행 | 논리 틱·지연·catch-up 제한, 세션 작업 복귀, 송신 전 FIFO·최신 값·만료·배치 처리 |
+| 파일·관측 | 제한된 바이너리 입출력, 임시 파일·원자적 교체, 비동기 콘솔·회전 로그, 메트릭·Prometheus 변환·drain 상태 |
+| 언어 연동 | 네이티브 C++ API, 불투명 handle 기반 C ABI 1, Rust 소유 객체와 표준 `Future` |
 
-## 핵심 기능
+외부 HTTP 클라이언트, TCP outbound connect, DNS 해석, TLS/DTLS, HTTP/2·HTTP/3, 압축·암호화, macOS 백엔드는 포함하지 않습니다. TLS 종료나 외부 서비스 호출은 소비 애플리케이션의 구성 요소로 연결합니다.
 
-- **비동기 TCP 전송:** Windows IOCP·AcceptEx와 Linux epoll, 부분 수신·송신 처리와 연결 수명 관리.
-- **HTTP·WebSocket:** 별도 `Web::HttpServer`가 HTTP/1.1 요청과 WebSocket 연결을 처리합니다. 정확 일치 라우트와 `/plugins/{id}` 같은 세그먼트 패턴을 등록하고 `HttpRequest::PathParameter("id")`로 값을 읽습니다. 우선순위·메서드별 `405` 응답과 사용 예는 [웹 서버 문서](docs/WEB.md)를 따릅니다.
-- **비동기 웹 응답:** 소유 요청 문맥과 제한된 처리기 풀, 응답 스트리밍·SSE·파일 전송을 제공합니다. HTTP와 WebSocket은 TCP의 송신 예산과 용량 알림을 공유합니다.
-- **스트림 프레이밍:** 4바이트 길이 머리와 선택적 JSON/바이너리 본문. 나뉘어 도착하거나 연속으로 도착한 프레임을 처리합니다. 바이너리는 같은 프레임·세션·송신 예산을 재사용합니다.
-- **공용 메시지 봉투:** `type`, `body`, 선택적 `seq`와 `error`를 파싱·직렬화합니다. UTF-8, JSON 값, 본문 형식과 크기를 검증합니다.
-- **준비된 송신 값:** `PreparedJsonValue`와 `PreparedMessage`를 소유 값으로 만들고 여러 수신자에게 재사용합니다. 실제 NetworkSession의 `SendPrepared`는 JSON을 다시 직렬화하지 않고 기존 프레임·송신 큐에 넣습니다.
-- **비차단 UDP 전송:** `Runtime::DatagramTransport`가 소켓, 세션별 토큰, 순번·재전송 입력 거절, endpoint 재바인딩과 제한된 수신 pump를 제공합니다. 공유 `DatagramCodec`의 최대 1,200바이트 형식을 사용하며 게임 메시지 정책은 소비자가 정합니다.
-- **세션과 처리기:** 세션 ID 발급, 연결·인증·종료 상태, 타입별 처리기와 본문 크기 제한, 시작 전 등록표 동결.
-- **실행 문맥:** 작업 수·보유 바이트가 제한된 JobRunner와 PeriodicRunner. `SubmitSessionTask`는 배경 작업과 세션 취소를 연결하고 예약한 완료 슬롯으로 게임 상태 변경을 돌려보냅니다.
-- **제한된 병렬 작업:** `TaskExecutor`가 작업자 수·대기 작업 수·보유 바이트를 제한하고, 부모 토큰·취소·마감 시간을 처리합니다. 실행 중 작업은 취소에 협력해야 합니다.
-- **TCP 흐름 제어:** 수신 일시정지·재개, 실제 보유 송신량 조회와 일회성 용량 알림을 제공합니다. TCP 수락기·게임 Host·웹 서버에 연결별·전체 송신 예산을 적용합니다.
-- **자원 제한:** 연결 수, 프레임 크기, 수신·파싱·송신 대기량에 상한을 적용합니다. 유휴 세션과 마지막 송신을 기다리는 세션의 종료 기한도 설정할 수 있습니다.
-- **관측과 실패 처리:** `Status`/`Result<T>`, 제한된 비동기 콘솔·회전 파일 로거, 작업·HTTP·게임 지표와 비동기 HTTP 요청 종료 추적을 제공합니다.
-- **Rust와 C 연동:** 선택적 C ABI와 안전한 Rust 래퍼가 HTTP 서버·스트리밍·WebSocket·raw TCP를 제공합니다. 표준 Future를 사용하며 이벤트 보관과 객체 해제를 네이티브 자원 상한·취소에 연결합니다.
-- **라이브러리 소비:** 소스 트리의 `add_subdirectory`와 설치 패키지의 `find_package`에서 같은 `ServerCore::ServerCore` 타깃을 사용합니다.
+프로세스 실행·플러그인 발견·복구, DB·계정 인증, 방·매치메이킹·AOI·월드 저장, 게임 스키마, UI·VRM 검증과 자동 배포도 애플리케이션 책임입니다. 라이브러리는 서버의 `main`이나 특정 게임 규칙을 소유하지 않습니다.
 
-웹 요청의 업로드 스트리밍·정책 문맥·101 전 WebSocket 인증과 파일 단일 Range·ETag·조건부 응답을 지원합니다. 웹·게임 서버의 `BeginDrain/DrainStatus/StopGracefully`는 수락한 작업을 비운 뒤 기한에 남은 연결을 취소합니다. 게임 세션에는 프레임·인증 기한과 입력 속도 상한을 선택적으로 적용하고, UDP 등록을 TCP 세션 수명에 연결할 수 있습니다. 여러 서버는 각자의 로거를 사용하며 고정 지연 histogram과 Prometheus 스냅샷 변환을 제공합니다.
+내부 계층은 [공개 헤더](include/ServerCore)와 [구현](src)에서 Core·Net·Protocol·Session·Dispatch·Runtime·Web·Observability·C로 구분합니다. Runtime의 Host가 모듈을 조립하고 Web은 Net과 공통 실행기를 사용합니다. C 어댑터는 네이티브 API 위에 놓입니다. 이 구분은 소스 의존 방향이며 계층마다 DLL을 만들지 않습니다.
 
-서버 프로세스의 `main`, 주소·포트의 명령행 옵션, 플레이어 목록과 방, 입장 조건, 게임 메시지의 스키마는 소비 프로젝트가 정합니다. 아래 예제에서는 작은 Echo 서버로 이 경계를 보여 줍니다.
+## 빌드와 테스트
 
-## 저장소 구조
+CMake 3.21 이상과 C++23의 `std::expected`·`std::move_only_function`을 제공하는 컴파일러·표준 라이브러리가 필요합니다. 구성 단계에서 해당 기능을 검사합니다. 프리셋은 Ninja를 사용합니다.
 
-| 위치 | 책임 |
-| --- | --- |
-| [include/ServerCore](include/ServerCore) | 소비자가 포함하는 공개 API. Core·Net·Protocol·Session·Dispatch·Runtime·Web으로 구분 |
-| [src](src) | 공개 API 구현과 내부 전송·파싱 상태. 플랫폼 헤더와 소켓 구현을 내부에 둠 |
-| [tests](tests) | C++ 회귀, 실제 TCP·UDP·HTTP·WebSocket 통합과 소스/설치 패키지 소비 검사 |
-| [cmake](cmake) | 설치 패키지의 Config/Targets 구성 |
-| [rust](rust) | servercore-sys C ABI 선언·빌드와 안전한 servercore 래퍼·예제 |
-| [scripts](scripts) | 개발 빌드 검증 스크립트 |
-| [docs](docs) | 프로토콜·설정·빌드 계약 |
-
-공개 API에서 실행 계층까지는 `ServerHost → FrameReader/ParseMessage → Dispatcher → 게임 처리기 → Session` 순서로 읽을 수 있습니다. I/O worker와 JobRunner의 실제 스레드·수명 관계는 [아키텍처](docs/ARCHITECTURE.md)에 설명합니다.
-
-## 빠른 시작
-
-Windows에서는 C++20을 지원하는 MSVC와 Windows SDK, CMake 3.21 이상, Ninja가 필요합니다. **x64 Native Tools Command Prompt** 또는 같은 도구 환경을 설정한 PowerShell에서 저장소 루트로 이동하여 실행합니다.
+Windows는 MSVC와 Windows SDK가 필요합니다. x64 Native Tools 개발 환경에서 저장소 루트에서 실행합니다.
 
 ```powershell
 cmake --preset msvc-release
@@ -70,23 +38,46 @@ cmake --build --preset msvc-release
 ctest --preset msvc-release
 ```
 
-Debug는 위 세 명령의 preset 이름을 `msvc-debug`로 바꿉니다. 개발 환경 설정, 전체 검증 스크립트, 출력 경로와 패키지 설치는 [빌드 문서](docs/BUILD_TEST_DEPLOY.md)를 참고합니다.
-
-Ubuntu에서는 C++20 컴파일러, CMake 3.21 이상과 Ninja로 빌드합니다.
+Ubuntu는 GCC 13 이상과 대응 libstdc++, CMake·Ninja를 준비한 뒤 실행합니다. GCC 버전 숫자뿐 아니라 위 표준 라이브러리 기능을 만족해야 합니다.
 
 ```bash
-sudo apt update
-sudo apt install build-essential cmake ninja-build
 cmake --preset linux-release
 cmake --build --preset linux-release
 ctest --preset linux-release
 ```
 
-Debug는 `linux-debug`를 사용합니다. Linux 구현은 epoll을 사용하며 외부 네트워크 라이브러리를 요구하지 않습니다. 실제 실행 검증 환경과 결과는 [검증 결과](docs/VALIDATION.md)에 별도로 기록하며, 다른 OS에서의 교차 컴파일은 Ubuntu 실행 검증을 대신하지 않습니다.
+Debug는 `msvc-debug`·`linux-debug`, 공유 빌드는 `msvc-shared-release`·`linux-shared-release`를 사용합니다. 공유 Debug 프리셋도 있습니다. 기본 프리셋은 정적 C++ 빌드이며 C ABI가 필요하면 구성 명령에 `-DSERVERCORE_BUILD_C_API=ON`을 추가합니다.
 
-## 서버 프로젝트에서 사용하기
+| CMake 옵션 | 기본값 | 역할 |
+| --- | --- | --- |
+| `SERVERCORE_BUILD_SHARED` | `OFF` | 전체 라이브러리의 정적·공유 방식 선택 |
+| `SERVERCORE_BUILD_C_API` | `OFF` | 같은 라이브러리에 C ABI 구현 추가 |
+| `SERVERCORE_BUILD_TESTS` | 최상위 빌드에서 `ON` | C++·통합·패키지 소비 검사 빌드 |
 
-다른 저장소에서 소스를 함께 빌드하려면 다음처럼 연결합니다. 예시는 두 저장소가 형제 디렉터리에 있고 소비 프로젝트에 `main.cpp`가 있는 경우입니다. MSVC의 CRT 선택 정책은 C++ 언어를 켜기 전에 설정합니다.
+두 API를 포함하는 Release 공유 라이브러리를 직접 구성하고 설치하는 예입니다. Windows에서는 같은 MSVC 개발 환경에서 실행합니다.
+
+```sh
+cmake -S . -B build/shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DSERVERCORE_BUILD_SHARED=ON -DSERVERCORE_BUILD_C_API=ON
+cmake --build build/shared
+ctest --test-dir build/shared --output-on-failure
+cmake --install build/shared --prefix stage/shared
+```
+
+| 산출물 | Windows Release / Debug | Linux Release / Debug |
+| --- | --- | --- |
+| 정적 아카이브 | `ServerCore.lib` / `ServerCore.lib` | `libServerCore.a` / `libServerCore.a` |
+| 공유 런타임 | `ServerCore.dll` / `ServerCored.dll` | `libServerCore.so.0.2.0` / `libServerCored.so.0.2.0` |
+| 공유 링크 파일 | import `ServerCore.lib` / `ServerCored.lib` | `libServerCore.so` / `libServerCored.so` |
+
+정적·공유 및 Debug·Release에는 별도 빌드 디렉터리와 설치 prefix를 사용합니다. Windows의 정적 아카이브와 import library는 확장자가 같아 서로 대체할 수 없습니다. DLL은 설치 prefix의 `bin`, 링크 파일은 `lib`에 설치합니다. Linux SO는 `lib`에 설치합니다.
+
+공유 배포에는 실행 파일과 대응 DLL/SO가 필요합니다. Windows에서는 DLL을 실행 파일 옆에 두거나 `PATH`로 찾게 하고, Linux에서는 RPATH나 운영체제 로더 경로를 설정합니다. 헤더·import library·CMake 파일은 개발용입니다. 정적 ServerCore를 사용해도 컴파일러·OS 런타임 의존성까지 없어지는 것은 아닙니다.
+
+별도 `ServerCoreCAbi` 바이너리와 `SERVERCORE_C_API_SHARED` 옵션은 제거했습니다. 이전 옵션이 캐시에 남았다면 `cmake -U SERVERCORE_C_API_SHARED -S . -B <빌드 디렉터리>`로 제거하고 `SERVERCORE_BUILD_SHARED`를 지정합니다.
+
+## C++에서 사용하기
+
+소스를 함께 빌드하는 소비 프로젝트의 예입니다. `main.cpp`와 ServerCore 저장소 경로는 프로젝트에 맞춥니다.
 
 ```cmake
 cmake_minimum_required(VERSION 3.21)
@@ -102,18 +93,14 @@ if(MSVC)
 endif()
 ```
 
-ServerCore를 설치한 뒤에는 `find_package(ServerCore CONFIG REQUIRED)`로 같은 타깃을 얻을 수 있습니다. 위 예의 `add_subdirectory`를 그 호출로 바꾸고 소비 프로젝트를 구성할 때 설치 prefix를 `CMAKE_PREFIX_PATH`로 전달합니다.
+공유 소스 빌드는 `add_subdirectory` 전에 `SERVERCORE_BUILD_SHARED=ON`을 지정합니다. 설치 패키지 소비는 위 `add_subdirectory`를 `find_package(ServerCore CONFIG REQUIRED)`로 바꾸고 구성 시 `-DCMAKE_PREFIX_PATH=<설치 prefix>`를 전달합니다. 두 방식 모두 `ServerCore::ServerCore`를 사용하며 C++23 조건이 전파됩니다.
 
-```powershell
-# 앞 절의 Release 프리셋 빌드가 끝난 뒤, 저장소 루트에서 실행
-cmake --install build/msvc-release --prefix stage/msvc-release
-```
+네이티브 C++ 공유 API는 **같은 라이브러리 릴리스·헤더·아키텍처·컴파일러 툴셋·STL·CRT·빌드 구성**을 요구합니다. MSVC는 `/MD[d]`와 기본 iterator level(Debug 2, Release 0)을 사용합니다. 제공 타깃과 헤더의 ABI 검사를 제거하거나 소비자에서 `SERVERCORE_BUILDING_LIBRARY`를 정의하지 않습니다. C++ ABI는 툴체인·릴리스를 넘는 안정성을 보장하지 않으며 Windows DLL을 Ubuntu에서 재사용할 수 없습니다.
 
-[CMake 소비 예제](docs/BUILD_TEST_DEPLOY.md)를 따라 `ServerCore::ServerCore`에 연결한 실행 타깃의 `main.cpp`를 다음처럼 작성할 수 있습니다. 이 예제는 `127.0.0.1:17891`을 열고, `Echo` 요청의 객체 본문과 `seq`를 `EchoReply`로 돌려줍니다. Enter를 누르면 메인 스레드에서 서버를 정리합니다.
+다음 Echo 서버는 `127.0.0.1:17891`에서 길이 프레임 프로토콜을 받습니다.
 
 ```cpp
 #include <ServerCore/Runtime/ServerHost.h>
-
 #include <iostream>
 #include <memory>
 
@@ -125,83 +112,127 @@ int main()
     options.port = 17891;
     options.maxBodySize = 8192;
 
-    const Core::Status configured = host.Configure(options);
-    if (!configured.IsOk())
-    {
-        std::cerr << configured.Message() << '\n';
+    auto status = host.Configure(options);
+    if (!status.IsOk()) {
+        std::cerr << status.Message() << '\n';
         return 1;
     }
-
-    const Core::Status registered = host.GetDispatcher().Register(
+    status = host.GetDispatcher().Register(
         "Echo",
         [](const std::shared_ptr<Session::Session>& session,
-           const Protocol::Message& message) -> Core::Status
-        {
-            try
-            {
+           const Protocol::Message& message) -> Core::Status {
+            try {
                 return session->Send(Protocol::MessageFields{
                     "EchoReply", message.Body(), message.Sequence(), nullptr });
-            }
-            catch (...)
-            {
+            } catch (...) {
                 return Core::Status::FailWithoutMessage(Core::ErrorCode::PlatformError);
             }
         },
         4096);
-    if (!registered.IsOk())
-    {
-        std::cerr << registered.Message() << '\n';
+    if (!status.IsOk()) {
+        std::cerr << status.Message() << '\n';
         return 1;
     }
-
-    const Core::Status started = host.Start();
-    if (!started.IsOk())
-    {
-        std::cerr << started.Message() << '\n';
+    status = host.Start();
+    if (!status.IsOk()) {
+        std::cerr << status.Message() << '\n';
         return 1;
     }
-
     std::cout << "Listening on 127.0.0.1:17891. Press Enter to stop.\n";
     std::cin.get();
     host.Stop();
-    return 0;
 }
 ```
 
-송신할 JSON은 예를 들어 `{"type":"Echo","seq":1,"body":{"text":"hello"}}`입니다. 실제 TCP 전송에서는 이 문자열 앞에 **JSON 바이트 수를 나타내는 4바이트 little-endian 길이**를 붙입니다. 이 예제의 `ServerHost`는 길이 프레임 프로토콜을 사용합니다. HTTP·WebSocket 서버는 [Web::HttpServer](docs/WEB.md)로 별도 구성합니다. 세부 규격과 인코딩 API는 [프로토콜 문서](docs/PROTOCOL.md)에 있습니다.
+요청 예는 `{"type":"Echo","seq":1,"body":{"text":"hello"}}`입니다. TCP에서는 UTF-8 JSON 바이트 수를 나타내는 **4바이트 little-endian 길이**를 앞에 붙입니다. 위 `4096`은 Echo의 raw body 상한, `8192`는 전체 JSON 상한입니다. HTTP·WebSocket은 [Web::HttpServer](include/ServerCore/Web/HttpServer.h)로 별도 구성합니다.
 
-처리기는 Start 전에 등록합니다. 이 예제의 `4096`은 Echo의 **raw body** 상한이고, `8192`는 봉투 전체 JSON의 상한입니다. 등록된 처리기에 들어오는 `Body()`는 객체이며, 요청에서 빌린 참조는 처리기 호출을 넘어 보관하지 않습니다. `Send` 성공은 송신 큐 수락을 뜻하며 상대의 수신 확인을 뜻하지 않습니다.
+## C에서 사용하기
 
-운영 로그가 필요하면 Start 전에 `host.SetLogger(...)`로 `Core::ILogger` 구현을 넣습니다. 기본 로거는 출력을 버립니다. 별도 관리 스레드에서 종료를 요청하는 프로그램은 `host.Run()`으로 메인 스레드를 대기시킬 수도 있습니다. Host가 소유한 worker나 메시지 처리기 안에서 `Stop()`으로 자기 스레드를 기다리면 안 됩니다.
+`SERVERCORE_BUILD_C_API=ON`으로 만든 설치 패키지를 소비합니다. 공개 헤더는 [include/ServerCore/C](include/ServerCore/C)에 있습니다.
 
-## 설정과 관측
+```cmake
+cmake_minimum_required(VERSION 3.21)
+project(MyCServer LANGUAGES C)
+find_package(ServerCore CONFIG REQUIRED COMPONENTS CAbi)
+add_executable(MyCServer main.c)
+target_link_libraries(MyCServer PRIVATE ServerCore::CAbi)
+```
 
-`ServerHostOptions` 또는 UTF-8 `key = value` 파일을 읽은 `Core::Config`로 서버를 구성합니다. 기본 주소는 `127.0.0.1`, 기본 연결 상한은 256이며 포트는 반드시 지정해야 합니다. 외부 인터페이스에 열려면 소비 프로그램이 `listenAddress`를 명시합니다.
+공유 라이브러리는 위처럼 C++ 언어를 활성화하지 않고 소비할 수 있습니다. 정적 링크에는 C++ 링커·런타임과 플랫폼 라이브러리가 필요합니다. `ServerCore::CAbi`는 C 헤더·정의·링크 조건을 제공하는 INTERFACE 타깃이며 네이티브 C++ 컴파일 조건을 전파하지 않습니다. 실제 빌드 타깃은 `ServerCore`, 파일 경로 조회는 `$<TARGET_FILE:ServerCore::ServerCore>`를 사용합니다. `cmake --install ... --component CAbi`도 통합 라이브러리와 필요한 소비 설정을 설치합니다.
 
-설정상 연결 수는 최대 65,536까지 허용하지만 프레임 크기와 곱한 저장소 예산도 만족해야 합니다. **기본 64 KiB 본문 상한을 그대로 두고 연결 수만 65,536으로 올리면 Configure가 거절합니다.** 8 KiB 본문과 65,536 연결을 구성하는 예제는 [설정 문서](docs/SUPPORT_AND_LIMITS.md)에 있습니다.
+CMake 밖에서 Windows DLL을 사용할 때는 `SC_CABI_SHARED`를 정의합니다. C ABI는 불투명 handle·정수 상태·버전과 크기가 지정된 구조체를 사용하고 C++ 객체·예외·STL을 넘기지 않습니다. `sc_abi_version()`·`sc_capabilities()`로 지원을 확인하고, 반환 자원은 대응하는 `*_destroy`로 해제합니다. 상세 소유권·동시성 조건은 각 C 헤더에 명시합니다.
 
-`SnapshotMetrics()`는 JobRunner 문맥에서 호출합니다. 통계는 서로 다른 동기화 경계에서 읽은 관측값이며, 송신 성공·오류 0·빈 큐 중 어느 하나도 게임의 응답성이나 전체 메시지 전달을 보증하지 않습니다.
+## Rust에서 사용하기
 
-## 검증 범위
+[rust](rust)의 `servercore-sys`는 C ABI 선언·빌드, `servercore`는 안전한 소유 객체와 표준 `Future`를 제공합니다. Rust 1.75 이상과 위 네이티브 빌드 도구가 필요합니다. 소비 프로젝트의 Cargo.toml에는 로컬 경로를 지정합니다.
 
-CTest는 기반 자료형, 설정, JSON·프레이밍, 세션, 디스패치, 작업 실행, 실제 TCP·UDP와 ServerHost의 수명·예산·종료 경로, CMake 소비를 검사합니다. 테스트 분류와 명령은 [빌드·테스트·배포](docs/BUILD_TEST_DEPLOY.md), 실행 환경과 결과는 [검증 결과](docs/VALIDATION.md)에 정리합니다.
+```toml
+[dependencies]
+servercore = { path = "../ServerCore/rust/servercore" }
+```
 
-회귀 테스트의 성공이나 설정상 연결 상한은 실제 게임의 동시 플레이 수와 처리량을 보장하지 않습니다. 성능을 판단할 때는 소비 서버의 메시지 크기·빈도·방송 대상 수·처리기 비용을 포함한 부하에서 지연 분포, 대기열과 자원 사용량을 함께 측정해야 합니다.
+저장소 루트에서 예제를 실행할 수 있습니다.
 
-## TCP와 UDP의 책임 경계
+```sh
+cargo test --manifest-path rust/Cargo.toml --workspace --all-targets --locked --offline
+cargo run --manifest-path rust/Cargo.toml --offline -p servercore --example http_echo -- 8080
+```
 
-ServerHost의 네트워크 세션은 **Windows IOCP·Linux epoll 기반 IPv4 TCP**입니다. 별도의 [Runtime::DatagramTransport](include/ServerCore/Runtime/DatagramTransport.h)는 비차단 IPv4 UDP 소켓과 세션별 토큰·순번·endpoint를 관리합니다. `Protocol/DatagramCodec.h`의 magic·128비트 토큰·big-endian 순번으로 된 28바이트 머리를 그대로 사용합니다.
+`SERVERCORE_CABI_DIR`가 없으면 Cargo가 저장소 소스로 **C ABI를 포함한 Release 공유 ServerCore**를 빌드합니다. Cargo Debug에서도 네이티브 소스 빌드는 Release입니다. 소스 빌드에는 전체 저장소가 필요하고, crate만 복사한 경우에는 prebuilt 라이브러리를 지정합니다.
 
-소비자는 신뢰 가능한 제어 채널에서 `RegisterSession`의 토큰을 전달하고 세션 종료 시 `UnregisterSession`을 호출합니다. `Poll(admission, receiver)`는 JSON 봉투를 한 번 파싱하고 게임의 admission이 허용한 뒤에만 순번·endpoint·준비 상태를 갱신합니다. 콜백은 내부 잠금 밖에서 실행됩니다. 수신 호출은 소비자의 실행 문맥에서 직렬화하며 기본 한도는 호출당 4,096회 수신 시도와 약 1 MiB입니다. heartbeat, 유실 복구, AOI와 틱별 송신 예산은 게임이 정합니다.
+| 환경 변수 | 용도 |
+| --- | --- |
+| `SERVERCORE_CABI_DIR` | prebuilt 라이브러리의 `lib` 디렉터리. C ABI를 포함한 빌드여야 함 |
+| `SERVERCORE_NATIVE_LIBRARY` | prebuilt basename `ServerCore` 또는 `ServerCored` 명시. 기본은 이 순서로 탐색 |
+| `SERVERCORE_CABI_STATIC=1` | 소스·prebuilt 모두 정적 링크 선택 |
+| `SERVERCORE_NATIVE_LIBS` | 정적 링크에 필요한 순서 있는 세미콜론 구분 라이브러리 목록 |
+| `SERVERCORE_NATIVE_SEARCH` | 추가 네이티브 라이브러리 디렉터리, 세미콜론 구분 |
+| `SERVERCORE_CMAKE_GENERATOR`, `SERVERCORE_CMAKE_TOOLCHAIN` | 소스 빌드 생성기·cross compile 도구 체인 |
+| `SERVERCORE_CMAKE_JOBS` | 네이티브 빌드 병렬도, 기본 2 |
 
-`PreparedMessage::Size()`는 JSON 봉투 바이트만 나타내며, `PreparedJsonValue::Size()`는 항목 하나의 바이트 수입니다. 소비자가 전송량을 계산할 때 TCP 머리 4바이트 또는 DatagramCodec 머리 28바이트를 더해야 하며, 이는 IP·UDP/TCP 커널 헤더와 재전송 트래픽을 포함한 링크 대역폭과 다릅니다. 자세한 소유권·검증·기본 Session 위임 경로는 [프로토콜 문서](docs/PROTOCOL.md#61-준비된-json과-봉투-재사용)를 참고합니다.
+Windows prebuilt 공유 빌드는 import `.lib` 옆 또는 형제 `bin` 디렉터리에 대응 DLL을 둡니다. Cargo가 선택한 DLL 하나를 자체 출력에 준비하므로 `cargo run/test`에서 찾을 수 있습니다. 직접 배포한 실행 파일에는 앞 절의 런타임 배포가 필요합니다. Linux prebuilt 예:
 
-## 지원 범위
+```bash
+export SERVERCORE_CABI_DIR=/absolute/path/to/servercore/lib
+export LD_LIBRARY_PATH="$SERVERCORE_CABI_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+cargo test --manifest-path rust/Cargo.toml --workspace --locked --offline
+```
 
-현재 서버 전송은 HTTP/2·HTTP/3, 내장 TLS/DTLS, IPv6와 범용 outbound TCP 연결 API를 제공하지 않습니다. 외부 HTTP·HTTPS 요청은 소비 애플리케이션의 책임입니다. Rust/C 연동의 범위는 [C ABI](docs/C_ABI.md)에 명시합니다. 자동 재접속, 계정 인증, DB, 매치메이킹, 서버 권위 물리, 방·관심 영역 분할은 아직 제공하지 않습니다. 웹 라우트는 시작 전에 등록하며 실행 중 교체하지 않습니다. 인증 상태 전이 API는 자격 증명을 검증하지 않습니다.
+Windows MSVC 개발 PowerShell에서 정적 소스 빌드를 선택하는 예입니다.
 
-공개 헤더는 OS 소켓 구조체를 노출하지 않으며 CMake가 Windows와 Linux 구현을 선택합니다. macOS 백엔드는 제공하지 않습니다. MSVC에서는 라이브러리와 소비 실행 파일이 동일한 `/MD` 또는 `/MDd` CRT 계약을 따라야 합니다. 자세한 계약과 제약은 [지원 범위와 설정](docs/SUPPORT_AND_LIMITS.md)을 기준으로 확인합니다.
+```powershell
+$env:SERVERCORE_CABI_DIR = $null
+$env:SERVERCORE_CABI_STATIC = '1'
+$env:SERVERCORE_NATIVE_LIBS = 'dylib=ws2_32;dylib=bcrypt'
+$env:CARGO_TARGET_DIR = "$PWD/build/rust-static"
+cargo build --manifest-path rust/Cargo.toml --workspace --examples --locked --offline
+```
 
-## 라이선스
+정적 prebuilt는 `SERVERCORE_CABI_DIR`에 `ServerCore.lib` 또는 `libServerCore.a`가 있는 디렉터리를 지정하고 같은 정적 설정을 유지합니다. GNU/Linux에서는 보통 `SERVERCORE_NATIVE_LIBS='dylib=stdc++'`가 필요하며 실제 툴체인의 런타임·링커에 맞춥니다. 목록에 ServerCore 아카이브를 다시 넣지 않습니다. MSVC 네이티브 빌드는 `/MD`이므로 Rust의 `+crt-static`을 추가하는 방식은 지원하지 않습니다. 공유로 돌아갈 때 정적 관련 변수를 해제하고, 링크 방식 변경에는 별도 Cargo 출력 디렉터리를 사용합니다.
 
-프로젝트 코드는 [MIT No Attribution (MIT-0)](LICENSE) 라이선스를 따릅니다. 사용·수정·재배포·상업적 이용을 허용하며, 재배포 시 저작권 고지 유지나 수정한 소스 공개를 요구하지 않습니다. 보증과 책임에 관한 조건은 라이선스 원문을 따릅니다.
+HTTP·WebSocket·raw TCP·UDP와 공통 실행·파일·관측을 감싸지만 C++ `ServerHost`·세션 등록표·JSON 디스패처 전체를 매핑하지는 않습니다. raw TCP 바이트에는 자동 프레이밍이 없습니다. 실행기와 애플리케이션 프로토콜은 소비자가 선택합니다. [Rust 예제](rust/servercore/examples)는 `http_echo`, `websocket_echo`, `tcp_echo`, `multipart_upload`, `runtime_channels`입니다.
+
+## 수명·흐름 제어·종료
+
+- 처리기·라우트·정책·로거는 시작 전에 등록합니다. 요청에서 빌린 참조는 소유 요청·이벤트보다 오래 보관하지 않습니다.
+- 송신 성공은 로컬 큐 수락입니다. `WouldBlock`이면 용량 알림이나 비동기 송신을 사용하고 제한된 조각으로 보냅니다. 수신 완료나 원격 처리 완료를 뜻하지 않습니다.
+- 큐는 작업 수·바이트 상한을 적용합니다. 소비자가 별도로 복사해 보관하는 데이터는 애플리케이션의 메모리 예산으로 관리합니다.
+- 작업 취소는 협력적이며 실행 중인 사용자 코드를 강제로 중단하지 않습니다. Rust의 불완전한 응답·연결 handle 해제는 해당 취소·종료 계약에 연결됩니다.
+- `BeginDrain/DrainStatus/StopGracefully`는 새 수락을 막고 진행 중 작업의 완료를 기다립니다. 기한 후 남은 연결을 취소하며 일반 `Stop`은 즉시 종료 경로입니다.
+- 종료·객체 해제는 worker join 때문에 대기할 수 있습니다. 서버가 소유한 worker·처리기에서 자기 스레드를 기다리는 `Stop`을 호출하지 않습니다. `JobRunner`는 실행 스레드를 소유하지 않으므로 `RequestStop` 후 호출자가 join합니다.
+- 실행 중 DLL/SO 교체·언로드는 지원하지 않습니다. 로거·메트릭은 인스턴스별이며 기본 로거는 출력을 버립니다.
+
+## 최근 검증
+
+2026-09-24 Windows x64, MSVC 19.50.35728·CMake 4.2.3 기준입니다.
+
+| 구성 | 결과 |
+| --- | --- |
+| 공유 Debug / Release | 각각 CTest 278/278 통과 |
+| 정적 Debug | CTest 276/276 통과 |
+| Rust 1.89: 공유 소스 / 공유 Debug prebuilt / 정적 소스 | 각 42/42 통과, 예제 5개 컴파일·링크 |
+| 위 Rust 세 구성의 `runtime_channels` | `ready` 출력 후 정상 종료 |
+
+설치·소스 소비, 순수 C 공유 소비, 네이티브 C++ ABI 불일치 거절, 통합 DLL의 C++·C 심벌과 실행 파일 의존성을 확인했습니다. 최신 통합 변경의 **Linux/GCC·ASan/UBSan 실행 검증은 하지 않았습니다**. Linux 구현과 CI 구성이 있다는 사실을 최신 Linux 실행 성공으로 해석하지 않습니다.
+
+테스트는 [tests](tests), 빌드 자동화는 [scripts](scripts)에 있습니다. 회귀 테스트와 설정상 연결 상한은 실제 동시 플레이 수·처리량을 보장하지 않습니다. 소비 서버의 메시지 크기·빈도·방송 대상 수·처리기 비용을 반영한 부하에서 지연·대기열·자원 사용량을 측정합니다.

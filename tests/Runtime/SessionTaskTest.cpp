@@ -262,6 +262,23 @@ void TaskCompletionCleanupAndRejection()
         "completion storage budget released before Wait completes");
     ExpectTrue(executor.Stop().IsOk(), "completion executor joins");
 }
+void SessionTaskRejectsEmptyLegacyWork()
+{
+    Runtime::TaskExecutor executor;
+    Runtime::JobRunner runner;
+    const auto session = std::make_shared<TestSession>();
+    std::function<Status(std::stop_token)> work;
+    const auto apply = [](Session::Session&, const Status&) {};
+    auto result = Runtime::SubmitSessionTask(executor, runner.AcquireLease(), session, work, apply);
+    ExpectTrue(!result.IsOk() && result.GetStatus().Code() == ErrorCode::InvalidArgument,
+        "empty legacy session work is rejected before execution or reservation");
+    result = Runtime::SubmitSessionTask(executor, runner.AcquireLease(), session, std::move(work), apply);
+    ExpectTrue(!result.IsOk() && result.GetStatus().Code() == ErrorCode::InvalidArgument,
+        "moved empty legacy session work keeps the same rejection");
+    ExpectEqual(std::size_t{ 0 }, runner.OutstandingCount(), "rejection retains no completion slot");
+}
+const ServerCoreTest::CheckRegistration emptyLegacyWork(
+    "Runtime.SessionTaskRejectsEmptyLegacyWork", SessionTaskRejectsEmptyLegacyWork);
 const ServerCoreTest::CheckRegistration bounds(
     "Runtime.BoundedRunnerReservations", BoundedRunnerReservations);
 const ServerCoreTest::CheckRegistration captures(

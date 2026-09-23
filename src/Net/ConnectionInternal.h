@@ -113,10 +113,11 @@ public:
     /// </param>
     /// <param name="winsock">Winsock이 살아 있게 하는 참조. 널을 넘기는 것은 계약 위반이다.</param>
     [[nodiscard]] static std::shared_ptr<TcpConnection> Create(SOCKET socket,
-        std::shared_ptr<WinsockScope> winsock, std::shared_ptr<SendBudget> sendBudget = nullptr);
+        std::shared_ptr<WinsockScope> winsock, std::shared_ptr<SendBudget> sendBudget = nullptr,
+        Core::IpEndpoint local = {}, Core::IpEndpoint remote = {});
 
     TcpConnection(CreationKey, SOCKET socket, std::shared_ptr<WinsockScope> winsock,
-        std::shared_ptr<SendBudget> sendBudget);
+        std::shared_ptr<SendBudget> sendBudget, Core::IpEndpoint local, Core::IpEndpoint remote);
 
     /// <summary>소켓을 닫고, 아직 통지하지 않았다면 끊김을 통지한다.</summary>
     /// <remarks>
@@ -136,6 +137,8 @@ public:
     void SetObserver(std::weak_ptr<IConnectionObserver> observer) override;
     [[nodiscard]] bool IsOpen() const noexcept override;
     [[nodiscard]] std::size_t QueuedSendBytes() const noexcept override;
+    [[nodiscard]] Core::IpEndpoint LocalEndpoint() const noexcept override { return mLocalEndpoint; }
+    [[nodiscard]] Core::IpEndpoint RemoteEndpoint() const noexcept override { return mRemoteEndpoint; }
     Core::Status PauseReceive() override;
     Core::Status ResumeReceive() override;
     [[nodiscard]] bool IsReceivePaused() const noexcept override;
@@ -200,6 +203,8 @@ private:
     mutable std::mutex mMutex;
     std::shared_ptr<WinsockScope> mWinsock;
     SOCKET mSocket = INVALID_SOCKET;
+    const Core::IpEndpoint mLocalEndpoint;
+    const Core::IpEndpoint mRemoteEndpoint;
 
     std::weak_ptr<IConnectionObserver> mObserver;
     bool mObserverAssigned = false;

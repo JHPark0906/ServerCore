@@ -399,8 +399,9 @@ void HistogramAndPrometheus()
     Runtime::ServerMetricsSnapshot game;
     game.activeSessionCount = 2;
     game.sessionSendQueues = {{static_cast<ServerCore::Session::SessionId>(1), 4}, {static_cast<ServerCore::Session::SessionId>(2), 6}};
+    game.retainedSendBytes = 15;
     auto gameText = Obs::RenderPrometheus(game);
-    ExpectTrue(gameText.IsOk() && gameText.Value().find("servercore_game_retained_send_bytes 10\n") != std::string::npos, "game collector aggregates sessions without per-session labels");
+    ExpectTrue(gameText.IsOk() && gameText.Value().find("servercore_game_retained_send_bytes 15\n") != std::string::npos, "game collector uses retained storage rather than remaining wire bytes without per-session labels");
 }
 const ServerCoreTest::CheckRegistration histogram("Observability.HistogramAndPrometheus", HistogramAndPrometheus);
 const ServerCoreTest::CheckRegistration tasks("Observability.TaskMetrics", TaskMetrics);

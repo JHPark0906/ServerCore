@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include <string_view>
 
 namespace ServerCore::Core::Detail
@@ -10,5 +12,5 @@ namespace ServerCore::Core::Detail
 /// 따라서 구현을 Protocol에 두면 Config가 역방향으로 의존하게 된다. 이 비공개 Core 도구를
 /// 함께 써서 한 구현만 유지한다.
 /// </remarks>
-[[nodiscard]] bool IsValidUtf8(std::string_view text) noexcept;
+[[nodiscard]] SERVERCORE_API bool IsValidUtf8(std::string_view text) noexcept;
 }

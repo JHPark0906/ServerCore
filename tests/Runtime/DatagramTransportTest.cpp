@@ -206,14 +206,14 @@ void BindLifecycleAndWinsockIsolation()
 void SocketEndpointBoundaryConformance()
 {
     ServerCore::Net::DatagramSocket socket;
-    sockaddr_in endpoint{};
+    ServerCore::Core::IpEndpoint endpoint{};
     ExpectTrue(socket.Receive({}).status.Code() == ErrorCode::Closed &&
         socket.Send(endpoint, {}).Code() == ErrorCode::Closed,
         "closed socket status precedes buffer and endpoint validation");
 
     constexpr char embeddedNul[] = "127.0.0.1\0ignored";
     const std::array invalidAddresses{
-        std::string_view{}, std::string_view{"localhost"}, std::string_view{"::1"},
+        std::string_view{}, std::string_view{"localhost"}, std::string_view{":::1"},
         std::string_view{"127.1"}, std::string_view{"127.000.0.1"},
         std::string_view{"256.0.0.1"}, std::string_view{"127.0.0.1 "},
         std::string_view{" 127.0.0.1"},
@@ -230,7 +230,7 @@ void SocketEndpointBoundaryConformance()
     const std::string adjacent = "127.0.0.1not-part-of-the-address";
     if (!ExpectOk(socket.Bind(std::string_view(adjacent).substr(0, 9), 0),
         "a non-NUL-terminated IPv4 view binds using exactly its declared bytes")) return;
-    ExpectTrue(socket.Bind({}, 0).Code() == ErrorCode::AlreadyExists,
+    ExpectTrue(socket.Bind(std::string_view{}, 0).Code() == ErrorCode::AlreadyExists,
         "an already bound socket takes precedence over a new invalid address");
     ExpectTrue(socket.Send(endpoint, {}).Code() == ErrorCode::InvalidArgument,
         "a bound IPv4 socket rejects an incompatible endpoint family");
@@ -258,7 +258,7 @@ void SocketEmptyAndTruncatedDatagrams()
     if (!peer.Send(socket.Port(), {}) || !receive({})) return;
     ExpectTrue(received.status.IsOk() && received.bytes == 0 && !received.retryable,
         "empty datagram succeeds even with an empty receive buffer");
-    ExpectTrue(received.endpoint.sin_family == AF_INET && received.endpoint.sin_port != 0,
+    ExpectTrue(received.endpoint.address.Family() == ServerCore::Core::IpFamily::V4 && received.endpoint.port != 0,
         "an empty datagram still identifies its reply endpoint");
     if (!received.status.IsOk()) return;
     if (!ExpectOk(socket.Send(received.endpoint, {}), "raw UDP permits an empty reply")) return;

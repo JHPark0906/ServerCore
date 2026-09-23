@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include "ServerCore/Observability/Observation.h"
 
 namespace ServerCore::Observability
 {
@@ -30,6 +31,7 @@ struct TaskExecutorMetricsSnapshot
     std::uint64_t cancelledTasks = 0, timedOutTasks = 0, rejectedTasks = 0;
     std::uint64_t totalLatencyNanoseconds = 0, maxLatencyNanoseconds = 0;
     LatencyHistogramSnapshot latencyHistogram;
+    Lifecycle lifecycle = Lifecycle::Created;
 };
 
 // Fixed fields only: no per-path, per-user, or per-request metric labels.
@@ -46,5 +48,6 @@ struct HttpServerMetricsSnapshot
     std::uint64_t totalLatencyNanoseconds = 0, maxLatencyNanoseconds = 0;
     TaskExecutorMetricsSnapshot handlers;
     LatencyHistogramSnapshot latencyHistogram;
+    Lifecycle lifecycle = Lifecycle::Created;
 };
 }

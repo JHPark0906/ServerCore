@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.21)
 
 project(ServerCorePackageConsumer LANGUAGES CXX)
 
+# The linked target must raise this baseline to C++23 without consumer flags.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 if (NOT DEFINED SERVERCORE_PACKAGE_PREFIX OR "${SERVERCORE_PACKAGE_PREFIX}" STREQUAL "" OR
         NOT DEFINED SERVERCORE_PACKAGE_VERSION OR "${SERVERCORE_PACKAGE_VERSION}" STREQUAL "")
     message(FATAL_ERROR

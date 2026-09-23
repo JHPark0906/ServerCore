@@ -9,6 +9,12 @@ endif ()
 
 project(ServerCoreSourceTreeConsumer LANGUAGES CXX)
 
+# The child project's directory settings must not supply this upgrade: the
+# PUBLIC requirement of the linked ServerCore target must reach our executable.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 add_subdirectory("${SERVERCORE_SOURCE_DIR}" ServerCore)
 
 if (NOT TARGET ServerCore::ServerCore)

@@ -1,4 +1,5 @@
 #pragma once
+#include "ServerCore/Export.h"
 
 #include "ServerCore/Core/Config.h"
 #include "ServerCore/Core/Error.h"
@@ -123,9 +124,9 @@ struct ServerHostOptions
     /// <summary>파싱 worker가 켜졌을 때 Host 전체가 보관할 완결 프레임 수 상한이다.</summary>
     std::uint32_t maxTotalPendingParseTasks = 4096;
 
-    /// <summary>들을 IPv4 주소다. 기본은 같은 기계의 loopback뿐이다.</summary>
+    /// <summary>들을 숫자 IPv4/IPv6 주소다. 기본은 같은 기계의 IPv4 loopback뿐이다.</summary>
     /// <remarks>
-    /// 외부 연결을 받을 서버는 명시적으로 "0.0.0.0" 또는 배포 환경의 특정 IPv4 주소를 둔다.
+    /// 외부 연결을 받을 서버는 "0.0.0.0", "::" 또는 배포 환경의 특정 IP 주소를 둔다.
     /// 주소 형식은 Acceptor가 포트를 열 때 검사한다.
     /// </remarks>
     std::string listenAddress = "127.0.0.1";
@@ -161,6 +162,8 @@ struct ServerHostOptions
     JobRunnerOptions jobRunner;
     /// Bounds receive-arrival metadata as well as byte storage; 1..65,536 per session.
     std::uint32_t maxPendingReceiveChunks = 1024;
+    /// Explicit IPV6_V6ONLY behavior, identical on Windows/Linux; ignored for IPv4.
+    bool ipv6Only = true;
 };
 
 /// <summary>
@@ -195,8 +198,8 @@ struct ServerHostOptions
 class ServerHost
 {
 public:
-    ServerHost();
-    ~ServerHost();
+    SERVERCORE_API ServerHost();
+    SERVERCORE_API ~ServerHost();
 
     ServerHost(const ServerHost&) = delete;
     ServerHost& operator=(const ServerHost&) = delete;
@@ -235,36 +238,36 @@ public:
     /// uint16_t 범위를 벗어나면 InvalidArgument이며, 다른 옵션 범위·상호 관계 검증은
     /// ServerHostOptions overload가 맡는다.
     /// </remarks>
-    Core::Status Configure(const Core::Config& config);
+    SERVERCORE_API Core::Status Configure(const Core::Config& config);
 
     /// <summary>명시적 옵션을 적용한다. Start 전에 부른다.</summary>
-    Core::Status Configure(const ServerHostOptions& options);
+    SERVERCORE_API Core::Status Configure(const ServerHostOptions& options);
 
     /// <summary>기록을 남길 곳을 정한다. 부팅의 가장 첫 단계다.</summary>
-    void SetLogger(std::shared_ptr<Core::ILogger> logger);
+    SERVERCORE_API void SetLogger(std::shared_ptr<Core::ILogger> logger);
 
     using BinaryHandler = std::function<Core::Status(
         const std::shared_ptr<Session::Session>&, Protocol::BinaryMessageView)>;
     /// Before Start only. Binary views are callback-local; handler executes on this Host's runner.
-    [[nodiscard]] Core::Status SetBinaryHandler(BinaryHandler handler);
+    [[nodiscard]] SERVERCORE_API Core::Status SetBinaryHandler(BinaryHandler handler);
     /// Optional, already bound transport dedicated to this Host. Automatically registers before OnSessionOpened and
     /// unregisters before OnSessionClosed. The caller still schedules Poll and distributes tokens
     /// over an authenticated control channel. This Host never closes a caller-owned UDP socket.
-    [[nodiscard]] Core::Status AttachDatagramTransport(std::shared_ptr<DatagramTransport> transport);
-    [[nodiscard]] Core::Result<Protocol::DatagramCodec::Token> GetDatagramToken(Session::SessionId id) const;
+    [[nodiscard]] SERVERCORE_API Core::Status AttachDatagramTransport(std::shared_ptr<DatagramTransport> transport);
+    [[nodiscard]] SERVERCORE_API Core::Result<Protocol::DatagramCodec::Token> GetDatagramToken(Session::SessionId id) const;
 
     /// <summary>
     /// 게임 백엔드가 메시지 처리기를 등록하는 자리다.
     /// </summary>
     /// <remarks>Start 전에만 쓴다. 도는 중에 등록하는 것은 지원하지 않는다.</remarks>
-    [[nodiscard]] Dispatch::Dispatcher& GetDispatcher() noexcept;
+    [[nodiscard]] SERVERCORE_API Dispatch::Dispatcher& GetDispatcher() noexcept;
 
     /// <summary>붙어 있는 세션 목록의 읽기 전용 참조를 준다. 브로드캐스트가 필요한 쪽이 쓴다.</summary>
     /// <remarks>
     /// SessionRegistry의 계약대로 JobRunner 문맥 안에서만 사용한다. 등록과 해제는 연결 수명과
     /// ServerHost 종료 계수를 함께 바꾸므로 Host만 수행한다.
     /// </remarks>
-    [[nodiscard]] const Session::SessionRegistry& GetSessions() const noexcept;
+    [[nodiscard]] SERVERCORE_API const Session::SessionRegistry& GetSessions() const noexcept;
 
     /// <summary>세션 목록과 같은 직렬 문맥에 일을 넣을 수 있는 수명 핸들이다.</summary>
     /// <remarks>
@@ -272,10 +275,10 @@ public:
     /// 백엔드는 이 실행자를 멈추거나 직접 돌릴 수 없다. PeriodicRunner에는 이 Lease를 그대로
     /// 넘긴다.
     /// </remarks>
-    [[nodiscard]] JobRunner::Lease GetJobRunner() const noexcept;
+    [[nodiscard]] SERVERCORE_API JobRunner::Lease GetJobRunner() const noexcept;
 
     /// <summary>세션이 열리고 닫히는 것을 받을 관찰자를 건다. 약한 참조로 잡는다.</summary>
-    void SetSessionObserver(std::weak_ptr<Session::ISessionObserver> observer);
+    SERVERCORE_API void SetSessionObserver(std::weak_ptr<Session::ISessionObserver> observer);
 
     /// <summary>부팅 순서대로 서버를 세운다. 성공으로 돌아오면 포트가 열려 있다.</summary>
     /// <remarks>
@@ -285,7 +288,7 @@ public:
     /// Stop()을 요청한 경우에도 부팅을 끝까지 되돌린 뒤 Closed를 돌린다. 따라서 성공으로 돌아오면
     /// 포트가 열려 있다는 위 계약은 그대로 유지된다.
     /// </remarks>
-    Core::Status Start();
+    SERVERCORE_API Core::Status Start();
 
     /// <summary>종료를 요청한다. 스레드 안전하다.</summary>
     /// <remarks>
@@ -299,25 +302,25 @@ public:
     /// 실패 정리가 서로 기다리지 않도록 종료 요청만 기록하고 돌아온다. 그 Start 호출이 종료를
     /// 완료하고 Closed를 돌려준다.
     /// </remarks>
-    void Stop();
+    SERVERCORE_API void Stop();
 
     /// Stops new admission, drains admitted work then locally queued sends, aborting remaining
     /// connections at deadline. Stop remains immediate and may interrupt this drain. Deadline
     /// bounds the drain phase, not joining non-cooperative application callbacks. External thread only.
-    [[nodiscard]] Core::Status BeginDrain();
+    [[nodiscard]] SERVERCORE_API Core::Status BeginDrain();
     /// Ok when drained/stopped; WouldBlock while admitted work or sends remain; Closed before Start.
-    [[nodiscard]] Core::Status DrainStatus() const;
-    [[nodiscard]] Core::Status StopGracefully(std::chrono::steady_clock::time_point deadline);
+    [[nodiscard]] SERVERCORE_API Core::Status DrainStatus() const;
+    [[nodiscard]] SERVERCORE_API Core::Status StopGracefully(std::chrono::steady_clock::time_point deadline);
 
     /// <summary>종료가 요청될 때까지 이 스레드를 붙잡아 둔다.</summary>
     /// <returns>프로세스 종료 코드로 쓸 값. 정상 종료면 0.</returns>
-    int Run();
+    SERVERCORE_API int Run();
 
     /// <summary>지금 포트를 열고 수락 중인지 답한다.</summary>
-    [[nodiscard]] bool IsRunning() const noexcept;
+    [[nodiscard]] SERVERCORE_API bool IsRunning() const noexcept;
 
     /// <summary>현재 듣고 있는 포트다. 멈췄으면 0이다.</summary>
-    [[nodiscard]] std::uint16_t Port() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::uint16_t Port() const noexcept;
 
     /// <summary>고정 운영 지표를 한 번 읽는다.</summary>
     /// <remarks>
@@ -326,7 +329,7 @@ public:
     /// JobRunner에 한 번의 요청을 넣어 결과를 가져간다. 벡터 스냅숏 할당이 실패하면
     /// PlatformError를 돌려준다.
     /// </remarks>
-    [[nodiscard]] Core::Result<ServerMetricsSnapshot> SnapshotMetrics() const;
+    [[nodiscard]] SERVERCORE_API Core::Result<ServerMetricsSnapshot> SnapshotMetrics() const;
 
 private:
     class State;

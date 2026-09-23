@@ -1,6 +1,7 @@
 #include "Net/ConnectionInternal.h"
 
 #include "Net/WinsockInternal.h"
+#include "Net/EndpointInternal.h"
 #include "ServerCore/Core/Assert.h"
 
 #include <cstddef>
@@ -15,19 +16,22 @@
 namespace ServerCore::Net
 {
 std::shared_ptr<TcpConnection> TcpConnection::Create(
-    SOCKET socket, std::shared_ptr<WinsockScope> winsock, std::shared_ptr<SendBudget> sendBudget)
+    SOCKET socket, std::shared_ptr<WinsockScope> winsock, std::shared_ptr<SendBudget> sendBudget,
+    Core::IpEndpoint local,Core::IpEndpoint remote)
 {
     SERVERCORE_ASSERT(socket != INVALID_SOCKET, "Create() was given INVALID_SOCKET");
     SERVERCORE_ASSERT(winsock != nullptr, "Create() was given a null Winsock reference");
 
     return std::make_shared<TcpConnection>(
-        CreationKey{}, socket, std::move(winsock), std::move(sendBudget));
+        CreationKey{}, socket, std::move(winsock), std::move(sendBudget),local,remote);
 }
 
 TcpConnection::TcpConnection(CreationKey, SOCKET socket, std::shared_ptr<WinsockScope> winsock,
-    std::shared_ptr<SendBudget> sendBudget)
+    std::shared_ptr<SendBudget> sendBudget,Core::IpEndpoint local,Core::IpEndpoint remote)
     : mWinsock(std::move(winsock))
     , mSocket(socket)
+    , mLocalEndpoint(local.IsValid()?local:ReadSocketEndpoint(socket,false))
+    , mRemoteEndpoint(remote.IsValid()?remote:ReadSocketEndpoint(socket,true))
     , mSendQueue(std::move(sendBudget))
 {
     mReceiveOperation.kind = IoOperationKind::Receive;

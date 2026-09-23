@@ -7,17 +7,28 @@ on:
 
 jobs:
   regression:
+    name: ${{ matrix.os }} ${{ matrix.configuration }} native-${{ matrix.linkage }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
-        configuration: [Debug, Release]
+        # Preserve all four static jobs. Two single-library shared jobs exercise
+        # the C++ and C APIs on both OS loaders without doubling every build path.
+        include:
+          - { os: ubuntu-24.04, configuration: Debug, linkage: static, shared: "OFF" }
+          - { os: ubuntu-24.04, configuration: Release, linkage: static, shared: "OFF" }
+          - { os: windows-2022, configuration: Debug, linkage: static, shared: "OFF" }
+          - { os: windows-2022, configuration: Release, linkage: static, shared: "OFF" }
+          - { os: ubuntu-24.04, configuration: Release, linkage: shared, shared: "ON" }
+          - { os: windows-2022, configuration: Debug, linkage: shared, shared: "ON" }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Configure without third-party dependencies
-        run: cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} -DSERVERCORE_BUILD_TESTS=ON -DSERVERCORE_BUILD_C_API=ON
+      - name: Configure C++23 and required standard library capabilities
+        run: >-
+          cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
+          -DSERVERCORE_BUILD_SHARED=${{ matrix.shared }}
+          -DSERVERCORE_BUILD_TESTS=ON -DSERVERCORE_BUILD_C_API=ON
       - name: Build
         run: cmake --build build/ci --config ${{ matrix.configuration }} --parallel 4
       - name: Test including source and installed package consumers
@@ -41,13 +52,16 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Configure Clang with ASan and UBSan
+      # Ubuntu's GCC/libstdc++ pair provides both required C++23 library types.
+      # Clang 18 with libstdc++ 13 hides expected behind its concepts feature guard.
+      - name: Configure GCC with ASan and UBSan
         run: >-
           cmake -S . -B build/sanitizers -G Ninja
-          -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=g++ -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
           -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
-          -DSERVERCORE_BUILD_C_API=ON -DSERVERCORE_C_API_SHARED=OFF
+          -DSERVERCORE_BUILD_SHARED=OFF
+          -DSERVERCORE_BUILD_C_API=ON
       - name: Build
         run: cmake --build build/sanitizers --parallel 4
       - name: Test

@@ -15,6 +15,35 @@ file(REMOVE_RECURSE "${testRoot}")
 run("Install C ABI only" "${CMAKE_COMMAND}" --install "${producer}"
     --config "${SERVERCORE_PACKAGE_CONFIGURATION}" --component CAbi --prefix "${testRoot}/stage")
 file(RENAME "${testRoot}/stage" "${testRoot}/relocated")
+
+# The component must be independently relocatable with one implementation
+# binary. ELF SONAME symlinks may name the same file more than once.
+set(packagePrefix "${testRoot}/relocated")
+file(GLOB_RECURSE installedFiles LIST_DIRECTORIES FALSE "${packagePrefix}/*")
+set(runtimeBinaries)
+foreach (installedFile IN LISTS installedFiles)
+    cmake_path(GET installedFile FILENAME installedName)
+    if (installedName MATCHES "^(lib)?ServerCoreCAbi(d)?\\.(dll|lib|a|so)(\\..*)?$")
+        message(FATAL_ERROR "The single-library package must not install a C ABI adapter binary: ${installedFile}")
+    endif ()
+    if (installedName MATCHES "\\.dll$" OR installedName MATCHES "\\.so(\\..*)?$")
+        if (NOT installedName MATCHES "^(lib)?ServerCore(d)?\\.(dll|so)(\\..*)?$")
+            message(FATAL_ERROR "Unexpected shared binary in the C ABI component: ${installedFile}")
+        endif ()
+        file(REAL_PATH "${installedFile}" physicalBinary)
+        cmake_path(IS_PREFIX packagePrefix "${physicalBinary}" NORMALIZE binaryInsidePackage)
+        if (NOT binaryInsidePackage OR NOT EXISTS "${physicalBinary}")
+            message(FATAL_ERROR "The shared library must remain inside the relocated package: ${installedFile}")
+        endif ()
+        list(APPEND runtimeBinaries "${physicalBinary}")
+    endif ()
+endforeach ()
+list(REMOVE_DUPLICATES runtimeBinaries)
+list(LENGTH runtimeBinaries runtimeBinaryCount)
+if (NOT runtimeBinaryCount EQUAL 1)
+    message(FATAL_ERROR "The C ABI component must contain exactly one shared implementation binary; found ${runtimeBinaryCount}.")
+endif ()
+
 set(command "${CMAKE_COMMAND}" -S "${SERVERCORE_PACKAGE_SOURCE_DIR}/tests/CAbiConsumer"
     -B "${testRoot}/consumer" -G "${SERVERCORE_PACKAGE_GENERATOR}"
     "-DSERVERCORE_PACKAGE_PREFIX=${testRoot}/relocated")
@@ -35,5 +64,5 @@ run("Configure pure C consumer" ${command})
 run("Build pure C consumer" "${CMAKE_COMMAND}" --build "${testRoot}/consumer" --config "${SERVERCORE_PACKAGE_CONFIGURATION}")
 if (NOT SERVERCORE_PACKAGE_CROSSCOMPILING)
     run("Execute pure C consumer" "${SERVERCORE_PACKAGE_CTEST_COMMAND}" --test-dir "${testRoot}/consumer"
-        -C "${SERVERCORE_PACKAGE_CONFIGURATION}" --output-on-failure)
+        -C "${SERVERCORE_PACKAGE_CONFIGURATION}" --output-on-failure --no-tests=error)
 endif ()

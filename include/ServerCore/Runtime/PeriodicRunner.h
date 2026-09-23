@@ -1,4 +1,5 @@
 #pragma once
+#include "ServerCore/Export.h"
 
 #include "ServerCore/Core/Error.h"
 #include "ServerCore/Runtime/JobRunner.h"
@@ -41,22 +42,22 @@ public:
     using Callback = std::function<void()>;
 
     /// <summary>작업 투입 손잡이·주기·실행할 콜백을 정한다. 실제 타이머 스레드는 Start에서 만든다.</summary>
-    PeriodicRunner(JobRunner::Lease runner, Period period, Callback callback);
+    SERVERCORE_API PeriodicRunner(JobRunner::Lease runner, Period period, Callback callback);
 
     /// <summary>독립 JobRunner를 쓰는 편의 생성자다.</summary>
     /// <remarks>
     /// ServerHost가 소유한 실행자에는 GetJobRunner()이 돌려주는 Lease를 넘긴다. 이 overload는
     /// 호출자가 JobRunner의 종료와 실행 스레드 join을 직접 소유하는 경우에만 쓴다.
     /// </remarks>
-    PeriodicRunner(JobRunner& runner, Period period, Callback callback);
-    ~PeriodicRunner();
+    SERVERCORE_API PeriodicRunner(JobRunner& runner, Period period, Callback callback);
+    SERVERCORE_API ~PeriodicRunner();
 
     PeriodicRunner(const PeriodicRunner&) = delete;
     PeriodicRunner& operator=(const PeriodicRunner&) = delete;
 
     /// <summary>타이머 스레드를 시작한다.</summary>
     /// <returns>0 이하 주기나 빈 콜백은 InvalidArgument, 중복 시작은 AlreadyExists다.</returns>
-    Core::Status Start();
+    SERVERCORE_API Core::Status Start();
 
     /// <summary>새 주기 예약을 멈추고 타이머 스레드의 join이 끝날 때까지 기다린다. 스레드 안전하다.</summary>
     /// <remarks>
@@ -67,17 +68,17 @@ public:
     /// 실행되지 않은 콜백이 소유 순환으로 남는 것을 막는다.
     /// 타이머 스레드 자신이 부르는 것은 계약 위반이다.
     /// </remarks>
-    void Stop();
+    SERVERCORE_API void Stop();
 
     /// <summary>실행하지 않고 버린 주기 수다.</summary>
-    [[nodiscard]] std::uint64_t SkippedCount() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::uint64_t SkippedCount() const noexcept;
 
     /// <summary>새 예약을 만드는 타이머 루프가 실행 중인지 답한다.</summary>
     /// <remarks>동시 실행 중의 순간값이다. 종료 동기화에는 Stop의 반환을 쓴다.</remarks>
-    [[nodiscard]] bool IsRunning() const noexcept;
+    [[nodiscard]] SERVERCORE_API bool IsRunning() const noexcept;
 
 private:
-    static void RecordSkippedPeriods(const JobRunner::Lease& runner, std::uint64_t count) noexcept;
+    SERVERCORE_API static void RecordSkippedPeriods(const JobRunner::Lease& runner, std::uint64_t count) noexcept;
 
     class State;
     std::shared_ptr<State> mState;

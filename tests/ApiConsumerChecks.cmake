@@ -11,6 +11,17 @@ function(ServerCoreSetStrictConsumerWarnings target)
 endfunction()
 
 function(ServerCoreAddConsumerApiChecks canonicalTarget)
+    get_target_property(serverCoreKind ServerCore::ServerCore TYPE)
+    if (DEFINED SERVERCORE_EXPECT_SHARED)
+        if ((SERVERCORE_EXPECT_SHARED AND NOT serverCoreKind STREQUAL "SHARED_LIBRARY") OR
+                (NOT SERVERCORE_EXPECT_SHARED AND NOT serverCoreKind STREQUAL "STATIC_LIBRARY"))
+            message(FATAL_ERROR "ServerCore native library kind differs from the requested package.")
+        endif ()
+    endif ()
+    get_target_property(serverCoreFeatures ServerCore::ServerCore INTERFACE_COMPILE_FEATURES)
+    if (NOT "cxx_std_23" IN_LIST serverCoreFeatures)
+        message(FATAL_ERROR "ServerCore::ServerCore must export the PUBLIC cxx_std_23 requirement.")
+    endif ()
     ServerCoreSetStrictConsumerWarnings("${canonicalTarget}")
 
     set(legacyTarget "${canonicalTarget}LegacyCompatibility")
@@ -26,6 +37,13 @@ function(ServerCoreAddConsumerApiChecks canonicalTarget)
         target_compile_options("${legacyTarget}" PRIVATE -Wno-deprecated-declarations)
     endif ()
     add_test(NAME "${legacyTarget}.Runs" COMMAND "${legacyTarget}")
+    if (WIN32 AND serverCoreKind STREQUAL "SHARED_LIBRARY")
+        foreach(consumer IN ITEMS "${canonicalTarget}" "${legacyTarget}")
+            add_custom_command(TARGET "${consumer}" POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_FILE:ServerCore::ServerCore> $<TARGET_FILE_DIR:${consumer}>)
+        endforeach()
+    endif ()
     set_tests_properties("${legacyTarget}.Runs" PROPERTIES TIMEOUT 30)
 
     foreach (probe IN LISTS SERVERCORE_DEPRECATED_API_PROBES)

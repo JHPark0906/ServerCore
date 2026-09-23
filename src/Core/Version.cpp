@@ -1,5 +1,9 @@
 #include "ServerCore/Core/Version.h"
 
+#if defined(_MSC_VER) && defined(SERVERCORE_SHARED)
+extern "C" SERVERCORE_API void SERVERCORE_NATIVE_ABI_SYMBOL() noexcept {}
+#endif
+
 namespace ServerCore
 {
 namespace

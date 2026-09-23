@@ -2,6 +2,7 @@
 
 #include "Net/Linux/EpollInternal.h"
 #include "Net/Linux/PosixInternal.h"
+#include "Net/EndpointInternal.h"
 #include "ServerCore/Core/Assert.h"
 
 #include <array>
@@ -14,15 +15,16 @@
 namespace ServerCore::Net
 {
 std::shared_ptr<TcpConnection> TcpConnection::Create(const int descriptor,
-    IoContext& context, std::shared_ptr<SendBudget> budget)
+    IoContext& context, std::shared_ptr<SendBudget> budget,Core::IpEndpoint local,Core::IpEndpoint remote)
 {
     SERVERCORE_ASSERT(descriptor >= 0, "a connection requires a valid descriptor");
-    return std::make_shared<TcpConnection>(CreationKey{}, descriptor, context, std::move(budget));
+    return std::make_shared<TcpConnection>(CreationKey{}, descriptor, context, std::move(budget),local,remote);
 }
 
 TcpConnection::TcpConnection(CreationKey, const int descriptor,
-    IoContext& context, std::shared_ptr<SendBudget> budget)
-    : mContext(context), mDescriptor(descriptor), mSends(std::move(budget)) {}
+    IoContext& context, std::shared_ptr<SendBudget> budget,Core::IpEndpoint local,Core::IpEndpoint remote)
+    : mContext(context), mDescriptor(descriptor), mLocalEndpoint(local.IsValid()?local:ReadSocketEndpoint(descriptor,false)),
+      mRemoteEndpoint(remote.IsValid()?remote:ReadSocketEndpoint(descriptor,true)), mSends(std::move(budget)) {}
 
 TcpConnection::~TcpConnection()
 {

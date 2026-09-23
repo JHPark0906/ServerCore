@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include "ServerCore/Session/Session.h"
 
 #include <cstddef>
@@ -37,8 +39,8 @@ namespace ServerCore::Session
 class SessionRegistry
 {
 public:
-    SessionRegistry();
-    ~SessionRegistry();
+    SERVERCORE_API SessionRegistry();
+    SERVERCORE_API ~SessionRegistry();
 
     SessionRegistry(const SessionRegistry&) = delete;
     SessionRegistry& operator=(const SessionRegistry&) = delete;
@@ -51,7 +53,7 @@ public:
     /// 스레드에서의 반복 호출은 성공으로 본다. 다른 스레드로 다시 묶는 것은 지원하지 않는다.
     /// 이 함수와 목록 API를 동시에 부르는 것은 계약 위반이다.
     /// </remarks>
-    [[nodiscard]] Core::Status BindToCurrentThread();
+    [[nodiscard]] SERVERCORE_API Core::Status BindToCurrentThread();
 
     /// <summary>새 세션 번호를 발급한다.</summary>
     /// <remarks>
@@ -59,7 +61,7 @@ public:
     /// 소진되면 TooLarge를 돌려준다. 발급 결과는 이 레지스트리에서 한 번 등록할 수 있도록
     /// 예약된다. 이 함수는 목록을 바꾸지 않으므로 어떤 스레드에서도 부를 수 있다.
     /// </remarks>
-    [[nodiscard]] Core::Result<SessionId> IssueId();
+    [[nodiscard]] SERVERCORE_API Core::Result<SessionId> IssueId();
 
     /// <summary>아직 등록하지 않을 발급 번호의 예약을 버린다.</summary>
     /// <remarks>
@@ -72,7 +74,7 @@ public:
     /// 성공한다. Invalid 번호, 다른 레지스트리가 발급한 번호, 이미 등록·폐기된 번호는
     /// InvalidArgument를 돌려준다.
     /// </remarks>
-    [[nodiscard]] Core::Status DiscardIssuedId(SessionId id);
+    [[nodiscard]] SERVERCORE_API Core::Status DiscardIssuedId(SessionId id);
 
     /// <summary>발급된 번호를 가진 세션을 목록에 넣는다.</summary>
     /// <remarks>
@@ -82,7 +84,7 @@ public:
     /// 등록은 번호의 예약을 소비하므로 해제한 번호를 다시 등록할 수 없다. Session의 Id는
     /// 등록 뒤에도 바뀌지 않아야 한다.
     /// </remarks>
-    [[nodiscard]] Core::Status Register(const std::shared_ptr<Session>& session);
+    [[nodiscard]] SERVERCORE_API Core::Status Register(const std::shared_ptr<Session>& session);
 
     /// <summary>번호에 해당하는 세션을 목록에서 뺀다.</summary>
     /// <remarks>
@@ -90,11 +92,11 @@ public:
     /// 전송 수명과 게임 통지는 ServerHost의 책임이다. 같은 번호의 등록과 경합하면 목록 잠금으로
     /// 순서가 정해진다.
     /// </remarks>
-    [[nodiscard]] Core::Status Unregister(SessionId id);
+    [[nodiscard]] SERVERCORE_API Core::Status Unregister(SessionId id);
 
     /// <summary>번호로 세션을 찾는다. 없으면 비어 있는 포인터를 준다.</summary>
     /// <remarks>BindToCurrentThread()로 묶은 직렬 문맥에서만 부를 수 있다.</remarks>
-    [[nodiscard]] std::shared_ptr<Session> Find(SessionId id) const;
+    [[nodiscard]] SERVERCORE_API std::shared_ptr<Session> Find(SessionId id) const;
 
     /// <summary>모든 세션을 한 번씩 준다.</summary>
     /// <param name="visitor">
@@ -102,11 +104,11 @@ public:
     /// 직렬 실행 문맥을 오래 점유해서는 안 된다.
     /// </param>
     /// <remarks>BindToCurrentThread()로 묶은 직렬 문맥에서만 부를 수 있다.</remarks>
-    void ForEach(const std::function<void(const std::shared_ptr<Session>&)>& visitor) const;
+    SERVERCORE_API void ForEach(const std::function<void(const std::shared_ptr<Session>&)>& visitor) const;
 
     /// <summary>현재 등록된 세션 수를 준다.</summary>
     /// <remarks>BindToCurrentThread()로 묶은 직렬 문맥에서만 부를 수 있다.</remarks>
-    [[nodiscard]] std::size_t Count() const noexcept;
+    [[nodiscard]] SERVERCORE_API std::size_t Count() const noexcept;
 
 private:
     void RequireMutationThread() const;

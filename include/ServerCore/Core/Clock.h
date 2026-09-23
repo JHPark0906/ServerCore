@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include <cstdint>
 
 namespace ServerCore::Core
@@ -10,5 +12,5 @@ namespace ServerCore::Core
 /// 코어는 uint64 밀리초를 준다. 와이어에 더 좁은 값을 싣는지는 게임이 자기 wrap 규칙과 함께
 /// 정한다.
 /// </remarks>
-[[nodiscard]] std::uint64_t MillisecondsSinceProcessStart() noexcept;
+[[nodiscard]] SERVERCORE_API std::uint64_t MillisecondsSinceProcessStart() noexcept;
 }

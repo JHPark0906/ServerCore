@@ -1,7 +1,7 @@
 #include "ServerCore/Net/Acceptor.h"
 
 #include "Net/AcceptorInternal.h"
-#include "Net/Ipv4EndpointInternal.h"
+#include "Net/EndpointInternal.h"
 #include "Net/SendBudgetInternal.h"
 #include "Net/Linux/ConnectionInternal.h"
 #include "Net/Linux/EpollInternal.h"
@@ -32,6 +32,7 @@ public:
         std::condition_variable changed;
         int descriptor = -1;
         std::uint16_t port = 0;
+        Core::IpEndpoint localEndpoint;
         IoContext* context = nullptr;
         std::uint64_t registration = 0;
         std::uint64_t generation = 0;
@@ -60,18 +61,22 @@ void Acceptor::State::Shared::CloseListenerLocked() noexcept
         descriptor = -1;
     }
     port = 0;
+    localEndpoint = {};
 }
 
 void Acceptor::State::Shared::OnReady(const std::uint64_t expectedGeneration)
 {
     int accepted = -1;
+    sockaddr_storage acceptedAddress{};
+    SocketAddressLength acceptedLength=sizeof acceptedAddress;
     IoContext* owner = nullptr;
     {
         const std::lock_guard guard(mutex);
         if (stopping || descriptor < 0 || generation != expectedGeneration) return;
         // Rearm before the application handoff, allowing independent connections
         // to be accepted on other workers while one application's handler blocks.
-        do { accepted = ::accept4(descriptor, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC); }
+        do { acceptedLength=sizeof acceptedAddress;
+            accepted = ::accept4(descriptor,reinterpret_cast<sockaddr*>(&acceptedAddress),&acceptedLength,SOCK_NONBLOCK|SOCK_CLOEXEC); }
         while (accepted < 0 && errno == EINTR);
         const int acceptError = accepted < 0 ? errno : 0;
         if (accepted < 0 && (acceptError == EMFILE || acceptError == ENFILE ||
@@ -107,7 +112,8 @@ void Acceptor::State::Shared::OnReady(const std::uint64_t expectedGeneration)
     std::shared_ptr<TcpConnection> connection;
     try
     {
-        connection = TcpConnection::Create(accepted, *owner, budget);
+        connection = TcpConnection::Create(accepted,*owner,budget,ReadSocketEndpoint(accepted,false),
+            FromNativeEndpoint(acceptedAddress,acceptedLength));
         (*handler)(connection);
         const auto started = connection->Start();
         if (!started.IsOk()) connection->Close();
@@ -132,23 +138,29 @@ Acceptor::~Acceptor() { Stop(); }
 
 Core::Status Acceptor::Listen(const std::string_view address, const std::uint16_t port, const int backlog)
 {
+    const auto parsed=Core::IpEndpoint::Parse(address,port);
+    return Listen(parsed.IsOk()?parsed.Value():Core::IpEndpoint{},backlog);
+}
+Core::Status Acceptor::Listen(const Core::IpEndpoint& endpoint,const int backlog,const bool ipv6Only)
+{
     SERVERCORE_ASSERT(backlog > 0, "listen backlog must be positive");
     auto& state = *mState->shared;
     const std::lock_guard guard(state.mutex);
     if (state.descriptor >= 0)
         return Core::Status::FailWithoutMessage(Core::ErrorCode::AlreadyExists);
-    if (port == 0)
+    if (endpoint.port == 0)
         return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
-    sockaddr_in endpoint{};
-    if (!TryParseIpv4Endpoint(address, port, endpoint))
+    NativeEndpoint address;
+    if (!ToNativeEndpoint(endpoint,address))
         return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
-    const int descriptor = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
+    const int descriptor = ::socket(address.Family(), SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
     if (descriptor < 0) return MakePosixFailure("socket(listen)", errno);
     // Linux SO_REUSEADDR permits restarting after TIME_WAIT, but without
     // SO_REUSEPORT it cannot share an actively listening endpoint.
     const int reuse = 1;
-    if (::setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0 ||
-        ::bind(descriptor, reinterpret_cast<const sockaddr*>(&endpoint), sizeof(endpoint)) < 0 ||
+    if (!SetIpv6Only(descriptor,address.Family(),ipv6Only) ||
+        ::setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0 ||
+        ::bind(descriptor, address.Address(), address.length) < 0 ||
         ::listen(descriptor, backlog) < 0)
     {
         auto failure = MakePosixFailure("listen endpoint", errno);
@@ -156,10 +168,16 @@ Core::Status Acceptor::Listen(const std::string_view address, const std::uint16_
         return failure;
     }
     state.descriptor = descriptor;
-    state.port = port;
+    state.port = endpoint.port;
+    state.localEndpoint = ReadSocketEndpoint(descriptor,false);
     state.stopping = false;
     ++state.generation;
     return Core::Status::Ok();
+}
+Core::IpEndpoint Acceptor::LocalEndpoint() const noexcept
+{
+    const std::lock_guard guard(mState->shared->mutex);
+    return mState->shared->localEndpoint;
 }
 
 void Acceptor::SetLogger(std::shared_ptr<Core::ILogger> logger)

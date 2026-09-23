@@ -1,9 +1,9 @@
 //! Safe owned handles for ServerCore's bounded C ABI.
 //!
 //! Async operations implement standard [`std::future::Future`]; no Tokio runtime
-//! is required. A shared, bounded readiness thread wakes pending futures on a
-//! nominal 10 ms interval, without a hard latency bound: OS scheduling and a
-//! slow custom Waker can delay delivery. Native code never calls Rust closures. Dropping an unfinished
+//! is required. A shared, bounded readiness thread blocks on native event
+//! notifications and explicit deadlines; it never periodically polls pending
+//! operations. Readiness never calls Rust closures from native workers. Dropping an unfinished
 //! response aborts it; dropping a connection closes it; dropping a server stops
 //! and joins its native workers. Keep immutable events alive while borrowing
 //! their bytes, and release them promptly to return the native queue budget.
@@ -11,9 +11,19 @@
 
 pub use servercore_sys as sys;
 use std::{fmt, ptr::NonNull, time::Duration};
+pub mod channel;
+pub mod binary;
+pub mod files;
+pub mod datagram;
+pub mod game_execution;
 pub mod net;
 pub mod observability;
 mod reactor;
+pub mod runtime;
+pub mod request_limiter;
+pub mod endpoint;
+pub mod web_data;
+pub mod web_policy;
 pub mod web;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -161,6 +171,9 @@ pub struct CapacityWait {
 unsafe impl Send for CapacityWait {}
 unsafe impl Sync for CapacityWait {}
 impl CapacityWait {
+    fn native_handle(&self) -> *mut sys::sc_wait {
+        self.handle.as_ptr()
+    }
     pub(crate) fn from_raw(value: *mut sys::sc_wait) -> Result<Self> {
         let handle = pointer(value)?;
         match reactor::Lease::new() {
@@ -184,7 +197,13 @@ impl CapacityWait {
         unsafe { sys::sc_wait_cancel(self.handle.as_ptr()) };
     }
     pub async fn wait(&self) -> Result<()> {
-        reactor::poll_fn(|| self.result())?.await
+        reactor::poll_fn(
+            || self.result(),
+            |notifier, key, out| unsafe {
+                sys::sc_wait_subscribe(self.native_handle(), notifier, key, out)
+            },
+        )?
+        .await
     }
 }
 impl Drop for CapacityWait {

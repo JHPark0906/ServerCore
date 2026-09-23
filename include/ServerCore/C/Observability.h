@@ -8,6 +8,29 @@ extern "C" {
 typedef struct sc_logger sc_logger;
 typedef struct sc_owned_text sc_owned_text;
 typedef struct sc_web_server sc_web_server;
+typedef struct sc_tcp_server sc_tcp_server;
+typedef struct sc_executor sc_executor;
+enum { SC_OBSERVATION_CONNECTIONS=1, SC_OBSERVATION_PENDING_WORK=2, SC_OBSERVATION_RECEIVE_BYTES=4,
+    SC_OBSERVATION_SEND_BYTES=8, SC_OBSERVATION_RETAINED_BYTES=16, SC_OBSERVATION_DRAIN_REMAINING=32,
+    SC_OBSERVATION_CLOSED=64, SC_OBSERVATION_REJECTED=128, SC_OBSERVATION_TIMED_OUT=256 };
+enum { SC_PROTOCOL_UNKNOWN=0, SC_PROTOCOL_HTTP=1, SC_PROTOCOL_WEBSOCKET=2, SC_PROTOCOL_TCP=3,
+    SC_PROTOCOL_UDP=4, SC_PROTOCOL_TASK=5, SC_PROTOCOL_HOST=6, SC_PROTOCOL_LOGGER=7 };
+enum { SC_LIFECYCLE_UNKNOWN=0, SC_LIFECYCLE_CREATED=1, SC_LIFECYCLE_RUNNING=2, SC_LIFECYCLE_DRAINING=3, SC_LIFECYCLE_STOPPED=4 };
+enum { SC_REASON_UNKNOWN=0, SC_REASON_NORMAL=1, SC_REASON_CANCELLED=2, SC_REASON_TIMEOUT=3,
+    SC_REASON_PROTOCOL=4, SC_REASON_CAPACITY=5, SC_REASON_POLICY=6, SC_REASON_TRANSPORT=7, SC_REASON_COUNT=8 };
+typedef struct sc_observation {
+    uint32_t abi_version, struct_size, protocol, lifecycle;
+    uint64_t available, connections, pending_work, receive_bytes, send_bytes, retained_bytes, drain_remaining;
+    uint64_t closed[SC_REASON_COUNT], rejected[SC_REASON_COUNT], timed_out;
+} sc_observation;
+typedef struct sc_log_field { sc_bytes name, value; } sc_log_field;
+typedef struct sc_log_record {
+    uint32_t abi_version, struct_size, level, reserved;
+    sc_bytes message;
+    const sc_log_field* fields;
+    size_t field_count;
+    uint64_t request_id, session_id, task_id, connection_id;
+} sc_log_record;
 enum { SC_LOG_TRACE = 0, SC_LOG_DEBUG = 1, SC_LOG_INFO = 2, SC_LOG_WARN = 3, SC_LOG_ERROR = 4 };
 typedef struct sc_logger_options {
     uint32_t abi_version, struct_size, minimum_level, console;
@@ -43,6 +66,16 @@ typedef struct sc_web_metrics {
 SC_API sc_status sc_logger_options_init(sc_logger_options* options, size_t size);
 SC_API sc_status sc_logger_create(const sc_logger_options* options, sc_logger** out);
 SC_API sc_status sc_logger_try_write(sc_logger* logger, uint32_t level, sc_bytes message);
+/* UTF-8, <=32 unique ASCII field names (<=64B); encoded record <=64KiB and
+ * configured max_message_bytes. Copies before return; no implicit context. */
+SC_API sc_status sc_logger_try_write_record(sc_logger*, const sc_log_record*);
+SC_API sc_status sc_observation_init(sc_observation*, size_t);
+/* Independent samples; unavailable bits mean unknown, not zero. A zero drain
+ * remainder does not replace the lifecycle or native shutdown/join contract. */
+SC_API sc_status sc_logger_get_observation(const sc_logger*, sc_observation*);
+SC_API sc_status sc_web_server_get_observation(const sc_web_server*, sc_observation*);
+SC_API sc_status sc_tcp_server_get_observation(const sc_tcp_server*, sc_observation*);
+SC_API sc_status sc_executor_get_observation(const sc_executor*, sc_observation*);
 SC_API sc_status sc_logger_set_minimum_level(sc_logger* logger, uint32_t level);
 SC_API sc_status sc_logger_get_metrics(const sc_logger* logger, sc_logger_metrics* out);
 SC_API void sc_logger_request_stop(sc_logger* logger);

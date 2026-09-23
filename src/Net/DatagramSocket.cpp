@@ -1,5 +1,5 @@
 #include "Net/DatagramSocket.h"
-#include "Net/Ipv4EndpointInternal.h"
+#include "Net/EndpointInternal.h"
 
 #include <limits>
 #include <string>
@@ -54,10 +54,15 @@ DatagramSocket::~DatagramSocket()
 
 Core::Status DatagramSocket::Bind(const std::string_view address, const std::uint16_t port)
 {
+    const auto parsed=Core::IpEndpoint::Parse(address,port);
+    return Bind(parsed.IsOk()?parsed.Value():Core::IpEndpoint{});
+}
+Core::Status DatagramSocket::Bind(const Core::IpEndpoint& binding,const bool ipv6Only)
+{
     if (IsOpen()) return Status::FailWithoutMessage(ErrorCode::AlreadyExists);
 
-    sockaddr_in endpoint{};
-    if (!TryParseIpv4Endpoint(address, port, endpoint))
+    NativeEndpoint endpoint;
+    if (!ToNativeEndpoint(binding,endpoint))
         return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
 
     try
@@ -66,8 +71,10 @@ Core::Status DatagramSocket::Bind(const std::string_view address, const std::uin
         if (!winsock.IsOk()) return std::move(winsock).TakeStatus();
 
         // The socket closes before its local Winsock owner on every failed bind.
-        SocketOwner socket(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+        SocketOwner socket(::socket(endpoint.Family(), SOCK_DGRAM, IPPROTO_UDP));
         if (socket.Get() == INVALID_SOCKET) return MakeSocketFailure("UDP socket", ::WSAGetLastError());
+        if (!SetIpv6Only(socket.Get(),endpoint.Family(),ipv6Only))
+            return MakeSocketFailure("UDP setsockopt(IPV6_V6ONLY)",::WSAGetLastError());
 
         const BOOL exclusive = TRUE;
         const int receiveBytes = 4 * 1024 * 1024;
@@ -84,18 +91,24 @@ Core::Status DatagramSocket::Bind(const std::string_view address, const std::uin
             return MakeSocketFailure("UDP setsockopt(SO_SNDBUF)", ::WSAGetLastError());
         if (::ioctlsocket(socket.Get(), FIONBIO, &nonblocking) == SOCKET_ERROR)
             return MakeSocketFailure("UDP ioctlsocket(FIONBIO)", ::WSAGetLastError());
-        if (::bind(socket.Get(), reinterpret_cast<const sockaddr*>(&endpoint), sizeof(endpoint)) == SOCKET_ERROR)
+        if (::bind(socket.Get(), endpoint.Address(), endpoint.length) == SOCKET_ERROR)
             return MakeSocketFailure("UDP bind", ::WSAGetLastError());
 
-        int length = sizeof(endpoint);
-        if (::getsockname(socket.Get(), reinterpret_cast<sockaddr*>(&endpoint), &length) == SOCKET_ERROR)
+        int length = sizeof(endpoint.storage);
+        if (::getsockname(socket.Get(), endpoint.Address(), &length) == SOCKET_ERROR)
             return MakeSocketFailure("UDP getsockname", ::WSAGetLastError());
-        if (length != static_cast<int>(sizeof(endpoint)) || endpoint.sin_family != AF_INET || endpoint.sin_port == 0)
+        const auto local=FromNativeEndpoint(endpoint.storage,length);
+        if (!local.IsValid() || local.port == 0)
             return Status::FailWithoutMessage(ErrorCode::PlatformError);
 
+        auto readiness = DatagramReadiness::Create(static_cast<std::uintptr_t>(socket.Get()));
+        if (!readiness.IsOk()) return std::move(readiness).TakeStatus();
+        mReadiness = std::move(readiness.Value());
         mWinsock = std::move(winsock.Value());
         mSocket = socket.Release();
-        mPort = ntohs(endpoint.sin_port);
+        mPort = local.port;
+        mLocalEndpoint = local;
+        mIpv6Only = ipv6Only;
         return Status::Ok();
     }
     catch (...)
@@ -106,9 +119,12 @@ Core::Status DatagramSocket::Bind(const std::string_view address, const std::uin
 
 void DatagramSocket::Close() noexcept
 {
+    if (mReadiness) mReadiness->Close();
     if (mSocket != INVALID_SOCKET) (void)::closesocket(mSocket);
     mSocket = INVALID_SOCKET;
     mPort = 0;
+    mLocalEndpoint = {};
+    mReadiness.reset();
     mWinsock.reset();
 }
 
@@ -118,7 +134,7 @@ DatagramReceiveResult DatagramSocket::Receive(const std::span<std::byte> buffer)
     if (buffer.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
         return {Status::FailWithoutMessage(ErrorCode::TooLarge)};
 
-    sockaddr_in endpoint{};
+    sockaddr_storage endpoint{};
     int length = sizeof(endpoint);
     char emptyBuffer = 0;
     char* const data = buffer.empty() ? &emptyBuffer : reinterpret_cast<char*>(buffer.data());
@@ -132,25 +148,29 @@ DatagramReceiveResult DatagramSocket::Receive(const std::span<std::byte> buffer)
         return {MakeSocketFailure("UDP recvfrom", error), {}, 0,
             error == WSAECONNRESET || error == WSAECONNREFUSED};
     }
-    if (count < 0 || static_cast<std::size_t>(count) > buffer.size() ||
-        length != static_cast<int>(sizeof(endpoint)) || endpoint.sin_family != AF_INET)
+    const auto remote=FromNativeEndpoint(endpoint,length);
+    if (count < 0 || static_cast<std::size_t>(count) > buffer.size() || !remote.IsValid())
         return {Status::FailWithoutMessage(ErrorCode::PlatformError)};
 
-    return {Status::Ok(), endpoint, static_cast<std::size_t>(count)};
+    return {Status::Ok(), remote, static_cast<std::size_t>(count)};
 }
 
-Core::Status DatagramSocket::Send(const sockaddr_in& endpoint,
+Core::Status DatagramSocket::Send(const Core::IpEndpoint& destination,
     const std::span<const std::byte> payload) noexcept
 {
     if (!IsOpen()) return Status::FailWithoutMessage(ErrorCode::Closed);
-    if (endpoint.sin_family != AF_INET) return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
+    NativeEndpoint endpoint;
+    if (!ToNativeEndpoint(destination,endpoint) ||
+        destination.address.Family()!=mLocalEndpoint.address.Family() ||
+        (mIpv6Only&&destination.address.IsV4Mapped()))
+        return Status::FailWithoutMessage(ErrorCode::InvalidArgument);
     if (payload.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
         return Status::FailWithoutMessage(ErrorCode::TooLarge);
 
     const char emptyPayload = 0;
     const char* const data = payload.empty() ? &emptyPayload : reinterpret_cast<const char*>(payload.data());
     const int sent = ::sendto(mSocket, data, static_cast<int>(payload.size()), 0,
-        reinterpret_cast<const sockaddr*>(&endpoint), sizeof(endpoint));
+        endpoint.Address(), endpoint.length);
     if (sent == SOCKET_ERROR)
     {
         const int error = ::WSAGetLastError();

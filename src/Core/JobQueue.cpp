@@ -9,7 +9,7 @@
 
 namespace ServerCore::Core
 {
-Status JobQueue::Post(std::function<void()> job)
+Status JobQueue::Post(Job job)
 {
     if (!job)
     {
@@ -18,8 +18,12 @@ Status JobQueue::Post(std::function<void()> job)
 
     try
     {
+        // A callable move/destructor may reenter the queue. Construct the node
+        // before locking and transfer only its ownership while locked.
+        std::list<Job> node;
+        node.emplace_back(std::move(job));
         const std::lock_guard<std::mutex> guard(mMutex);
-        mJobs.emplace_back(std::move(job));
+        mJobs.splice(mJobs.end(), node);
     }
     catch (const std::bad_alloc&)
     {
@@ -42,7 +46,7 @@ Status JobQueue::Post(std::function<void()> job)
 
 std::size_t JobQueue::DrainOnce()
 {
-    std::deque<std::function<void()>> pending;
+    std::list<Job> pending;
     {
         const std::lock_guard<std::mutex> guard(mMutex);
         // 이번 배치만 떼어 잠금 밖에서 호출한다. 작업이 다시 Post한 일은 다음 DrainOnce로
@@ -50,7 +54,7 @@ std::size_t JobQueue::DrainOnce()
         pending.swap(mJobs);
     }
 
-    for (std::function<void()>& job : pending)
+    for (Job& job : pending)
     {
         try
         {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ServerCore/Export.h"
+
 #include "ServerCore/Core/Error.h"
 #include "ServerCore/Core/Logging.h"
 #include "ServerCore/Protocol/Message.h"
@@ -85,7 +87,7 @@ class Dispatcher
 public:
     // Instance-owned sink. Safe to replace; an in-flight write retains its sink.
     // An unset sink discards diagnostics without consulting process globals.
-    void SetLogger(std::shared_ptr<Core::ILogger> logger) noexcept;
+    SERVERCORE_API void SetLogger(std::shared_ptr<Core::ILogger> logger) noexcept;
     /// <summary>타입 하나에 처리기를 건다.</summary>
     /// <param name="type">봉투의 type과 정확히 같아야 한다. 대소문자를 구분한다.</param>
     /// <param name="maximumRawBodySize">
@@ -99,7 +101,7 @@ public:
     /// Freeze와 동시에 부르면 등록 게이트를 먼저 얻은 쪽이 먼저 끝난다. Freeze가 먼저 닫으면
     /// 이 호출은 ErrorCode::Closed다.
     /// </returns>
-    Core::Status Register(std::string_view type, MessageHandler handler,
+    SERVERCORE_API Core::Status Register(std::string_view type, MessageHandler handler,
         std::size_t maximumRawBodySize = UnlimitedRawBodySize);
 
     /// <summary>등록표를 닫는다.</summary>
@@ -109,10 +111,10 @@ public:
     /// 있으면 그것이 끝날 때까지 기다린 뒤 표를 닫으므로, 이 함수가 돌아온 뒤에는 실행 중 표
     /// 변경이 읽기 경합으로 바뀌지 않는다.
     /// </remarks>
-    void Freeze() noexcept;
+    SERVERCORE_API void Freeze() noexcept;
 
     /// <summary>등록표가 닫혔는지 준다.</summary>
-    [[nodiscard]] bool IsFrozen() const noexcept;
+    [[nodiscard]] SERVERCORE_API bool IsFrozen() const noexcept;
 
     /// <summary>메시지를 그 타입의 처리기로 보낸다.</summary>
     /// <returns>
@@ -122,12 +124,12 @@ public:
     /// Session::Disconnect도 그 함수의 예외 금지 계약을 지켜야 하며, 그 계약 위반은 라우팅
     /// 실패로 숨기지 않고 호출자에게 그대로 드러낸다.
     /// </returns>
-    Core::Status Dispatch(
+    SERVERCORE_API Core::Status Dispatch(
         const std::shared_ptr<Session::Session>& session, const Protocol::Message& message);
 
-    void SetUnknownTypePolicy(UnknownTypePolicy policy) noexcept;
+    SERVERCORE_API void SetUnknownTypePolicy(UnknownTypePolicy policy) noexcept;
 
-    [[nodiscard]] UnknownTypePolicy GetUnknownTypePolicy() const noexcept;
+    [[nodiscard]] SERVERCORE_API UnknownTypePolicy GetUnknownTypePolicy() const noexcept;
 
 private:
     struct TransparentStringHash

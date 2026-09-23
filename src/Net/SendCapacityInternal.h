@@ -25,7 +25,8 @@ private:
     std::atomic<std::size_t> mRetainedBytes{0};
     std::atomic<bool> mClosed{false};
     std::mutex mMutex;
-    std::weak_ptr<SendCapacitySubscription::State> mPending;
+    Core::CompletionSource mPending;
+    std::size_t mRequiredBytes = 0;
     std::uint64_t mRegistration = 0;
 };
 }

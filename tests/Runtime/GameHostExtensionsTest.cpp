@@ -189,6 +189,38 @@ void HostBinaryAndUdpLifetime()
     ExpectTrue(udp->RegisteredSessionCount() == 0 && udp->Port() != 0, "TCP lifetime unregisters UDP without closing caller socket");
 }
 
+void SessionCapacityNotifications()
+{
+    ServerCoreTest::SocketRuntime sockets;
+    Runtime::ServerHost host;
+    Runtime::ServerHostOptions options; options.port = FreePort();
+    auto observer = std::make_shared<Observer>();
+    if (!Start(host, options, observer)) return;
+    Peer peer;
+    ExpectTrue(peer.Connect(host.Port()), "capacity peer connects");
+    if (!Wait([&] { return observer->opened == 1; })) { ExpectTrue(false, "capacity session opens"); return; }
+    auto session = observer->Get();
+    std::atomic<int> called = 0;
+    auto ready = session->WaitForSendCapacity(32, [&](Core::Status status)
+    {
+        ExpectTrue(status.IsOk(), "empty session has capacity");
+        (void)session->QueuedSendBytes();
+        ++called;
+    });
+    ExpectTrue(ready.IsOk() && called == 1, "session forwards one-shot readiness");
+    std::stop_source stop; stop.request_stop();
+    auto cancelled = session->WaitForSendCapacity(32, [&](Core::Status status)
+    { ExpectTrue(status.Code() == Core::ErrorCode::Cancelled, "caller cancellation precedes ready notification"); ++called; }, stop.get_token());
+    ExpectTrue(cancelled.IsOk() && called == 2, "session accepts cancelled notification once");
+    auto tooLarge = session->WaitForSendCapacity(static_cast<std::size_t>(-1), [&](Core::Status) { ++called; });
+    ExpectTrue(tooLarge.GetStatus().Code() == Core::ErrorCode::TooLarge && called == 2, "impossible wait rejects without callback");
+    auto closing = session->WaitForSendCapacity(32, [&](Core::Status status)
+    { ExpectTrue(status.IsOk(), "reentrant close begins from readiness"); session->Disconnect(Core::Status::Ok()); });
+    ExpectTrue(closing.IsOk() && Wait([&] { return observer->closed == 1; }), "readiness callback can disconnect without locking itself");
+    ExpectTrue(session->WaitForSendCapacity(32, [](Core::Status) {}).GetStatus().Code() == Core::ErrorCode::Closed, "closed session rejects new waits");
+    host.Stop();
+}
+
 void DatagramRegistryAndBinary()
 {
     Runtime::DatagramTransport transport;
@@ -201,7 +233,7 @@ void DatagramRegistryAndBinary()
     ExpectTrue(transport.RegisterSession(two).GetStatus().Code() == Core::ErrorCode::WouldBlock, "registration cap is enforced before allocation");
     Net::DatagramSocket peer;
     ExpectTrue(peer.Bind("127.0.0.1", 0).IsOk(), "raw UDP peer binds");
-    sockaddr_in endpoint{}; endpoint.sin_family = AF_INET; endpoint.sin_port = htons(transport.Port()); endpoint.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const auto endpoint=Core::IpEndpoint::Parse("127.0.0.1",transport.Port()).Value();
     auto binary = Protocol::EncodeBinaryMessage(9, Bytes(std::string_view("a\0b", 3)), 64);
     std::array<std::byte, Protocol::DatagramCodec::MaximumDatagramBytes> packet{};
     const auto size = Protocol::DatagramCodec::Encode(packet, token.Value(), 1, binary.Value());
@@ -344,6 +376,7 @@ void HostConcurrentIsolation()
 }
 
 const ServerCoreTest::CheckRegistration BinaryUdp("Runtime.HostBinaryAndUdpLifetime", HostBinaryAndUdpLifetime);
+const ServerCoreTest::CheckRegistration Capacity("Runtime.SessionCapacityNotifications", SessionCapacityNotifications);
 const ServerCoreTest::CheckRegistration DatagramBinary("Runtime.DatagramRegistryAndBinary", DatagramRegistryAndBinary);
 const ServerCoreTest::CheckRegistration Input("Runtime.HostInputAdmission", HostInputAdmission);
 const ServerCoreTest::CheckRegistration Drain("Runtime.HostGracefulDrain", HostGracefulDrain);
