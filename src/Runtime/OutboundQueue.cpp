@@ -1,6 +1,9 @@
 #include "ServerCore/Runtime/OutboundQueue.h"
 #include "Runtime/CompletionSignalInternal.h"
 #include "ServerCore/Net/ConnectionFlowControl.h"
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+#include "Runtime/TransportTestAccess.h"
+#endif
 #include <algorithm>
 #include <limits>
 #include <list>
@@ -21,7 +24,42 @@ template <class T> Core::Result<T> Error(ErrorCode code)
 {
     return Core::Result<T>::FromStatus(Fail(code));
 }
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+struct OutboundArmGateSlot
+{
+    std::mutex mutex;
+    std::weak_ptr<TestAccess::IOutboundArmGate> gate;
+};
+[[nodiscard]] OutboundArmGateSlot& GetOutboundArmGateSlot()
+{
+    static OutboundArmGateSlot slot;
+    return slot;
 }
+void BeforeOutboundArmForTest() noexcept
+{
+    std::shared_ptr<TestAccess::IOutboundArmGate> gate;
+    {
+        const std::lock_guard guard(GetOutboundArmGateSlot().mutex);
+        gate = GetOutboundArmGateSlot().gate.lock();
+    }
+    if (gate)
+        gate->BeforeArm();
+}
+#endif
+}
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+void TestAccess::InstallOutboundArmGate(std::shared_ptr<IOutboundArmGate> gate)
+{
+    const std::lock_guard guard(GetOutboundArmGateSlot().mutex);
+    GetOutboundArmGateSlot().gate = std::move(gate);
+}
+void TestAccess::ClearOutboundArmGate(const std::shared_ptr<IOutboundArmGate>& expected)
+{
+    const std::lock_guard guard(GetOutboundArmGateSlot().mutex);
+    if (GetOutboundArmGateSlot().gate.lock() == expected)
+        GetOutboundArmGateSlot().gate.reset();
+}
+#endif
 std::span<const std::byte> OutboundPayload::Bytes() const noexcept
 {
     return mPrepared ? mPrepared->Bytes() : std::span(mBytes);
@@ -121,6 +159,8 @@ public:
     ErrorCode result = ErrorCode::WouldBlock;
     Core::CompletionSubscription capacity;
     TimerHandle timer;
+    // 스케줄러가 가득 찼을 때 실행 중인 자기 타이머의 완료를 기다리는 재무장 구독.
+    Core::CompletionSubscription wakeRetry;
     std::uint64_t timerGeneration = 0;
     Detail::CompletionSignal completion;
 
@@ -161,7 +201,7 @@ public:
     }
     void Halt(ErrorCode code) noexcept
     {
-        Core::CompletionSubscription wait;
+        Core::CompletionSubscription wait, retry;
         TimerHandle wake;
         {
             const std::lock_guard guard(mutex);
@@ -175,10 +215,12 @@ public:
             }
             changed = true;
             wait = std::move(capacity);
+            retry = std::move(wakeRetry);
             wake = timer;
             ++timerGeneration;
         }
         wait.Reset();
+        retry.Reset();
         (void)wake.RequestCancel();
         // Close/destruction must not allocate a temporary list sentinel (MSVC).
         // Detach one owning pointer at a time; reentrant Close observes halting.
@@ -218,28 +260,13 @@ public:
         }
         Drive();
     }
-    bool Arm(Clock::time_point due)
+    // 세대가 같을 때만 펌프를 도는 깨움 타이머를 건다. Schedule은 콜백을 인라인으로 부르지 않는다.
+    Core::Result<TimerHandle> ScheduleWake(std::uint64_t generation, Clock::time_point due)
     {
-        TimerHandle previous;
-        {
-            const std::lock_guard guard(mutex);
-            previous = timer;
-        }
-        (void)previous.RequestCancel();
         TimerOptions configuration;
         configuration.due = due;
         configuration.retainedBytes = sizeof(std::weak_ptr<State>);
-        std::unique_lock guard(mutex);
-        if (closed)
-        {
-            pumping = false;
-            return false;
-        }
-        const auto generation = ++timerGeneration;
-        // Schedule never invokes its callback inline. Publish the timer and
-        // release pump ownership atomically, so an immediate wake cannot vanish
-        // between scheduling and the active driver's handoff.
-        auto scheduled = scheduler.Schedule(
+        return scheduler.Schedule(
             [weak = weak_from_this(), generation](std::stop_token token)
             {
                 if (token.stop_requested())
@@ -256,16 +283,93 @@ public:
                 return Status::Ok();
             },
             configuration);
-        pumping = false;
-        if (!scheduled.IsOk())
+    }
+    bool Arm(Clock::time_point due)
+    {
+        std::unique_lock guard(mutex);
+        if (closed)
         {
-            const auto code = scheduled.GetStatus().Code();
-            guard.unlock();
-            Halt(code);
+            pumping = false;
             return false;
         }
-        timer = scheduled.Value();
-        return true;
+        // Drive가 changed를 마지막으로 본 잠금 뒤에 온 Enqueue·용량 알림은 pumping 때문에 changed만
+        // 남기고 돌아갔다. 여기서 pumping을 내리므로, 그 변화가 있으면 만료 시각까지 미루지 않고 곧바로
+        // 다시 돌게 한다(EXEC-3, Runtime.OutboundCapacityWakeBeforeArmIsKept).
+        if (changed)
+            due = (std::min)(due, Clock::now());
+        // 대기 중인 깨움 타이머는 새 슬롯을 잡지 않고 옮긴다. 콜백의 세대가 그대로라 아래와 같은 게시
+        // 규칙을 따른다. 매번 취소하고 새로 만들면 취소된 타이머가 정리될 때까지 공유 스케줄러의 슬롯을
+        // 차지했다(EXEC-5, Runtime.OutboundQueueFitsOneSchedulerSlot).
+        if (timer.Reschedule(due).IsOk())
+        {
+            pumping = false;
+            return true;
+        }
+        // Schedule never invokes its callback inline. Publish the timer and
+        // release pump ownership atomically, so an immediate wake cannot vanish
+        // between scheduling and the active driver's handoff.
+        const auto generation = ++timerGeneration;
+        auto scheduled = ScheduleWake(generation, due);
+        pumping = false;
+        if (scheduled.IsOk())
+        {
+            timer = scheduled.Value();
+            return true;
+        }
+        const auto code = scheduled.GetStatus().Code();
+        // 스케줄러가 가득 찼어도 이 큐의 타이머가 아직 실행 중이면(대개 이 Drive를 부른 타이머다) 그것이
+        // 끝나며 슬롯을 돌려준다. 그때 다시 건다. 완료 구독은 인라인으로 불릴 수 있으므로 잠금 밖에서 건다.
+        const auto running = timer;
+        if (code == ErrorCode::WouldBlock && running.IsValid() && !running.IsFinished())
+        {
+            ++metrics.deferredWakes;
+            guard.unlock();
+            auto retry = running.WaitForCompletion(
+                [weak = weak_from_this(), generation](Status)
+                {
+                    if (auto self = weak.lock())
+                        self->RetryWake(generation);
+                });
+            if (retry.IsOk())
+            {
+                Core::CompletionSubscription replaced;
+                {
+                    const std::lock_guard relock(mutex);
+                    replaced = std::move(wakeRetry);
+                    wakeRetry = std::move(retry.Value());
+                }
+                replaced.Reset();
+                return false;
+            }
+            Halt(retry.GetStatus().Code());
+            return false;
+        }
+        guard.unlock();
+        Halt(code);
+        return false;
+    }
+    // 이 큐의 이전 타이머가 끝나 슬롯을 돌려준 뒤 스케줄러의 타이머 스레드에서 불린다. 사용자 코드를
+    // 부르지 않고 즉시 깨움 하나만 건다. 펌프가 깨어나 다음 시각을 다시 정한다.
+    void RetryWake(std::uint64_t generation) noexcept
+    {
+        auto code = ErrorCode::PlatformError;
+        try
+        {
+            std::unique_lock guard(mutex);
+            if (closed || timerGeneration != generation)
+                return;
+            auto scheduled = ScheduleWake(generation, Clock::now());
+            if (scheduled.IsOk())
+            {
+                timer = scheduled.Value();
+                return;
+            }
+            code = scheduled.GetStatus().Code();
+        }
+        catch (...)
+        {
+        }
+        Halt(code);
     }
     void Drive() noexcept
     {
@@ -388,6 +492,10 @@ public:
                 if (!next)
                     pumping = false;
             }
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+            if (next)
+                BeforeOutboundArmForTest();
+#endif
             if (next)
                 (void)Arm(*next);
             FinishIfReady();

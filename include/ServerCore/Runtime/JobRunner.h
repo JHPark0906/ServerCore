@@ -4,8 +4,8 @@
 #include "ServerCore/Core/Error.h"
 #include "ServerCore/Observability/Metrics.h"
 
-#include <condition_variable>
 #include <concepts>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -81,7 +81,7 @@ public:
         Reservation& operator=(const Reservation&) = delete;
         [[nodiscard]] SERVERCORE_API bool IsValid() const noexcept;
         SERVERCORE_API Core::Status Post(Job job);
-        template<class Callback>
+        template <class Callback>
             requires std::same_as<std::remove_cvref_t<Callback>, std::function<void()>>
         Core::Status Post(Callback&& job)
         {
@@ -117,19 +117,17 @@ public:
 
         /// <summary>소유 실행자가 아직 있으면 작업을 넣는다.</summary>
         /// <returns>실행자가 이미 소멸했거나 멈췄으면 Closed다.</returns>
+        /// <remarks>
+        /// 어느 lane에 들어가는지는 Lease를 만든 쪽이 정한다. AcquireLease의 Lease는 일반 lane,
+        /// AcquireControlLease의 Lease는 control lane이다. Lease에는 lane을 고르는 함수가 없으므로
+        /// ServerHost가 게임에 준 Lease로는 Host 내부 작업용 control lane을 쓸 수 없다.
+        /// </remarks>
         SERVERCORE_API Core::Status Post(Job job, std::size_t retainedBytes = 0) const;
-        SERVERCORE_API Core::Status PostControl(Job job, std::size_t retainedBytes = 0) const;
-        template<class Callback>
+        template <class Callback>
             requires std::same_as<std::remove_cvref_t<Callback>, std::function<void()>>
         Core::Status Post(Callback&& job, std::size_t retainedBytes = 0) const
         {
             return Post(JobRunner::FromLegacyJob(std::forward<Callback>(job)), retainedBytes);
-        }
-        template<class Callback>
-            requires std::same_as<std::remove_cvref_t<Callback>, std::function<void()>>
-        Core::Status PostControl(Callback&& job, std::size_t retainedBytes = 0) const
-        {
-            return PostControl(JobRunner::FromLegacyJob(std::forward<Callback>(job)), retainedBytes);
         }
         SERVERCORE_API Core::Result<Reservation> Reserve(std::size_t retainedBytes = 0) const;
 
@@ -139,7 +137,8 @@ public:
     private:
         friend class JobRunner;
         friend class PeriodicRunner;
-        SERVERCORE_API explicit Lease(std::shared_ptr<SharedState> state, bool control = false) noexcept;
+        SERVERCORE_API explicit Lease(
+            std::shared_ptr<SharedState> state, bool control = false) noexcept;
 
         SERVERCORE_API void RecordSkippedPeriodicPeriods(std::uint64_t count) const noexcept;
 
@@ -160,13 +159,13 @@ public:
     // declared bytes: TooLarge. Occupied count/byte capacity: WouldBlock.
     SERVERCORE_API Core::Status Post(Job job, std::size_t retainedBytes = 0);
     SERVERCORE_API Core::Status PostControl(Job job, std::size_t retainedBytes = 0);
-    template<class Callback>
+    template <class Callback>
         requires std::same_as<std::remove_cvref_t<Callback>, std::function<void()>>
     Core::Status Post(Callback&& job, std::size_t retainedBytes = 0)
     {
         return Post(FromLegacyJob(std::forward<Callback>(job)), retainedBytes);
     }
-    template<class Callback>
+    template <class Callback>
         requires std::same_as<std::remove_cvref_t<Callback>, std::function<void()>>
     Core::Status PostControl(Callback&& job, std::size_t retainedBytes = 0)
     {
@@ -205,7 +204,8 @@ public:
     [[nodiscard]] SERVERCORE_API std::size_t PendingCount() const;
     [[nodiscard]] SERVERCORE_API std::size_t OutstandingCount() const noexcept;
     [[nodiscard]] SERVERCORE_API std::size_t RetainedBytes() const noexcept;
-    [[nodiscard]] SERVERCORE_API Observability::JobRunnerMetricsSnapshot GetMetrics() const noexcept;
+    [[nodiscard]] SERVERCORE_API Observability::JobRunnerMetricsSnapshot GetMetrics()
+        const noexcept;
 
     /// <summary>이 실행자의 Lease로 만든 PeriodicRunner들이 건너뛴 주기 수의 합이다.</summary>
     /// <remarks>

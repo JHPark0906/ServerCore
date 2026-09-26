@@ -44,9 +44,9 @@
 
 // Also enforce the actual imported binary's ABI, including manual consumers and
 // CMake's fallback to an installed configuration other than the requested one.
-#define SERVERCORE_DETAIL_ABI_NAME_I(compiler, iter, debug) \
+#define SERVERCORE_DETAIL_ABI_NAME_I(compiler, iter, debug)                                        \
     ServerCoreNativeAbi_Msvc##compiler##_Iter##iter##_Debug##debug
-#define SERVERCORE_DETAIL_ABI_NAME(compiler, iter, debug) \
+#define SERVERCORE_DETAIL_ABI_NAME(compiler, iter, debug)                                          \
     SERVERCORE_DETAIL_ABI_NAME_I(compiler, iter, debug)
 #if defined(_DEBUG)
 #define SERVERCORE_NATIVE_ABI_SYMBOL SERVERCORE_DETAIL_ABI_NAME(_MSC_VER, _ITERATOR_DEBUG_LEVEL, 1)

@@ -93,12 +93,12 @@ void ResultFromValueHoldsValue()
     auto copied = result;
     const auto moved = std::move(copied);
     ServerCoreTest::ExpectTrue(&result.GetStatus() != &independent.GetStatus() &&
-                                  &result.GetStatus() != &copied.GetStatus() &&
-                                  &result.GetStatus() != &moved.GetStatus() &&
-                                  &copied.GetStatus() != &moved.GetStatus(),
+                                   &result.GetStatus() != &copied.GetStatus() &&
+                                   &result.GetStatus() != &moved.GetStatus() &&
+                                   &copied.GetStatus() != &moved.GetStatus(),
         "each successful Result owns its Status independently, including copies and moves");
     ServerCoreTest::ExpectTrue(independent.GetStatus().IsOk() && copied.GetStatus().IsOk() &&
-                                  moved.GetStatus().IsOk() && moved.GetStatus().Message().empty(),
+                                   moved.GetStatus().IsOk() && moved.GetStatus().Message().empty(),
         "copying and moving successful Results preserves their success Status");
     ServerCoreTest::ExpectEqual(7, moved.Value(), "moving a copied Result preserves its value");
 }
@@ -154,9 +154,10 @@ void ResultHoldsNonTrivialValue()
 
     auto pointer = std::make_unique<int>(42);
     const int* const original = pointer.get();
-    const auto owned = ServerCore::Core::Result<std::unique_ptr<int>>::FromValue(std::move(pointer));
-    ServerCoreTest::ExpectTrue(pointer == nullptr && owned.Value().get() == original &&
-                                  *owned.Value() == 42,
+    const auto owned =
+        ServerCore::Core::Result<std::unique_ptr<int>>::FromValue(std::move(pointer));
+    ServerCoreTest::ExpectTrue(
+        pointer == nullptr && owned.Value().get() == original && *owned.Value() == 42,
         "FromValue transfers a move-only value into the result exactly once");
 }
 
@@ -191,8 +192,8 @@ void ResultFailureDoesNotConstructValue()
         auto copied = failed;
         const auto moved = std::move(copied);
         ServerCoreTest::ExpectTrue(!failed.IsOk() && !moved.IsOk() &&
-                                      moved.GetStatus().Code() == ErrorCode::NotFound &&
-                                      moved.GetStatus().Message() == "missing value",
+                                       moved.GetStatus().Code() == ErrorCode::NotFound &&
+                                       moved.GetStatus().Message() == "missing value",
             "copying and moving failure results preserves their error state");
         ServerCoreTest::ExpectEqual(constructionsBefore, DefaultConstructionProbe::constructions,
             "creating, copying and moving failed Results never constructs T");
@@ -212,7 +213,9 @@ struct NonDefaultMoveOnlyValue
 {
     NonDefaultMoveOnlyValue() = delete;
     explicit NonDefaultMoveOnlyValue(std::unique_ptr<OwnedResultResource> resource)
-        : owned(std::move(resource)) {}
+        : owned(std::move(resource))
+    {
+    }
     NonDefaultMoveOnlyValue(NonDefaultMoveOnlyValue&&) noexcept = default;
     NonDefaultMoveOnlyValue& operator=(NonDefaultMoveOnlyValue&&) noexcept = default;
     NonDefaultMoveOnlyValue(const NonDefaultMoveOnlyValue&) = delete;
@@ -239,17 +242,18 @@ void ResultSupportsNonDefaultMoveOnlyValues()
         auto original = OwnedResult::FromValue(NonDefaultMoveOnlyValue(std::move(resource)));
         auto moved = std::move(original);
         ServerCoreTest::ExpectTrue(!resource && moved.Value().owned.get() == identity &&
-                                      moved.Value().owned->value == 42 && !original.Value().owned,
+                                       moved.Value().owned->value == 42 && !original.Value().owned,
             "moving a Result transfers exclusive resource ownership without copying");
         moved = std::move(failed);
         ServerCoreTest::ExpectTrue(!moved.IsOk() && moved.GetStatus().Code() == ErrorCode::Closed,
             "move assignment can replace a successful result with its failure alternative");
         ServerCoreTest::ExpectEqual(1, destructions,
             "replacing a successful result releases its former resource exactly once");
-        moved = OwnedResult::FromValue(NonDefaultMoveOnlyValue(
-            std::make_unique<OwnedResultResource>(9, &destructions)));
-        ServerCoreTest::ExpectTrue(moved.GetStatus().IsOk() && moved.GetStatus().Message().empty() &&
-                                      moved.Value().owned->value == 9,
+        moved = OwnedResult::FromValue(
+            NonDefaultMoveOnlyValue(std::make_unique<OwnedResultResource>(9, &destructions)));
+        ServerCoreTest::ExpectTrue(moved.GetStatus().IsOk() &&
+                                       moved.GetStatus().Message().empty() &&
+                                       moved.Value().owned->value == 9,
             "replacing a failed result with a value restores the success Status contract");
     }
     ServerCoreTest::ExpectEqual(2, destructions,
@@ -278,7 +282,9 @@ const ServerCoreTest::CheckRegistration gResultHoldsNonTrivialValue{
 const ServerCoreTest::CheckRegistration gResultValueIsMutable{ "Error.ResultValueIsMutable",
     ResultValueIsMutable };
 const ServerCoreTest::CheckRegistration gResultFailureDoesNotConstructValue{
-    "Error.ResultFailureDoesNotConstructValue", ResultFailureDoesNotConstructValue };
+    "Error.ResultFailureDoesNotConstructValue", ResultFailureDoesNotConstructValue
+};
 const ServerCoreTest::CheckRegistration gResultSupportsNonDefaultMoveOnlyValues{
-    "Error.ResultSupportsNonDefaultMoveOnlyValues", ResultSupportsNonDefaultMoveOnlyValues };
+    "Error.ResultSupportsNonDefaultMoveOnlyValues", ResultSupportsNonDefaultMoveOnlyValues
+};
 }

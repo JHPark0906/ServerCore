@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
 #ifdef _WIN32
-#include <WinSock2.h>
 #include <WS2tcpip.h>
+#include <WinSock2.h>
 #else
 #include <arpa/inet.h>
 #include <cerrno>
@@ -47,7 +49,8 @@ public:
     ~SocketRuntime()
     {
 #ifdef _WIN32
-        if (mReady) ::WSACleanup();
+        if (mReady)
+            ::WSACleanup();
 #endif
     }
 
@@ -87,7 +90,8 @@ inline void CloseSocket(const Socket socket) noexcept
 #endif
 }
 
-[[nodiscard]] inline bool SetSocketTimeouts(const Socket socket, const unsigned milliseconds) noexcept
+[[nodiscard]] inline bool SetSocketTimeouts(
+    const Socket socket, const unsigned milliseconds) noexcept
 {
 #ifdef _WIN32
     const DWORD timeout = milliseconds;
@@ -95,10 +99,10 @@ inline void CloseSocket(const Socket socket) noexcept
     const timeval timeout{ static_cast<time_t>(milliseconds / 1000u),
         static_cast<suseconds_t>((milliseconds % 1000u) * 1000u) };
 #endif
-    return ::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
-               reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0 &&
-        ::setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,
-            reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0;
+    return ::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout),
+               sizeof(timeout)) == 0 &&
+           ::setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout),
+               sizeof(timeout)) == 0;
 }
 
 [[nodiscard]] inline bool SetSocketNonblocking(const Socket socket) noexcept
@@ -167,10 +171,76 @@ inline void CloseSocket(const Socket socket) noexcept
     ssize_t received;
     do
     {
-        received = ::recvfrom(socket, data, static_cast<std::size_t>(size), flags,
-            endpoint, endpointLength);
+        received = ::recvfrom(
+            socket, data, static_cast<std::size_t>(size), flags, endpoint, endpointLength);
     } while (received == -1 && errno == EINTR);
     return static_cast<int>(received);
 #endif
+}
+
+/// <summary>::1에 UDP 소켓을 묶을 수 있는지 본다.</summary>
+/// <remarks>IPv6가 없는 컨테이너에서는 socket이나 bind가 실패한다. 그런 환경에서 IPv6 검사는
+/// 실패하지도 조용히 통과하지도 않고 ServerCoreTest::Skip으로 건너뛴다(BUILD-4).</remarks>
+[[nodiscard]] inline bool Ipv6LoopbackAvailable() noexcept
+{
+    const SocketRuntime runtime;
+    if (!runtime.IsReady())
+        return false;
+    const Socket probe = ::socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (probe == InvalidSocket)
+        return false;
+    sockaddr_in6 address{};
+    address.sin6_family = AF_INET6;
+    const bool bound =
+        ::inet_pton(AF_INET6, "::1", &address.sin6_addr) == 1 &&
+        ::bind(probe, reinterpret_cast<const sockaddr*>(&address), sizeof address) == 0;
+    CloseSocket(probe);
+    return bound;
+}
+
+/// <summary>운영체제에게 127.0.0.1의 서로 다른 빈 TCP 포트 count개를 받아 돌려준다. 실패하면 빈 목록이다.</summary>
+/// <remarks>
+/// Acceptor와 ServerHost는 포트 0("정하지 않음")을 받지 않는다(Transport.ListenRejectsInvalidEndpoint,
+/// Runtime.ServerHostRejectsInvalidOptions가 고정). 그래서 시험은 임시 소켓을 0에 묶어 운영체제가 준 번호를
+/// 읽고 닫은 뒤 그 번호로 연다. 임시 소켓을 모두 묶어 둔 채 번호를 읽으므로 한 번에 받은 포트끼리는 서로
+/// 다르다. 닫은 뒤 다시 열기까지의 짧은 틈에 다른 프로세스가 같은 번호를 가져갈 수는 있다(TOCTOU).
+/// 그래도 고정 블록과 달리 여러 빌드 트리가 동시에 시험을 돌려도 결정적으로 부딪히지는 않는다.
+/// </remarks>
+[[nodiscard]] inline std::vector<std::uint16_t> FreeLoopbackTcpPorts(const std::size_t count)
+{
+    const SocketRuntime runtime;
+    std::vector<Socket> probes;
+    std::vector<std::uint16_t> ports;
+    bool ok = runtime.IsReady();
+    for (std::size_t index = 0; ok && index < count; ++index)
+    {
+        const Socket probe = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (probe == InvalidSocket)
+        {
+            ok = false;
+            break;
+        }
+        probes.push_back(probe);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        SocketLength length = sizeof address;
+        ok = ::bind(probe, reinterpret_cast<const sockaddr*>(&address), sizeof address) == 0 &&
+             ::getsockname(probe, reinterpret_cast<sockaddr*>(&address), &length) == 0;
+        if (ok)
+            ports.push_back(ntohs(address.sin_port));
+    }
+    for (const Socket probe : probes)
+        CloseSocket(probe);
+    if (!ok)
+        ports.clear();
+    return ports;
+}
+
+/// <summary>FreeLoopbackTcpPorts(1)의 첫 번호다. 실패하면 0이고, 0은 Listen·Configure가 거절한다.</summary>
+[[nodiscard]] inline std::uint16_t FreeLoopbackTcpPort()
+{
+    const auto ports = FreeLoopbackTcpPorts(1);
+    return ports.empty() ? std::uint16_t{ 0 } : ports.front();
 }
 }

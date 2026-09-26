@@ -231,13 +231,18 @@ Core::Result<ProxyPeer> TrustedProxyPolicy::Resolve(
                 return Fail<ProxyPeer>(protocols.GetStatus().Code());
             if (!hosts.IsOk())
                 return Fail<ProxyPeer>(hosts.GetStatus().Code());
-            if ((!protocols.Value().empty() && protocols.Value().size() != nodes.Value().size()) ||
-                (!hosts.Value().empty() && hosts.Value().size() != nodes.Value().size()))
-                return Fail<ProxyPeer>();
+            // nginx·ALB는 X-Forwarded-For에 덧붙이고 Proto·Host는 한 값으로 덮어쓴다. 길이가 다르면 오른쪽
+            // (가까운 hop)부터 짝을 짓고, 짝이 없는 먼 hop은 비워 둔다. 남는 먼 쪽 값은 버린다(WEB-6).
+            const auto aligned = [&nodes](std::vector<std::string>& values, std::size_t index)
+            {
+                const auto count = nodes.Value().size();
+                return index + values.size() < count
+                           ? std::string{}
+                           : std::move(values[index + values.size() - count]);
+            };
             for (std::size_t i = 0; i < nodes.Value().size(); ++i)
-                hops.push_back({ std::move(nodes.Value()[i]),
-                    protocols.Value().empty() ? "" : std::move(protocols.Value()[i]),
-                    hosts.Value().empty() ? "" : std::move(hosts.Value()[i]) });
+                hops.push_back({ std::move(nodes.Value()[i]), aligned(protocols.Value(), i),
+                    aligned(hosts.Value(), i) });
         }
         for (auto it = hops.rbegin(); it != hops.rend() && Trusted(result.client.address); ++it)
         {

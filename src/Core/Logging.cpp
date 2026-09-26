@@ -12,74 +12,119 @@ namespace ServerCore::Core
 Result<std::string> FormatLogRecord(const LogRecord& record, std::size_t maximum) noexcept
 {
     using ResultType = Result<std::string>;
-    const auto fail = [](ErrorCode code) { return ResultType::FromStatus(Status::FailWithoutMessage(code)); };
-    if (record.level < LogLevel::Trace || record.level > LogLevel::Error ||
-        !maximum || maximum > MaxStructuredLogBytes || record.fields.size() > MaxLogFields)
+    const auto fail = [](ErrorCode code)
+    { return ResultType::FromStatus(Status::FailWithoutMessage(code)); };
+    if (record.level < LogLevel::Trace || record.level > LogLevel::Error || !maximum ||
+        maximum > MaxStructuredLogBytes || record.fields.size() > MaxLogFields)
         return fail(ErrorCode::InvalidArgument);
-    if (record.message.size() > maximum) return fail(ErrorCode::TooLarge);
-    if (!Detail::IsValidUtf8(record.message)) return fail(ErrorCode::InvalidArgument);
+    if (record.message.size() > maximum)
+        return fail(ErrorCode::TooLarge);
+    if (!Detail::IsValidUtf8(record.message))
+        return fail(ErrorCode::InvalidArgument);
     for (std::size_t i = 0; i < record.fields.size(); ++i)
     {
         const auto& field = record.fields[i];
-        if (field.name.empty() || field.name.size() > MaxLogFieldNameBytes) return fail(ErrorCode::InvalidArgument);
-        if (field.value.size() > maximum) return fail(ErrorCode::TooLarge);
-        if (!Detail::IsValidUtf8(field.value)) return fail(ErrorCode::InvalidArgument);
+        if (field.name.empty() || field.name.size() > MaxLogFieldNameBytes)
+            return fail(ErrorCode::InvalidArgument);
+        if (field.value.size() > maximum)
+            return fail(ErrorCode::TooLarge);
+        if (!Detail::IsValidUtf8(field.value))
+            return fail(ErrorCode::InvalidArgument);
         for (const unsigned char c : field.name)
-            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-')) return fail(ErrorCode::InvalidArgument);
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                    c == '_' || c == '.' || c == '-'))
+                return fail(ErrorCode::InvalidArgument);
         for (std::size_t previous = 0; previous < i; ++previous)
-            if (record.fields[previous].name == field.name) return fail(ErrorCode::InvalidArgument);
+            if (record.fields[previous].name == field.name)
+                return fail(ErrorCode::InvalidArgument);
     }
     try
     {
         std::string text;
-        text.reserve((std::min)(maximum, std::size_t{1024}));
+        text.reserve((std::min)(maximum, std::size_t{ 1024 }));
         bool tooLarge = false;
-        const auto append = [&](std::string_view value) {
-            if (value.size() > maximum - text.size()) { tooLarge = true; return; }
+        const auto append = [&](std::string_view value)
+        {
+            if (value.size() > maximum - text.size())
+            {
+                tooLarge = true;
+                return;
+            }
             text.append(value);
         };
-        const auto quoted = [&](std::string_view value) {
+        const auto quoted = [&](std::string_view value)
+        {
             append("\"");
             constexpr char hex[] = "0123456789abcdef";
             for (const unsigned char c : value)
             {
-                if (tooLarge) break;
-                if (c == '"' || c == '\\') { const char escaped[]{'\\', static_cast<char>(c)}; append({escaped, 2}); }
-                else if (c < 32 || c == 127) { const char escaped[]{'\\','u','0','0',hex[c >> 4],hex[c & 15]}; append({escaped, 6}); }
-                else { const char byte = static_cast<char>(c); append({&byte, 1}); }
+                if (tooLarge)
+                    break;
+                if (c == '"' || c == '\\')
+                {
+                    const char escaped[]{ '\\', static_cast<char>(c) };
+                    append({ escaped, 2 });
+                }
+                else if (c < 32 || c == 127)
+                {
+                    const char escaped[]{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 15] };
+                    append({ escaped, 6 });
+                }
+                else
+                {
+                    const char byte = static_cast<char>(c);
+                    append({ &byte, 1 });
+                }
             }
             append("\"");
         };
-        static constexpr std::string_view levels[]{"trace", "debug", "info", "warn", "error"};
-        append("{\"level\":"); quoted(levels[static_cast<unsigned>(record.level)]);
-        append(",\"message\":"); quoted(record.message);
-        const auto id = [&](std::string_view name, std::uint64_t value) {
-            if (!value) return;
-            append(","); quoted(name); append(":");
-            char number[20]; const auto converted = std::to_chars(number, number + sizeof(number), value);
-            append({number, static_cast<std::size_t>(converted.ptr - number)});
+        static constexpr std::string_view levels[]{ "trace", "debug", "info", "warn", "error" };
+        append("{\"level\":");
+        quoted(levels[std::to_underlying(record.level)]);
+        append(",\"message\":");
+        quoted(record.message);
+        const auto id = [&](std::string_view name, std::uint64_t value)
+        {
+            if (!value)
+                return;
+            append(",");
+            quoted(name);
+            append(":");
+            char number[20];
+            const auto converted = std::to_chars(number, number + sizeof(number), value);
+            append({ number, static_cast<std::size_t>(converted.ptr - number) });
         };
-        id("request_id", record.correlation.requestId); id("session_id", record.correlation.sessionId);
-        id("task_id", record.correlation.taskId); id("connection_id", record.correlation.connectionId);
+        id("request_id", record.correlation.requestId);
+        id("session_id", record.correlation.sessionId);
+        id("task_id", record.correlation.taskId);
+        id("connection_id", record.correlation.connectionId);
         append(",\"fields\":{");
         for (std::size_t i = 0; i < record.fields.size(); ++i)
         {
-            if (i) append(",");
-            quoted(record.fields[i].name); append(":"); quoted(record.fields[i].value);
+            if (i)
+                append(",");
+            quoted(record.fields[i].name);
+            append(":");
+            quoted(record.fields[i].value);
         }
         append("}}");
-        if (tooLarge) return fail(ErrorCode::TooLarge);
+        if (tooLarge)
+            return fail(ErrorCode::TooLarge);
         return ResultType::FromValue(std::move(text));
     }
-    catch (...) { return ResultType::FromStatus(Status::AllocationFailure()); }
+    catch (...)
+    {
+        return ResultType::FromStatus(Status::AllocationFailure());
+    }
 }
 
 Status WriteLog(ILogger& logger, const LogRecord& record) noexcept
 {
-    if (auto* structured = dynamic_cast<IStructuredLogger*>(&logger)) return structured->TryWriteRecord(record);
+    if (auto* structured = dynamic_cast<IStructuredLogger*>(&logger))
+        return structured->TryWriteRecord(record);
     auto encoded = FormatLogRecord(record);
-    if (!encoded.IsOk()) return std::move(encoded).TakeStatus();
+    if (!encoded.IsOk())
+        return std::move(encoded).TakeStatus();
     logger.Write(record.level, encoded.Value());
     return Status::Ok();
 }
@@ -134,11 +179,16 @@ std::atomic<ILogger*>& CurrentLogger() noexcept
 
 void SetGlobalLogger(std::shared_ptr<ILogger> logger)
 {
-    OwnedLogger() = std::move(logger);
-
     // 널을 넣으면 버리는 로거로 돌아간다. 그래야 GetGlobalLogger가 어느 경우에도 널을
     // 돌려주지 않는다는 약속이 설치 뒤에도 유지된다.
-    ILogger* target = OwnedLogger() ? OwnedLogger().get() : &Discarding();
+    ILogger* target = logger ? logger.get() : &Discarding();
+
+    // 새 로거를 조회 자리에 먼저 올리고, 이전 로거는 함수를 나가며 놓는다. 반대 순서면 이전 로거가
+    // 파괴되는 동안의 조회가 파괴 중인 그 로거를 받는다.
+    // Logging.ReplacingPublishesTheNewLoggerBeforeDestroyingTheOld가 이 순서를 고정한다.
+    // 이 순서가 도는 중의 교체를 안전하게 만들지는 않는다. 교체 전에 받아 둔 참조는 여전히 이전
+    // 로거를 가리킨다.
+    const std::shared_ptr<ILogger> previous = std::exchange(OwnedLogger(), std::move(logger));
     CurrentLogger().store(target, std::memory_order_release);
 }
 

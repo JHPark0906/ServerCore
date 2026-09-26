@@ -106,8 +106,75 @@ void LimiterExpiryAndConcurrency()
     permits.clear();
     ExpectTrue(concurrent.Snapshot().active == 0, "moving permits returns each charge once");
 }
+/// <summary>steady_clock이 기준 시각을 지날 때까지 바쁘게 기다린다. 기다린 길이로 판정하지 않는다.</summary>
+void UntilClockPasses(std::chrono::steady_clock::time_point mark)
+{
+    while (std::chrono::steady_clock::now() <= mark)
+    {
+    }
+}
+// EXEC-4: 키 표가 가득 찼을 때, 활성 permit이 없고 버킷이 가득 찬 항목은 새로 만든 항목과 구별되지
+// 않는데도 idleExpiry(기본 5분)가 지나기 전에는 비우지 않아 새 키를 거절했다. 채움 속도를 1ns당 한
+// 토큰으로 두어, 시계가 한 번 움직이면 버킷이 가득 차게 한다.
+void LimiterEvictsFullBucketsUnderPressure()
+{
+    Runtime::RequestLimiterOptions options;
+    options.maxKeys = 4;
+    options.burstTokens = 1;
+    options.refillTokens = 1000000000;
+    options.refillInterval = 1ms;
+    options.maxConcurrentPerKey = 1;
+    options.maxConcurrentTotal = 8;
+    auto limiter = Runtime::RequestLimiter::Create(options).Value();
+    for (const auto key : { "a", "b", "c", "d" })
+    {
+        auto acquired = limiter.TryAcquire(key);
+        ExpectTrue(acquired.IsOk() && acquired.Value().Allowed(), "table fills with spent keys");
+    }
+    UntilClockPasses(std::chrono::steady_clock::now());
+    auto fresh = limiter.TryAcquire("e");
+    ExpectTrue(fresh.IsOk() && fresh.Value().Allowed(),
+        "idle full buckets yield their slots to a new key under pressure");
+
+    // 활성 permit을 쥔 항목은 비우지 않고, permit을 돌려받은 뒤에는 다시 비울 수 있다.
+    std::vector<Runtime::RequestPermit> held;
+    if (fresh.IsOk() && fresh.Value().Allowed())
+        held.push_back(std::move(*fresh.Value().permit));
+    for (const auto key : { "f", "g", "h" })
+    {
+        auto acquired = limiter.TryAcquire(key);
+        if (acquired.IsOk() && acquired.Value().Allowed())
+            held.push_back(std::move(*acquired.Value().permit));
+    }
+    ExpectTrue(held.size() == 4 && limiter.Snapshot().keys == 4, "table full of active keys");
+    UntilClockPasses(std::chrono::steady_clock::now());
+    auto blocked = limiter.TryAcquire("i");
+    ExpectTrue(blocked.IsOk() && blocked.Value().reason == Runtime::RequestLimitReason::KeyCapacity,
+        "active keys are never evicted");
+    if (!held.empty())
+        held.pop_back();
+    UntilClockPasses(std::chrono::steady_clock::now());
+    auto released = limiter.TryAcquire("i");
+    ExpectTrue(released.IsOk() && released.Value().Allowed(),
+        "a returned permit makes its full bucket evictable again");
+
+    // 버킷이 비어 있는 항목은 압박 중에도 비우지 않는다. 비우면 소진한 속도 한도가 초기화된다.
+    options.refillInterval = 24h;
+    options.refillTokens = 1;
+    auto depleted = Runtime::RequestLimiter::Create(options).Value();
+    for (const auto key : { "a", "b", "c", "d" })
+        (void)depleted.TryAcquire(key);
+    UntilClockPasses(std::chrono::steady_clock::now());
+    auto denied = depleted.TryAcquire("e");
+    ExpectTrue(denied.IsOk() && denied.Value().reason == Runtime::RequestLimitReason::KeyCapacity,
+        "depleted buckets keep their slots under pressure");
+    ExpectTrue(depleted.TryAcquire("a").Value().reason == Runtime::RequestLimitReason::Rate,
+        "a kept depleted bucket still limits its key");
+}
 ServerCoreTest::CheckRegistration a(
     "Runtime.RequestLimiterBudgetsAndLease", LimiterBudgetsAndLease);
 ServerCoreTest::CheckRegistration b(
     "Runtime.RequestLimiterExpiryAndConcurrency", LimiterExpiryAndConcurrency);
+ServerCoreTest::CheckRegistration c(
+    "Runtime.RequestLimiterEvictsFullBucketsUnderPressure", LimiterEvictsFullBucketsUnderPressure);
 }

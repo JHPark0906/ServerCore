@@ -195,7 +195,10 @@ public:
 private:
     struct ValueStorage
     {
-        explicit ValueStorage(T&& initialValue) : value(std::move(initialValue)) {}
+        explicit ValueStorage(T&& initialValue)
+            : value(std::move(initialValue))
+        {
+        }
         T value;
         Status status = Status::Ok();
     };

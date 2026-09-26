@@ -6,6 +6,9 @@
 namespace C = ServerCore::CDetail;
 namespace W = ServerCore::Web;
 namespace Core = ServerCore::Core;
+// C 프록시 헤더 방식을 ProxyHeaderMode로 그대로 옮긴다(static_cast). 번호가 갈리면 여기서 멈춘다.
+static_assert(SC_PROXY_FORWARDED == static_cast<int>(W::ProxyHeaderMode::Forwarded) &&
+              SC_PROXY_X_FORWARDED == static_cast<int>(W::ProxyHeaderMode::XForwarded));
 struct sc_trusted_proxy
 {
     W::TrustedProxyPolicy value;
@@ -106,28 +109,28 @@ sc_status Export(W::HttpPolicyResult value, sc_http_policy_result** out)
 }
 extern "C"
 {
-    sc_status sc_http_policy_options_init(sc_http_policy_options* o, size_t size)
+    sc_status sc_http_policy_options_init(sc_http_policy_options* o, size_t size) noexcept
     {
         if (!o || size < sizeof(*o))
             return SC_INVALID_ARGUMENT;
         *o = { SC_ABI_VERSION, sizeof(*o), 64, 16384, 256 * 1024 };
         return SC_OK;
     }
-    sc_status sc_cors_options_init(sc_cors_options* o, size_t size)
+    sc_status sc_cors_options_init(sc_cors_options* o, size_t size) noexcept
     {
         if (!o || size < sizeof(*o))
             return SC_INVALID_ARGUMENT;
         *o = { SC_ABI_VERSION, sizeof(*o), nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, 0, 600 };
         return SC_OK;
     }
-    sc_status sc_proxy_options_init(sc_proxy_options* o, size_t size)
+    sc_status sc_proxy_options_init(sc_proxy_options* o, size_t size) noexcept
     {
         if (!o || size < sizeof(*o))
             return SC_INVALID_ARGUMENT;
         *o = { SC_ABI_VERSION, sizeof(*o), nullptr, 0, SC_PROXY_FORWARDED, 0, 0, 1, 32, 8192 };
         return SC_OK;
     }
-    sc_status sc_trusted_proxy_create(const sc_proxy_options* o, sc_trusted_proxy** out)
+    sc_status sc_trusted_proxy_create(const sc_proxy_options* o, sc_trusted_proxy** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
@@ -166,12 +169,12 @@ extern "C"
                 return SC_OK;
             });
     }
-    void sc_trusted_proxy_destroy(sc_trusted_proxy* value)
+    void sc_trusted_proxy_destroy(sc_trusted_proxy* value) noexcept
     {
         delete value;
     }
     sc_status sc_trusted_proxy_resolve(const sc_trusted_proxy* proxy, const sc_ip_endpoint* peer,
-        const sc_header* headers, size_t count, sc_proxy_peer** out)
+        const sc_header* headers, size_t count, sc_proxy_peer** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
@@ -195,9 +198,9 @@ extern "C"
                 return SC_OK;
             });
     }
-    sc_status sc_proxy_peer_get(const sc_proxy_peer* peer, sc_proxy_peer_view* out)
+    sc_status sc_proxy_peer_get(const sc_proxy_peer* peer, sc_proxy_peer_view* out) noexcept
     {
-        if (!peer || !C::Version(out))
+        if (!peer || !C::OutputVersion(out))
             return SC_INVALID_ARGUMENT;
         out->transport_peer = C::FromEndpoint(peer->value.transportPeer);
         out->client = C::FromEndpoint(peer->value.client);
@@ -206,11 +209,11 @@ extern "C"
         out->host = C::View(peer->value.host);
         return SC_OK;
     }
-    void sc_proxy_peer_destroy(sc_proxy_peer* value)
+    void sc_proxy_peer_destroy(sc_proxy_peer* value) noexcept
     {
         delete value;
     }
-    sc_status sc_http_policy_create(const sc_http_policy_options* o, sc_http_policy** out)
+    sc_status sc_http_policy_create(const sc_http_policy_options* o, sc_http_policy** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
@@ -233,7 +236,7 @@ extern "C"
             });
     }
     sc_status sc_http_policy_add_headers(
-        sc_http_policy* p, sc_bytes prefix, const sc_header* headers, size_t count)
+        sc_http_policy* p, sc_bytes prefix, const sc_header* headers, size_t count) noexcept
     {
         return C::Protect(
             [&]() -> sc_status
@@ -248,7 +251,8 @@ extern "C"
                 return Add(p, prefix, W::CommonHeadersPolicy(std::move(fields)), bytes);
             });
     }
-    sc_status sc_http_policy_add_cors(sc_http_policy* p, sc_bytes prefix, const sc_cors_options* o)
+    sc_status sc_http_policy_add_cors(
+        sc_http_policy* p, sc_bytes prefix, const sc_cors_options* o) noexcept
     {
         if (!C::Version(o) || o->allow_credentials > 1)
             return SC_INVALID_ARGUMENT;
@@ -281,8 +285,8 @@ extern "C"
                 return Add(p, prefix, W::CorsPolicy(std::move(options)), bytes);
             });
     }
-    sc_status sc_http_policy_add_request_id(
-        sc_http_policy* p, sc_bytes prefix, sc_bytes header, uint32_t incoming, size_t maxBytes)
+    sc_status sc_http_policy_add_request_id(sc_http_policy* p, sc_bytes prefix, sc_bytes header,
+        uint32_t incoming, size_t maxBytes) noexcept
     {
         if (!C::Valid(header) || header.len > 128 || incoming > 1)
             return SC_INVALID_ARGUMENT;
@@ -295,7 +299,7 @@ extern "C"
             });
     }
     sc_status sc_http_policy_add_proxy(
-        sc_http_policy* p, sc_bytes prefix, const sc_trusted_proxy* proxy)
+        sc_http_policy* p, sc_bytes prefix, const sc_trusted_proxy* proxy) noexcept
     {
         if (!proxy)
             return SC_INVALID_ARGUMENT;
@@ -309,7 +313,7 @@ extern "C"
             });
     }
     sc_status sc_http_policy_evaluate(sc_http_policy* p, const sc_request_view* request,
-        const sc_ip_endpoint* peer, uint32_t upgrade, sc_http_policy_result** out)
+        const sc_ip_endpoint* peer, uint32_t upgrade, sc_http_policy_result** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
@@ -351,7 +355,7 @@ extern "C"
             });
     }
     sc_status sc_http_policy_evaluate_event(
-        sc_http_policy* policy, const sc_web_event* event, sc_http_policy_result** out)
+        sc_http_policy* policy, const sc_web_event* event, sc_http_policy_result** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
@@ -372,9 +376,9 @@ extern "C"
             sc_web_event_policy_is_websocket(event), out);
     }
     sc_status sc_http_policy_result_get(
-        const sc_http_policy_result* value, sc_http_policy_view* out)
+        const sc_http_policy_result* value, sc_http_policy_view* out) noexcept
     {
-        if (!value || !C::Version(out))
+        if (!value || !C::OutputVersion(out))
             return SC_INVALID_ARGUMENT;
         const auto& result = value->value;
         out->has_response = result.response ? 1u : 0u;
@@ -388,7 +392,7 @@ extern "C"
         return SC_OK;
     }
     sc_status sc_http_policy_result_apply(
-        const sc_http_policy_result* result, sc_request_decision* decision)
+        const sc_http_policy_result* result, sc_request_decision* decision) noexcept
     {
         if (!result || !decision)
             return SC_INVALID_ARGUMENT;
@@ -409,16 +413,16 @@ extern "C"
             result->headers.size(), result->attributes.data(), result->attributes.size() };
         return sc_request_decision_allow(decision, &allow);
     }
-    void sc_http_policy_result_destroy(sc_http_policy_result* value)
+    void sc_http_policy_result_destroy(sc_http_policy_result* value) noexcept
     {
         delete value;
     }
-    void sc_http_policy_destroy(sc_http_policy* value)
+    void sc_http_policy_destroy(sc_http_policy* value) noexcept
     {
         delete value;
     }
     sc_status sc_http_json_response(
-        sc_bytes json, uint32_t status, size_t maxBytes, sc_http_policy_result** out)
+        sc_bytes json, uint32_t status, size_t maxBytes, sc_http_policy_result** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
@@ -442,7 +446,7 @@ extern "C"
             });
     }
     sc_status sc_http_error_response(
-        sc_status error, sc_bytes id, uint32_t status, sc_http_policy_result** out)
+        sc_status error, sc_bytes id, uint32_t status, sc_http_policy_result** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;

@@ -1,0 +1,8 @@
+# ThreadSanitizer suppressions for the CI thread-sanitizer job (.github/workflows/build.yml).
+# Each entry must name one known false positive as narrowly as the report allows. Do not add
+# entries for real races, and prefer removing the construct TSan cannot model over suppressing it.
+#
+# There are currently no entries. The C ABI runtime shutdown used std::timed_mutex::try_lock_until,
+# which GCC 13's libtsan cannot see (pthread_mutex_clocklock is not intercepted), so its unlock was
+# reported as a mutex misuse. src/C/Runtime.cpp now serializes shutdown with a mutex, a condition
+# variable and a flag instead, which TSan models fully.

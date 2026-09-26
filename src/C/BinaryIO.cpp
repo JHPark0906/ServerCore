@@ -5,6 +5,9 @@
 #include <optional>
 namespace P = ServerCore::Protocol;
 namespace C = ServerCore::CDetail;
+// C 바이트 순서 상수를 ByteOrder로 그대로 옮긴다(static_cast). 번호가 갈리면 여기서 멈춘다.
+static_assert(SC_BIG_ENDIAN == static_cast<int>(P::ByteOrder::BigEndian) &&
+              SC_LITTLE_ENDIAN == static_cast<int>(P::ByteOrder::LittleEndian));
 struct sc_binary_reader
 {
     std::vector<std::byte> storage;
@@ -17,7 +20,7 @@ struct sc_binary_writer
 extern "C"
 {
     sc_status sc_binary_reader_create(
-        sc_bytes input, uint32_t order, size_t limit, sc_binary_reader** out)
+        sc_bytes input, uint32_t order, size_t limit, sc_binary_reader** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
@@ -41,20 +44,20 @@ extern "C"
                 return SC_OK;
             });
     }
-    void sc_binary_reader_destroy(sc_binary_reader* value)
+    void sc_binary_reader_destroy(sc_binary_reader* value) noexcept
     {
         delete value;
     }
-    size_t sc_binary_reader_position(const sc_binary_reader* value)
+    size_t sc_binary_reader_position(const sc_binary_reader* value) noexcept
     {
         return value ? value->native->Position() : 0;
     }
-    size_t sc_binary_reader_remaining(const sc_binary_reader* value)
+    size_t sc_binary_reader_remaining(const sc_binary_reader* value) noexcept
     {
         return value ? value->native->Remaining() : 0;
     }
 #define SC_READ_NUMBER(name, type, expression)                                                     \
-    sc_status name(sc_binary_reader* value, type* out)                                             \
+    sc_status name(sc_binary_reader* value, type* out) noexcept                                    \
     {                                                                                              \
         if (!value || !out)                                                                        \
             return SC_INVALID_ARGUMENT;                                                            \
@@ -68,7 +71,7 @@ extern "C"
     SC_READ_NUMBER(sc_binary_read_f32, float, ReadFloat32())
     SC_READ_NUMBER(sc_binary_read_f64, double, ReadFloat64())
 #undef SC_READ_NUMBER
-    sc_status sc_binary_read_unsigned(sc_binary_reader* value, size_t width, uint64_t* out)
+    sc_status sc_binary_read_unsigned(sc_binary_reader* value, size_t width, uint64_t* out) noexcept
     {
         if (!value || !out)
             return SC_INVALID_ARGUMENT;
@@ -78,7 +81,7 @@ extern "C"
         *out = result.Value();
         return SC_OK;
     }
-    sc_status sc_binary_read_signed(sc_binary_reader* value, size_t width, int64_t* out)
+    sc_status sc_binary_read_signed(sc_binary_reader* value, size_t width, int64_t* out) noexcept
     {
         if (!value || !out)
             return SC_INVALID_ARGUMENT;
@@ -89,7 +92,7 @@ extern "C"
         return SC_OK;
     }
 #define SC_READ_BYTES(name, expression)                                                            \
-    sc_status name(sc_binary_reader* value, size_t length, sc_bytes* out)                          \
+    sc_status name(sc_binary_reader* value, size_t length, sc_bytes* out) noexcept                 \
     {                                                                                              \
         if (!value || !out)                                                                        \
             return SC_INVALID_ARGUMENT;                                                            \
@@ -103,11 +106,11 @@ extern "C"
     SC_READ_BYTES(sc_binary_read_blob, ReadLengthPrefixed(length))
     SC_READ_BYTES(sc_binary_read_utf8, ReadUtf8(length))
 #undef SC_READ_BYTES
-    sc_status sc_binary_skip(sc_binary_reader* value, size_t length)
+    sc_status sc_binary_skip(sc_binary_reader* value, size_t length) noexcept
     {
         return value ? C::Code(value->native->Skip(length)) : SC_INVALID_ARGUMENT;
     }
-    sc_status sc_binary_writer_create(size_t limit, uint32_t order, sc_binary_writer** out)
+    sc_status sc_binary_writer_create(size_t limit, uint32_t order, sc_binary_writer** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
@@ -122,16 +125,16 @@ extern "C"
                 return SC_OK;
             });
     }
-    void sc_binary_writer_destroy(sc_binary_writer* value)
+    void sc_binary_writer_destroy(sc_binary_writer* value) noexcept
     {
         delete value;
     }
-    void sc_binary_writer_clear(sc_binary_writer* value)
+    void sc_binary_writer_clear(sc_binary_writer* value) noexcept
     {
         if (value)
             value->native.Clear();
     }
-    sc_status sc_binary_writer_view(const sc_binary_writer* value, sc_bytes* out)
+    sc_status sc_binary_writer_view(const sc_binary_writer* value, sc_bytes* out) noexcept
     {
         if (!value || !out)
             return SC_INVALID_ARGUMENT;
@@ -139,40 +142,41 @@ extern "C"
         *out = { reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size() };
         return SC_OK;
     }
-    sc_status sc_binary_write_unsigned(sc_binary_writer* value, uint64_t number, size_t width)
+    sc_status sc_binary_write_unsigned(
+        sc_binary_writer* value, uint64_t number, size_t width) noexcept
     {
         return value
                    ? C::Protect([&] { return C::Code(value->native.WriteUnsigned(number, width)); })
                    : SC_INVALID_ARGUMENT;
     }
-    sc_status sc_binary_write_signed(sc_binary_writer* value, int64_t number, size_t width)
+    sc_status sc_binary_write_signed(sc_binary_writer* value, int64_t number, size_t width) noexcept
     {
         return value ? C::Protect([&] { return C::Code(value->native.WriteSigned(number, width)); })
                      : SC_INVALID_ARGUMENT;
     }
-    sc_status sc_binary_write_bool(sc_binary_writer* value, uint32_t number)
+    sc_status sc_binary_write_bool(sc_binary_writer* value, uint32_t number) noexcept
     {
         return value && number < 2
                    ? C::Protect([&] { return C::Code(value->native.WriteBool(number != 0)); })
                    : SC_INVALID_ARGUMENT;
     }
-    sc_status sc_binary_write_f32(sc_binary_writer* value, float number)
+    sc_status sc_binary_write_f32(sc_binary_writer* value, float number) noexcept
     {
         return value ? C::Protect([&] { return C::Code(value->native.WriteFloat32(number)); })
                      : SC_INVALID_ARGUMENT;
     }
-    sc_status sc_binary_write_f64(sc_binary_writer* value, double number)
+    sc_status sc_binary_write_f64(sc_binary_writer* value, double number) noexcept
     {
         return value ? C::Protect([&] { return C::Code(value->native.WriteFloat64(number)); })
                      : SC_INVALID_ARGUMENT;
     }
-    sc_status sc_binary_write_bytes(sc_binary_writer* value, sc_bytes bytes)
+    sc_status sc_binary_write_bytes(sc_binary_writer* value, sc_bytes bytes) noexcept
     {
         return value && C::Valid(bytes)
                    ? C::Protect([&] { return C::Code(value->native.WriteBytes(C::Bytes(bytes))); })
                    : SC_INVALID_ARGUMENT;
     }
-    sc_status sc_binary_write_blob(sc_binary_writer* value, sc_bytes bytes, size_t limit)
+    sc_status sc_binary_write_blob(sc_binary_writer* value, sc_bytes bytes, size_t limit) noexcept
     {
         return value && C::Valid(bytes) ? C::Protect(
                                               [&]
@@ -182,7 +186,7 @@ extern "C"
                                               })
                                         : SC_INVALID_ARGUMENT;
     }
-    sc_status sc_binary_write_utf8(sc_binary_writer* value, sc_bytes bytes, size_t limit)
+    sc_status sc_binary_write_utf8(sc_binary_writer* value, sc_bytes bytes, size_t limit) noexcept
     {
         return value && C::Valid(bytes)
                    ? C::Protect(
@@ -190,7 +194,8 @@ extern "C"
                    : SC_INVALID_ARGUMENT;
     }
     sc_status sc_protocol_negotiate(const sc_protocol_offer* server, size_t serverCount,
-        const sc_protocol_offer* peer, size_t peerCount, uint64_t required, sc_protocol_offer* out)
+        const sc_protocol_offer* peer, size_t peerCount, uint64_t required,
+        sc_protocol_offer* out) noexcept
     {
         if (!server || !peer || !out || !serverCount || serverCount > 64 || !peerCount ||
             peerCount > 64)

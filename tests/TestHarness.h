@@ -53,6 +53,19 @@ public:
 /// <param name="what">무엇을 확인했는지. 원인 짐작을 적지 않는다.</param>
 void ExpectTrue(bool condition, std::string_view what);
 
+/// <summary>건너뛴 검사의 종료 코드. ctest에는 SKIP_RETURN_CODE로 같은 값을 준다.</summary>
+inline constexpr int SkipExitCode = 77;
+
+/// <summary>
+/// 환경이 검사의 전제를 갖추지 못해 이 검사를 건너뛴다고 기록한다. 부른 검사는 곧바로 돌아온다.
+/// </summary>
+/// <remarks>
+/// 실패가 없으면 실행 파일은 SkipExitCode로 끝나고 ctest는 통과가 아니라 건너뜀으로 센다.
+/// requiredBy로 준 환경 변수가 설정되어 있으면(CI가 그 전제를 갖췄다고 선언한 경우) 건너뛰지 않고
+/// 실패로 기록한다. 그래야 전제가 조용히 사라져 검사가 빠지는 일이 없다.
+/// </remarks>
+void Skip(std::string_view reason, const char* requiredBy = nullptr);
+
 /// <summary>ExpectEqual이 어긋남을 알리는 창구다. 검사가 직접 부르지 않는다.</summary>
 void ReportMismatch(const std::string& expected, const std::string& actual, std::string_view what);
 

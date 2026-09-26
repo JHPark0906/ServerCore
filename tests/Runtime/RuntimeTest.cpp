@@ -34,16 +34,20 @@ void JobRunnerDrainsAcceptedJobsOnStop()
 
     const ServerCore::Core::Status first = runner.Post([&order]() { order.push_back(1); });
     const ServerCore::Core::Status second = runner.Post([&order]() { order.push_back(2); });
-    ServerCoreTest::ExpectTrue(first.IsOk() && second.IsOk(), "jobs are accepted before RequestStop");
+    ServerCoreTest::ExpectTrue(
+        first.IsOk() && second.IsOk(), "jobs are accepted before RequestStop");
 
     runner.RequestStop();
     runner.RequestStop();
-    ServerCoreTest::ExpectTrue(runner.IsStopRequested(), "RequestStop synchronously closes admission");
-    ServerCoreTest::ExpectTrue(order.empty(), "RequestStop does not execute or wait for queued jobs");
+    ServerCoreTest::ExpectTrue(
+        runner.IsStopRequested(), "RequestStop synchronously closes admission");
+    ServerCoreTest::ExpectTrue(
+        order.empty(), "RequestStop does not execute or wait for queued jobs");
     std::thread worker([&runner]() { runner.RunUntilStopped(); });
     worker.join();
 
-    ServerCoreTest::ExpectEqual(std::size_t{ 2 }, order.size(), "accepted jobs drain after RequestStop");
+    ServerCoreTest::ExpectEqual(
+        std::size_t{ 2 }, order.size(), "accepted jobs drain after RequestStop");
     if (order.size() == 2)
     {
         ServerCoreTest::ExpectEqual(1, order[0], "first accepted job keeps its order");
@@ -51,22 +55,28 @@ void JobRunnerDrainsAcceptedJobsOnStop()
     }
 
     const ServerCore::Core::Status rejected = runner.Post([]() {});
-    ServerCoreTest::ExpectTrue(
-        !rejected.IsOk() && rejected.Code() == ErrorCode::Closed, "Post after RequestStop reports Closed");
+    ServerCoreTest::ExpectTrue(!rejected.IsOk() && rejected.Code() == ErrorCode::Closed,
+        "Post after RequestStop reports Closed");
 
     JobRunner callbackRunner;
     bool requestReturned = false;
     bool acceptedTailRan = false;
-    const auto stoppingJob = callbackRunner.Post([&]() {
-        callbackRunner.RequestStop();
-        requestReturned = callbackRunner.IsStopRequested();
-    });
+    const auto stoppingJob = callbackRunner.Post(
+        [&]()
+        {
+            callbackRunner.RequestStop();
+            requestReturned = callbackRunner.IsStopRequested();
+        });
     const auto tailJob = callbackRunner.Post([&]() { acceptedTailRan = requestReturned; });
-    ServerCoreTest::ExpectTrue(stoppingJob.IsOk() && tailJob.IsOk(), "callback shutdown jobs are accepted");
-    if (!stoppingJob.IsOk()) callbackRunner.RequestStop();
+    ServerCoreTest::ExpectTrue(
+        stoppingJob.IsOk() && tailJob.IsOk(), "callback shutdown jobs are accepted");
+    if (!stoppingJob.IsOk())
+        callbackRunner.RequestStop();
     callbackRunner.RunUntilStopped();
-    ServerCoreTest::ExpectTrue(requestReturned, "an executing job can request stop without waiting for itself");
-    ServerCoreTest::ExpectTrue(acceptedTailRan, "work accepted before an executing job requests stop still drains");
+    ServerCoreTest::ExpectTrue(
+        requestReturned, "an executing job can request stop without waiting for itself");
+    ServerCoreTest::ExpectTrue(
+        acceptedTailRan, "work accepted before an executing job requests stop still drains");
 }
 
 void JobRunnerReportsThreadAffinity()
@@ -115,8 +125,12 @@ void JobRunnerMoveOnlyOwnership()
     } reentrantState;
     struct ReentrantJob
     {
-        explicit ReentrantJob(ReentrantState* value) : state(value) {}
-        ReentrantJob(ReentrantJob&& other) noexcept : state(other.state)
+        explicit ReentrantJob(ReentrantState* value)
+            : state(value)
+        {
+        }
+        ReentrantJob(ReentrantJob&& other) noexcept
+            : state(other.state)
         {
             (void)state->runner->RetainedBytes();
             ++state->moves;
@@ -131,7 +145,10 @@ void JobRunnerMoveOnlyOwnership()
     };
     struct Capture
     {
-        explicit Capture(int& count) : released(count) {}
+        explicit Capture(int& count)
+            : released(count)
+        {
+        }
         ~Capture() { ++released; }
         int& released;
     };
@@ -140,28 +157,33 @@ void JobRunnerMoveOnlyOwnership()
     JobRunner runner;
     reentrantState.runner = &runner;
     const auto lease = runner.AcquireLease();
-    const auto job = [&]() -> JobRunner::Job {
-        return [capture = std::make_unique<Capture>(released), &called] {
+    const auto controlLease = runner.AcquireControlLease();
+    const auto job = [&]() -> JobRunner::Job
+    {
+        return [capture = std::make_unique<Capture>(released), &called]
+        {
             (void)capture;
             ++called;
         };
     };
     std::function<void()> empty;
     ServerCoreTest::ExpectTrue(runner.Post(empty).Code() == ErrorCode::InvalidArgument &&
-        runner.PostControl(empty).Code() == ErrorCode::InvalidArgument &&
-        lease.Post(empty).Code() == ErrorCode::InvalidArgument &&
-        lease.PostControl(empty).Code() == ErrorCode::InvalidArgument,
+                                   runner.PostControl(empty).Code() == ErrorCode::InvalidArgument &&
+                                   lease.Post(empty).Code() == ErrorCode::InvalidArgument &&
+                                   controlLease.Post(empty).Code() == ErrorCode::InvalidArgument,
         "empty legacy callbacks are invalid in both runner and lease lanes");
     ServerCoreTest::ExpectTrue(runner.Post(job()).IsOk() && runner.PostControl(job()).IsOk() &&
-        lease.Post(job()).IsOk() && lease.PostControl(job()).IsOk(),
+                                   lease.Post(job()).IsOk() && controlLease.Post(job()).IsOk(),
         "both runner and lease lanes accept unique-owned callbacks");
     auto reserved = lease.Reserve(4);
     ServerCoreTest::ExpectTrue(reserved.IsOk(), "move-only completion reserves capacity");
     if (reserved.IsOk())
     {
-        ServerCoreTest::ExpectTrue(reserved.Value().Post(empty).Code() == ErrorCode::InvalidArgument,
+        ServerCoreTest::ExpectTrue(
+            reserved.Value().Post(empty).Code() == ErrorCode::InvalidArgument,
             "empty legacy completion preserves its reservation");
-        ServerCoreTest::ExpectTrue(reserved.Value().IsValid() && reserved.Value().Post(job()).IsOk(),
+        ServerCoreTest::ExpectTrue(
+            reserved.Value().IsValid() && reserved.Value().Post(job()).IsOk(),
             "reserved slot accepts unique-owned completion after validation failure");
     }
     std::function<void()> legacy = [&called] { ++called; };
@@ -170,32 +192,42 @@ void JobRunnerMoveOnlyOwnership()
     auto reentrant = runner.Reserve(8);
     ServerCoreTest::ExpectTrue(reentrant.IsOk(), "reentrant job reserves capacity");
     if (reentrant.IsOk())
-        ServerCoreTest::ExpectTrue(reentrant.Value().Post(ReentrantJob{&reentrantState}).IsOk(),
+        ServerCoreTest::ExpectTrue(reentrant.Value().Post(ReentrantJob{ &reentrantState }).IsOk(),
             "moving an inline reserved callback can query its runner");
     auto stoppedReservation = runner.Reserve(8);
-    ServerCoreTest::ExpectTrue(stoppedReservation.IsOk(), "rejected reentrant job reserves capacity before stop");
+    ServerCoreTest::ExpectTrue(
+        stoppedReservation.IsOk(), "rejected reentrant job reserves capacity before stop");
     runner.RequestStop();
     if (stoppedReservation.IsOk())
         ServerCoreTest::ExpectTrue(
-            stoppedReservation.Value().Post(ReentrantJob{&reentrantState}).Code() == ErrorCode::Closed,
+            stoppedReservation.Value().Post(ReentrantJob{ &reentrantState }).Code() ==
+                ErrorCode::Closed,
             "rejected reserved callback destruction can query its runner");
     ServerCoreTest::ExpectTrue(runner.Post(job()).Code() == ErrorCode::Closed,
         "closed runner rejects unique-owned callback");
-    ServerCoreTest::ExpectEqual(1, released, "rejected job releases its unique capture immediately");
+    ServerCoreTest::ExpectEqual(
+        1, released, "rejected job releases its unique capture immediately");
     runner.RunUntilStopped();
-    ServerCoreTest::ExpectEqual(1, reentrantState.calls, "only the committed reentrant callback executes");
+    ServerCoreTest::ExpectEqual(
+        1, reentrantState.calls, "only the committed reentrant callback executes");
     ServerCoreTest::ExpectTrue(reentrantState.moves > 0 && reentrantState.destructions > 0,
         "reserved callback moves and destruction finish their runner queries");
-    ServerCoreTest::ExpectEqual(6, called, "accepted unique-owned jobs and legacy callback drain exactly once");
+    ServerCoreTest::ExpectEqual(
+        6, called, "accepted unique-owned jobs and legacy callback drain exactly once");
     ServerCoreTest::ExpectEqual(6, released, "drained jobs release all unique captures");
-    ServerCoreTest::ExpectEqual(std::size_t{0}, runner.OutstandingCount(), "drain returns count capacity");
-    ServerCoreTest::ExpectEqual(std::size_t{0}, runner.RetainedBytes(), "drain returns byte capacity");
+    ServerCoreTest::ExpectEqual(
+        std::size_t{ 0 }, runner.OutstandingCount(), "drain returns count capacity");
+    ServerCoreTest::ExpectEqual(
+        std::size_t{ 0 }, runner.RetainedBytes(), "drain returns byte capacity");
     {
         JobRunner undrained;
-        ServerCoreTest::ExpectTrue(undrained.Post(job()).IsOk(), "undrained runner owns a queued capture");
+        ServerCoreTest::ExpectTrue(
+            undrained.Post(job()).IsOk(), "undrained runner owns a queued capture");
     }
-    ServerCoreTest::ExpectEqual(7, released, "destroying an undrained owner releases its queued capture");
-    ServerCoreTest::ExpectEqual(6, called, "discarded queued capture is not invoked during destruction");
+    ServerCoreTest::ExpectEqual(
+        7, released, "destroying an undrained owner releases its queued capture");
+    ServerCoreTest::ExpectEqual(
+        6, called, "discarded queued capture is not invoked during destruction");
 }
 
 void PeriodicRunnerInvokesThroughJobRunner()
@@ -430,6 +462,26 @@ void PeriodicRunnerConcurrentStopsShareCompletedJoin()
     }
 }
 
+/// <summary>시계 계산이 넘치지 않는 주기만 받는지 본다.</summary>
+void PeriodicRunnerRejectsUnboundedPeriod()
+{
+    ServerCore::Runtime::JobRunner jobRunner;
+    ServerCore::Runtime::PeriodicRunner tooLong(jobRunner,
+        std::chrono::duration_cast<ServerCore::Runtime::PeriodicRunner::Period>(
+            std::chrono::hours(24)) +
+            std::chrono::milliseconds(1),
+        [] {});
+    ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::InvalidArgument),
+        static_cast<int>(tooLong.Start().Code()), "a period longer than 24 hours is rejected");
+    ServerCore::Runtime::PeriodicRunner longest(jobRunner,
+        std::chrono::duration_cast<ServerCore::Runtime::PeriodicRunner::Period>(
+            std::chrono::hours(24)),
+        [] {});
+    ServerCoreTest::ExpectTrue(longest.Start().IsOk(), "a 24-hour period is accepted");
+    longest.Stop();
+    jobRunner.RequestStop();
+}
+
 ServerCoreTest::CheckRegistration gJobRunnerDrainsAcceptedJobsOnStop(
     "Runtime.JobRunnerDrainsAcceptedJobsOnStop", &JobRunnerDrainsAcceptedJobsOnStop);
 ServerCoreTest::CheckRegistration gJobRunnerReportsThreadAffinity(
@@ -443,6 +495,8 @@ ServerCoreTest::CheckRegistration gPeriodicRunnerCountsSkippedPeriods(
 ServerCoreTest::CheckRegistration gPeriodicRunnerStopsSafelyAfterJobRunnerDestruction(
     "Runtime.PeriodicRunnerStopsSafelyAfterJobRunnerDestruction",
     &PeriodicRunnerStopsSafelyAfterJobRunnerDestruction);
+ServerCoreTest::CheckRegistration gPeriodicRunnerRejectsUnboundedPeriod(
+    "Runtime.PeriodicRunnerRejectsUnboundedPeriod", &PeriodicRunnerRejectsUnboundedPeriod);
 ServerCoreTest::CheckRegistration gPeriodicRunnerConcurrentStopsShareCompletedJoin(
     "Runtime.PeriodicRunnerConcurrentStopsShareCompletedJoin",
     &PeriodicRunnerConcurrentStopsShareCompletedJoin);

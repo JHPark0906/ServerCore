@@ -16,7 +16,8 @@ Core::Result<BinaryMessageView> DecodeBinaryMessage(const std::span<const std::b
     if (type == 0)
         return Core::Result<BinaryMessageView>::FromStatus(
             Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidFormat));
-    return Core::Result<BinaryMessageView>::FromValue({type, bytes.subspan(BinaryMessageHeaderSize)});
+    return Core::Result<BinaryMessageView>::FromValue(
+        { type, bytes.subspan(BinaryMessageHeaderSize) });
 }
 
 Core::Result<std::vector<std::byte>> EncodeBinaryMessage(const std::uint32_t type,
@@ -24,8 +25,10 @@ Core::Result<std::vector<std::byte>> EncodeBinaryMessage(const std::uint32_t typ
 {
     using Result = Core::Result<std::vector<std::byte>>;
     if (type == 0)
-        return Result::FromStatus(Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument));
-    if (maximumBytes < BinaryMessageHeaderSize || payload.size() > maximumBytes - BinaryMessageHeaderSize)
+        return Result::FromStatus(
+            Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument));
+    if (maximumBytes < BinaryMessageHeaderSize ||
+        payload.size() > maximumBytes - BinaryMessageHeaderSize)
         return Result::FromStatus(Core::Status::FailWithoutMessage(Core::ErrorCode::TooLarge));
     try
     {
@@ -35,6 +38,9 @@ Core::Result<std::vector<std::byte>> EncodeBinaryMessage(const std::uint32_t typ
         std::copy(payload.begin(), payload.end(), bytes.begin() + BinaryMessageHeaderSize);
         return Result::FromValue(std::move(bytes));
     }
-    catch (const std::bad_alloc&) { return Result::FromStatus(Core::Status::AllocationFailure()); }
+    catch (const std::bad_alloc&)
+    {
+        return Result::FromStatus(Core::Status::AllocationFailure());
+    }
 }
 }

@@ -5,6 +5,7 @@
 #include "ServerCore/Observability/ServerObservation.h"
 #include "ServerCore/Runtime/DatagramTransport.h"
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 
 namespace C = ServerCore::CDetail;
@@ -103,6 +104,8 @@ struct UdpState : std::enable_shared_from_this<UdpState>
         configuration.peerSendRate = { options.peer_send_rate.bytes_per_interval,
             options.peer_send_rate.burst_bytes,
             std::chrono::milliseconds(options.peer_send_rate.interval_ms) };
+        configuration.allowEndpointMigration = options.allow_endpoint_migration != 0;
+        configuration.maxSequenceJump = options.max_sequence_jump;
         auto status = transport.Configure(configuration);
         if (!status.IsOk())
             return C::Code(status);
@@ -175,7 +178,7 @@ struct sc_udp_transport
 };
 extern "C"
 {
-    sc_status sc_udp_options_init(sc_udp_options* options, size_t size)
+    sc_status sc_udp_options_init(sc_udp_options* options, size_t size) noexcept
     {
         if (!options || size < sizeof(*options))
             return SC_INVALID_ARGUMENT;
@@ -190,9 +193,11 @@ extern "C"
         options->max_datagrams_per_batch = 256;
         options->max_bytes_per_batch = 256 * 1024;
         options->total_send_rate.interval_ms = options->peer_send_rate.interval_ms = 1000;
+        options->max_sequence_jump = 1024;
         return SC_OK;
     }
-    sc_status sc_udp_transport_create(const sc_udp_options* options, sc_udp_transport** out)
+    sc_status sc_udp_transport_create(
+        const sc_udp_options* options, sc_udp_transport** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
@@ -204,7 +209,9 @@ extern "C"
             !options->max_event_bytes || options->max_event_bytes > 1024 * 1024 * 1024 ||
             !options->max_datagrams_per_batch || options->max_datagrams_per_batch > 65536 ||
             !options->max_bytes_per_batch || options->max_bytes_per_batch > 64 * 1024 * 1024 ||
-            options->total_send_rate.reserved || options->peer_send_rate.reserved)
+            options->total_send_rate.reserved || options->peer_send_rate.reserved ||
+            !options->max_sequence_jump || options->allow_endpoint_migration > 1 ||
+            options->reserved2)
             return SC_INVALID_ARGUMENT;
         return C::Protect(
             [&]() -> sc_status
@@ -215,19 +222,19 @@ extern "C"
                 return SC_OK;
             });
     }
-    sc_status sc_udp_transport_start(sc_udp_transport* value)
+    sc_status sc_udp_transport_start(sc_udp_transport* value) noexcept
     {
         if (!value)
             return SC_INVALID_ARGUMENT;
         return C::Protect([&] { return value->state->Start(); });
     }
-    sc_status sc_udp_transport_stop(sc_udp_transport* value)
+    sc_status sc_udp_transport_stop(sc_udp_transport* value) noexcept
     {
         if (!value)
             return SC_INVALID_ARGUMENT;
         return C::Protect([&] { return value->state->Stop(); });
     }
-    void sc_udp_transport_destroy(sc_udp_transport* value)
+    void sc_udp_transport_destroy(sc_udp_transport* value) noexcept
     {
         if (value)
         {
@@ -235,7 +242,8 @@ extern "C"
             delete value;
         }
     }
-    sc_status sc_udp_transport_local_endpoint(const sc_udp_transport* value, sc_ip_endpoint* out)
+    sc_status sc_udp_transport_local_endpoint(
+        const sc_udp_transport* value, sc_ip_endpoint* out) noexcept
     {
         if (!value || !out)
             return SC_INVALID_ARGUMENT;
@@ -246,7 +254,7 @@ extern "C"
         return SC_OK;
     }
     sc_status sc_udp_transport_remote_endpoint(
-        const sc_udp_transport* value, uint64_t session, sc_ip_endpoint* out)
+        const sc_udp_transport* value, uint64_t session, sc_ip_endpoint* out) noexcept
     {
         if (!value || !out)
             return SC_INVALID_ARGUMENT;
@@ -262,7 +270,7 @@ extern "C"
             });
     }
     sc_status sc_udp_transport_register(
-        sc_udp_transport* value, uint64_t session, sc_udp_token* out)
+        sc_udp_transport* value, uint64_t session, sc_udp_token* out) noexcept
     {
         if (!value || !out)
             return SC_INVALID_ARGUMENT;
@@ -277,13 +285,14 @@ extern "C"
                 return SC_OK;
             });
     }
-    void sc_udp_transport_unregister(sc_udp_transport* value, uint64_t session)
+    void sc_udp_transport_unregister(sc_udp_transport* value, uint64_t session) noexcept
     {
         if (!value)
             return;
         value->state->transport.UnregisterSession(static_cast<SessionId>(session));
     }
-    sc_status sc_udp_transport_send_json(sc_udp_transport* value, uint64_t session, sc_bytes bytes)
+    sc_status sc_udp_transport_send_json(
+        sc_udp_transport* value, uint64_t session, sc_bytes bytes) noexcept
     {
         if (!value || !C::Valid(bytes))
             return SC_INVALID_ARGUMENT;
@@ -291,7 +300,7 @@ extern "C"
             static_cast<SessionId>(session), C::Bytes(bytes)));
     }
     sc_status sc_udp_transport_send_binary(
-        sc_udp_transport* value, uint64_t session, uint32_t type, sc_bytes bytes)
+        sc_udp_transport* value, uint64_t session, uint32_t type, sc_bytes bytes) noexcept
     {
         if (!value || !C::Valid(bytes))
             return SC_INVALID_ARGUMENT;
@@ -302,7 +311,8 @@ extern "C"
                     static_cast<SessionId>(session), type, C::Bytes(bytes)));
             });
     }
-    sc_status sc_udp_transport_next(sc_udp_transport* value, uint32_t timeout, sc_udp_event** out)
+    sc_status sc_udp_transport_next(
+        sc_udp_transport* value, uint32_t timeout, sc_udp_event** out) noexcept
     {
         if (!value)
         {
@@ -312,8 +322,8 @@ extern "C"
         }
         return C::Protect([&] { return value->state->events.Next(timeout, out); });
     }
-    sc_status sc_udp_transport_subscribe(
-        sc_udp_transport* value, sc_notifier* notifier, uint64_t key, sc_subscription** out)
+    sc_status sc_udp_transport_subscribe(sc_udp_transport* value, sc_notifier* notifier,
+        uint64_t key, sc_subscription** out) noexcept
     {
         if (!value)
         {
@@ -323,9 +333,9 @@ extern "C"
         }
         return C::Protect([&] { return value->state->events.Subscribe(notifier, key, out); });
     }
-    sc_status sc_udp_event_get(const sc_udp_event* value, sc_udp_event_view* out)
+    sc_status sc_udp_event_get(const sc_udp_event* value, sc_udp_event_view* out) noexcept
     {
-        if (!value || !C::Version(out))
+        if (!value || !C::OutputVersion(out))
             return SC_INVALID_ARGUMENT;
         out->kind = value->kind;
         out->payload_mode = value->mode;
@@ -337,13 +347,14 @@ extern "C"
         out->payload = C::View(value->payload);
         return SC_OK;
     }
-    void sc_udp_event_destroy(sc_udp_event* value)
+    void sc_udp_event_destroy(sc_udp_event* value) noexcept
     {
         delete value;
     }
-    sc_status sc_udp_transport_get_metrics(const sc_udp_transport* value, sc_udp_metrics* out)
+    sc_status sc_udp_transport_get_metrics(
+        const sc_udp_transport* value, sc_udp_metrics* out) noexcept
     {
-        if (!value || !C::Version(out))
+        if (!value || !C::OutputVersion(out))
             return SC_INVALID_ARGUMENT;
         const auto m = value->state->transport.SnapshotMetrics();
         out->received_datagrams = m.receivedDatagrams;
@@ -372,13 +383,16 @@ extern "C"
         out->pending_batches = m.pendingBatches;
         out->bound = m.bound ? 1u : 0u;
         out->receiving = m.receiving ? 1u : 0u;
+        out->endpoint_mismatch_datagrams = m.endpointMismatchDatagrams;
+        out->sequence_jump_datagrams = m.sequenceJumpDatagrams;
         out->event_queue_drops = value->state->queueDrops.load();
         const std::lock_guard guard(value->state->budget->mutex);
         out->retained_events = value->state->budget->count;
         out->retained_event_bytes = value->state->budget->bytes;
         return SC_OK;
     }
-    sc_status sc_udp_transport_get_observation(const sc_udp_transport* value, sc_observation* out)
+    sc_status sc_udp_transport_get_observation(
+        const sc_udp_transport* value, sc_observation* out) noexcept
     {
         if (!value)
             return SC_INVALID_ARGUMENT;
@@ -391,7 +405,7 @@ extern "C"
         return C::CopyObservation(snapshot, out);
     }
     sc_status sc_udp_packet_encode(const sc_udp_token* token, uint64_t sequence, sc_bytes payload,
-        uint8_t* output, size_t capacity, size_t* written)
+        uint8_t* output, size_t capacity, size_t* written) noexcept
     {
         if (!token || !written || !C::Valid(payload) || (!output && capacity))
             return SC_INVALID_ARGUMENT;
@@ -403,6 +417,15 @@ extern "C"
         *written = P::DatagramCodec::HeaderBytes + payload.len;
         if (capacity < *written)
             return SC_TOO_LARGE;
+        // 머리말을 먼저 쓰고 페이로드를 복사하므로, 페이로드가 쓰일 출력 구간과 겹치면 결과가
+        // 정의되지 않는다. 겹침은 거절한다(CAbi.DatagramCodecAndValidation).
+        const auto first = reinterpret_cast<std::uintptr_t>(output);
+        const auto source = reinterpret_cast<std::uintptr_t>(payload.data);
+        if (source < first + *written && first < source + payload.len)
+        {
+            *written = 0;
+            return SC_INVALID_ARGUMENT;
+        }
         P::DatagramCodec::Token native;
         std::memcpy(native.data(), token->bytes, 16);
         return P::DatagramCodec::Encode({ reinterpret_cast<std::byte*>(output), capacity }, native,
@@ -410,9 +433,9 @@ extern "C"
                    ? SC_OK
                    : SC_INVALID_ARGUMENT;
     }
-    sc_status sc_udp_packet_decode(sc_bytes packet, sc_udp_packet_view* out)
+    sc_status sc_udp_packet_decode(sc_bytes packet, sc_udp_packet_view* out) noexcept
     {
-        if (!out || !C::Valid(packet))
+        if (!out || !C::OutputVersion(out) || !C::Valid(packet))
             return SC_INVALID_ARGUMENT;
         const auto decoded = P::DatagramCodec::Decode(C::Bytes(packet));
         if (!decoded)

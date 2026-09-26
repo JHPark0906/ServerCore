@@ -6,8 +6,8 @@
 
 #include <concepts>
 #include <cstddef>
-#include <list>
 #include <functional>
+#include <list>
 #include <mutex>
 #include <type_traits>
 #include <utility>
@@ -42,7 +42,7 @@ public:
     SERVERCORE_API Status Post(Job job);
     // Preserve empty std::function rejection: wrapping an empty function inside
     // move_only_function directly would instead create a nonempty wrapper.
-    template<class Callback>
+    template <class Callback>
         requires std::same_as<std::remove_cvref_t<Callback>, std::function<void()>>
     Status Post(Callback&& job)
     {

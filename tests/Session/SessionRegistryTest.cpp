@@ -1,11 +1,13 @@
 #include "TestHarness.h"
 
 #include "ServerCore/Session/SessionRegistry.h"
+#include "Session/SessionRegistryTestAccess.h"
 
 #include <cstdint>
 #include <latch>
 #include <limits>
 #include <memory>
+#include <new>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -358,7 +360,7 @@ void ForEachUsesSnapshotSoVisitorMayRemoveSessions()
     }
 
     std::size_t visited = 0;
-    registry.ForEach(
+    const ServerCore::Core::Status iterated = registry.ForEach(
         [&registry, &visited](const std::shared_ptr<ServerCore::Session::Session>& session)
         {
             ++visited;
@@ -367,10 +369,47 @@ void ForEachUsesSnapshotSoVisitorMayRemoveSessions()
                 "a visitor can unregister its snapshot session without invalidating the iteration");
         });
 
+    ServerCoreTest::ExpectTrue(iterated.IsOk(), "ForEach() reports a completed iteration");
     ServerCoreTest::ExpectEqual(std::size_t{ 3 }, visited,
         "the snapshot visits every session present when ForEach() began");
     ServerCoreTest::ExpectEqual(
         std::size_t{ 0 }, registry.Count(), "visitor removals leave the registry empty");
+}
+
+void ForEachReportsSnapshotAllocationFailure()
+{
+    ServerCore::Session::SessionRegistry registry;
+    ServerCoreTest::ExpectTrue(
+        registry.BindToCurrentThread().IsOk(), "the current test thread binds the registry");
+    const ServerCore::Session::SessionId id = IssueIdOrFail(registry);
+    ServerCoreTest::ExpectTrue(
+        registry.Register(std::make_shared<FakeSession>(id)).IsOk(), "the setup session registers");
+
+    std::size_t visited = 0;
+    bool threw = false;
+    ServerCore::Core::Status failed = ServerCore::Core::Status::Ok();
+    ServerCore::Session::TestAccess::FailNextForEachSnapshot();
+    try
+    {
+        failed = registry.ForEach(
+            [&visited](const std::shared_ptr<ServerCore::Session::Session>&) { ++visited; });
+    }
+    catch (const std::bad_alloc&)
+    {
+        threw = true;
+    }
+    ServerCore::Session::TestAccess::ClearForEachSnapshotFailure();
+    ServerCoreTest::ExpectTrue(!threw, "a failed ForEach snapshot does not throw into the caller");
+    ServerCoreTest::ExpectEqual(
+        static_cast<int>(ServerCore::Core::Status::AllocationFailure().Code()),
+        static_cast<int>(failed.Code()), "a failed ForEach snapshot reports an allocation failure");
+    ServerCoreTest::ExpectEqual(
+        std::size_t{ 0 }, visited, "a failed ForEach snapshot visits nothing");
+
+    const ServerCore::Core::Status recovered = registry.ForEach(
+        [&visited](const std::shared_ptr<ServerCore::Session::Session>&) { ++visited; });
+    ServerCoreTest::ExpectTrue(
+        recovered.IsOk() && visited == 1, "the next ForEach visits the session");
 }
 
 const ServerCoreTest::CheckRegistration gRegistryIssuesValidDistinctIds{
@@ -407,5 +446,9 @@ const ServerCoreTest::CheckRegistration gSessionMarksAuthenticationWithoutOwning
 const ServerCoreTest::CheckRegistration gForEachUsesSnapshotSoVisitorMayRemoveSessions{
     "SessionRegistry.ForEachUsesSnapshotSoVisitorMayRemoveSessions",
     ForEachUsesSnapshotSoVisitorMayRemoveSessions
+};
+const ServerCoreTest::CheckRegistration gForEachReportsSnapshotAllocationFailure{
+    "SessionRegistry.ForEachReportsSnapshotAllocationFailure",
+    ForEachReportsSnapshotAllocationFailure
 };
 }

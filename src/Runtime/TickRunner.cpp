@@ -43,6 +43,9 @@ Core::Result<TickHandle> ScheduleTicks(TimerScheduler& scheduler,
         TimerOptions timer;
         timer.due = epoch;
         timer.repeatInterval = interval;
+        // 논리 틱이 epoch + n×interval이므로 타이머도 같은 격자를 따라야 콜백 시간만큼 위상이 밀려
+        // 틱을 건너뛰지 않는다(EXEC-1).
+        timer.repeatMode = TimerRepeatMode::FixedRate;
         timer.parentToken = options.parentToken;
         timer.retainedBytes = options.retainedBytes + sizeof(Detail::TickState);
         const auto maxCalls =

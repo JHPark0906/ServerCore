@@ -226,11 +226,13 @@ private:
         if (count < 0)
         {
             const int error = errno;
-            if (error == EINTR) continue;
+            if (error == EINTR)
+                continue;
             return Result<std::string>::FromStatus(Status::Fail(ErrorCode::PlatformError,
                 "read(config file) failed, errno=" + std::to_string(error)));
         }
-        if (count == 0) break;
+        if (count == 0)
+            break;
         text.append(buffer.data(), static_cast<std::size_t>(count));
     }
     return Result<std::string>::FromValue(std::move(text));
@@ -239,7 +241,7 @@ private:
 
 [[nodiscard]] Result<Values> ParseConfigText(std::string_view text)
 {
-    if (text.find('\0') != std::string_view::npos)
+    if (text.contains('\0'))
     {
         return Result<Values>::FromStatus(
             Status::Fail(ErrorCode::InvalidFormat, "config text contains a NUL byte"));
@@ -329,10 +331,10 @@ Result<Config> Config::LoadFromFile(const std::string_view path)
     try
     {
         // Validate once before either platform converts or opens the path.
-        if (path.empty() || path.find('\0') != std::string_view::npos || !Detail::IsValidUtf8(path))
+        if (path.empty() || path.contains('\0') || !Detail::IsValidUtf8(path))
         {
-            return Result<Config>::FromStatus(
-                Status::Fail(ErrorCode::InvalidArgument, "config path must be non-empty UTF-8 text"));
+            return Result<Config>::FromStatus(Status::Fail(
+                ErrorCode::InvalidArgument, "config path must be non-empty UTF-8 text"));
         }
         Result<std::string> text = ReadConfigText(path);
         if (!text.IsOk())

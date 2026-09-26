@@ -2,7 +2,7 @@
 
 Windows와 Linux에서 웹·게임 백엔드를 만들기 위한 **C++23 서버 라이브러리**입니다. Windows IOCP·Linux epoll 기반 네트워크, HTTP/1.1·WebSocket, 메시지 처리와 제한된 작업 실행을 제공하며 애플리케이션이 그 위에 자신의 규칙을 구현합니다.
 
-현재 버전은 **0.2.0**입니다. C++와 선택적 C ABI를 하나의 정적 라이브러리 또는 DLL/SO로 빌드합니다. Rust에서는 같은 C ABI를 사용하는 소유권 기반 래퍼를 제공합니다. 프로젝트 코드는 [MIT-0](LICENSE) 라이선스이며 개발 과정에서 생성형 AI의 도움을 받았습니다.
+현재 버전은 **0.3.0**입니다. C++와 선택적 C ABI를 하나의 정적 라이브러리 또는 DLL/SO로 빌드합니다. Rust에서는 같은 C ABI를 사용하는 소유권 기반 래퍼를 제공합니다. 프로젝트 코드는 [MIT-0](LICENSE) 라이선스이며 개발 과정에서 생성형 AI의 도움을 받았습니다.
 
 표준 라이브러리·컴파일러 런타임·OS API만 사용하고 서드파티 라이브러리에 의존하지 않습니다. Rust workspace에도 crates.io 의존성이 없으며 Tokio 같은 비동기 실행기를 강제하지 않습니다.
 
@@ -28,7 +28,9 @@ Windows와 Linux에서 웹·게임 백엔드를 만들기 위한 **C++23 서버 
 
 ## 빌드와 테스트
 
-CMake 3.21 이상과 C++23의 `std::expected`·`std::move_only_function`을 제공하는 컴파일러·표준 라이브러리가 필요합니다. 구성 단계에서 해당 기능을 검사합니다. 프리셋은 Ninja를 사용합니다.
+CMake 3.21 이상과 이 라이브러리가 사용하는 C++23 표준 라이브러리 기능(`std::expected`, `std::move_only_function`, 문자열·범위의 `contains`, `std::to_underlying`)을 제공하는 컴파일러·표준 라이브러리가 필요합니다. 구성 단계에서 해당 기능을 검사합니다. 프리셋은 Ninja를 사용합니다.
+
+공개 C++ API는 설치 가능한 헤더로 제공하며 모듈 BMI는 배포하지 않습니다. CMake 4.4.3·GCC 16.2·MSVC 19.50으로 비공개 라우팅 모듈의 빌드와 설치 라이브러리 소비를 시험했지만, 기본 지원 범위는 여전히 CMake 3.21·GCC 13입니다. 기본 빌드에 모듈을 넣으려면 최소 구성과 CI를 CMake 3.28·GCC 14 이상으로 올리고 실제 빌드 시간의 이득을 확인해야 합니다. 공개 모듈은 설치·BMI 소비 경로를 별도로 검증해야 하므로 헤더 API를 유지합니다. `import std`는 현 [CMake 모듈 지원 조건](https://cmake.org/cmake/help/v4.4/manual/cmake-cxxmodules.7.html)에서 실험적 기능이며 사용하지 않습니다.
 
 Windows는 MSVC와 Windows SDK가 필요합니다. x64 Native Tools 개발 환경에서 저장소 루트에서 실행합니다.
 
@@ -46,7 +48,7 @@ cmake --build --preset linux-release
 ctest --preset linux-release
 ```
 
-Debug는 `msvc-debug`·`linux-debug`, 공유 빌드는 `msvc-shared-release`·`linux-shared-release`를 사용합니다. 공유 Debug 프리셋도 있습니다. 기본 프리셋은 정적 C++ 빌드이며 C ABI가 필요하면 구성 명령에 `-DSERVERCORE_BUILD_C_API=ON`을 추가합니다.
+Debug는 `msvc-debug`·`linux-debug`, 공유 빌드는 `msvc-shared-release`·`linux-shared-release`를 사용합니다. 공유 Debug 프리셋도 있습니다. 프리셋은 모두 C ABI를 함께 빌드합니다(`SERVERCORE_BUILD_C_API=ON`). 프리셋 없이 구성하면 C ABI는 꺼져 있으므로 필요하면 `-DSERVERCORE_BUILD_C_API=ON`을 추가합니다.
 
 | CMake 옵션 | 기본값 | 역할 |
 | --- | --- | --- |
@@ -66,7 +68,7 @@ cmake --install build/shared --prefix stage/shared
 | 산출물 | Windows Release / Debug | Linux Release / Debug |
 | --- | --- | --- |
 | 정적 아카이브 | `ServerCore.lib` / `ServerCore.lib` | `libServerCore.a` / `libServerCore.a` |
-| 공유 런타임 | `ServerCore.dll` / `ServerCored.dll` | `libServerCore.so.0.2.0` / `libServerCored.so.0.2.0` |
+| 공유 런타임 | `ServerCore.dll` / `ServerCored.dll` | `libServerCore.so.0.3.0` / `libServerCored.so.0.3.0` |
 | 공유 링크 파일 | import `ServerCore.lib` / `ServerCored.lib` | `libServerCore.so` / `libServerCored.so` |
 
 정적·공유 및 Debug·Release에는 별도 빌드 디렉터리와 설치 prefix를 사용합니다. Windows의 정적 아카이브와 import library는 확장자가 같아 서로 대체할 수 없습니다. DLL은 설치 prefix의 `bin`, 링크 파일은 `lib`에 설치합니다. Linux SO는 `lib`에 설치합니다.
@@ -164,7 +166,7 @@ CMake 밖에서 Windows DLL을 사용할 때는 `SC_CABI_SHARED`를 정의합니
 
 ## Rust에서 사용하기
 
-[rust](rust)의 `servercore-sys`는 C ABI 선언·빌드, `servercore`는 안전한 소유 객체와 표준 `Future`를 제공합니다. Rust 1.75 이상과 위 네이티브 빌드 도구가 필요합니다. 소비 프로젝트의 Cargo.toml에는 로컬 경로를 지정합니다.
+[rust](rust)의 `servercore-sys`는 C ABI 선언·빌드, `servercore`는 안전한 소유 객체와 표준 `Future`를 제공합니다. Rust 1.82 이상과 위 네이티브 빌드 도구가 필요합니다. 소비 프로젝트의 Cargo.toml에는 로컬 경로를 지정합니다.
 
 ```toml
 [dependencies]
@@ -233,6 +235,6 @@ HTTP·WebSocket·raw TCP·UDP와 공통 실행·파일·관측을 감싸지만 C
 | Rust 1.89: 공유 소스 / 공유 Debug prebuilt / 정적 소스 | 각 42/42 통과, 예제 5개 컴파일·링크 |
 | 위 Rust 세 구성의 `runtime_channels` | `ready` 출력 후 정상 종료 |
 
-설치·소스 소비, 순수 C 공유 소비, 네이티브 C++ ABI 불일치 거절, 통합 DLL의 C++·C 심벌과 실행 파일 의존성을 확인했습니다. 최신 통합 변경의 **Linux/GCC·ASan/UBSan 실행 검증은 하지 않았습니다**. Linux 구현과 CI 구성이 있다는 사실을 최신 Linux 실행 성공으로 해석하지 않습니다.
+설치·소스 소비, 순수 C 공유 소비, 네이티브 C++ ABI 불일치 거절, 통합 DLL의 C++·C 심벌과 실행 파일 의존성을 확인했습니다. 기준 커밋 `a1a5959`의 [GitHub Actions 실행](https://github.com/JHPark0906/ServerCore/actions/runs/35907675644)에서는 Windows·Linux 네이티브 빌드, Rust 소비자 빌드, ASan·UBSan을 포함한 9개 작업이 모두 통과했습니다.
 
 테스트는 [tests](tests), 빌드 자동화는 [scripts](scripts)에 있습니다. 회귀 테스트와 설정상 연결 상한은 실제 동시 플레이 수·처리량을 보장하지 않습니다. 소비 서버의 메시지 크기·빈도·방송 대상 수·처리기 비용을 반영한 부하에서 지연·대기열·자원 사용량을 측정합니다.

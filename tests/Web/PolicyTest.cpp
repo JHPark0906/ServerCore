@@ -159,18 +159,60 @@ void TrustedProxyBoundaries()
     ExpectTrue(
         result.IsOk() && result.Value().acceptedHops == 2 && result.Value().host == "app.example",
         "explicit legacy lists keep hop correlation");
-    ExpectTrue(!legacy
-                   .Resolve(peer, { { "x-forwarded-for", "192.0.2.1,10.0.0.2" },
-                                      { "x-forwarded-proto", "https" } })
-                   .IsOk(),
-        "misaligned legacy metadata rejected");
+    result = legacy.Resolve(
+        peer, { { "x-forwarded-for", "192.0.2.1,10.0.0.2" }, { "x-forwarded-proto", "https" } });
+    ExpectTrue(result.IsOk() && result.Value().acceptedHops == 2 && result.Value().proto.empty(),
+        "shorter legacy metadata aligns to the nearest hops");
     options.maxHops = 1;
     auto bounded = Web::TrustedProxyPolicy::Create(options).Value();
     auto tooMany = bounded.Resolve(peer, { { "x-forwarded-for", "192.0.2.1,10.0.0.2" } });
     ExpectTrue(!tooMany.IsOk() && tooMany.GetStatus().Code() == Core::ErrorCode::TooLarge,
         "hop storage is bounded with a distinct limit error");
 }
+/// <summary>
+/// X-Forwarded-Proto·Host가 X-Forwarded-For보다 짧을 때 가까운 hop부터 맞춰 읽는지 본다(WEB-6).
+/// </summary>
+/// <remarks>
+/// nginx와 ALB는 X-Forwarded-For에는 값을 덧붙이고 X-Forwarded-Proto는 한 값으로 덮어쓴다. 클라이언트나
+/// 앞단 프록시가 X-Forwarded-For를 보내면 두 목록의 길이가 달라지며, 고치기 전에는 그 요청을 형식 오류로
+/// 거절했다. 짧은 목록의 값은 오른쪽(가까운 hop)부터 짝을 짓고, 짝이 없는 먼 hop의 값은 비워 둔다.
+/// </remarks>
+void TrustedProxyRightAlignsForwardedFields()
+{
+    Web::TrustedProxyOptions options;
+    options.trustedNetworks = { Core::IpNetwork::Parse("10.0.0.0/8").Value() };
+    options.mode = Web::ProxyHeaderMode::XForwarded;
+    options.acceptProto = true;
+    options.acceptHost = true;
+    const auto policy = Web::TrustedProxyPolicy::Create(options).Value();
+    const auto proxy = Core::IpEndpoint::Parse("10.0.0.1", 4567).Value();
+    auto result = policy.Resolve(
+        proxy, { { "x-forwarded-for", "198.51.100.7, 192.0.2.1" }, { "x-forwarded-proto", "https" },
+                   { "x-forwarded-host", "app.example" } });
+    ExpectTrue(result.IsOk(),
+        "a client-supplied X-Forwarded-For does not break a single overwritten proto");
+    if (result.IsOk())
+        ExpectTrue(result.Value().client.address.ToString() == "192.0.2.1" &&
+                       result.Value().acceptedHops == 1 && result.Value().proto == "https" &&
+                       result.Value().host == "app.example",
+            "the single value belongs to the hop nearest the trusted proxy");
+    result = policy.Resolve(
+        proxy, { { "x-forwarded-for", "192.0.2.1, 10.0.0.2" }, { "x-forwarded-proto", "https" } });
+    ExpectTrue(result.IsOk(), "a trusted chain with one proto value resolves");
+    if (result.IsOk())
+        ExpectTrue(result.Value().client.address.ToString() == "192.0.2.1" &&
+                       result.Value().acceptedHops == 2 && result.Value().proto.empty(),
+            "a farther hop without its own proto value reports none rather than a nearer hop's "
+            "value");
+    result = policy.Resolve(
+        proxy, { { "x-forwarded-for", "192.0.2.1" }, { "x-forwarded-proto", "http, https" } });
+    ExpectTrue(
+        result.IsOk() && result.Value().proto == "https", "extra farther proto values are ignored");
+}
+
 ServerCoreTest::CheckRegistration a("Web.GroupedPoliciesAndJson", GroupedPoliciesAndJson);
+ServerCoreTest::CheckRegistration aligned(
+    "Web.TrustedProxyRightAlignsForwardedFields", TrustedProxyRightAlignsForwardedFields);
 ServerCoreTest::CheckRegistration b("Web.CorsPreflightAndCredentials", CorsPreflightAndCredentials);
 ServerCoreTest::CheckRegistration c("Web.TrustedProxyBoundaries", TrustedProxyBoundaries);
 }

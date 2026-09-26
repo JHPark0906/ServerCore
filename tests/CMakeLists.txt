@@ -34,6 +34,7 @@ set(SERVERCORE_TEST_NAMES
         Logging.LoggerIsUsableBeforeInstall
         Logging.InstalledLoggerReceivesLevelAndMessage
         Logging.InstallingAgainReplacesTheLogger
+        Logging.ReplacingPublishesTheNewLoggerBeforeDestroyingTheOld
         Clock.MillisecondsSinceProcessStartIsMonotonic
         Config.LoadsFlatSnapshot
         Config.ReportsMissingValuesAndFiles
@@ -61,14 +62,21 @@ set(SERVERCORE_PROTOCOL_TEST_NAMES
         Protocol.MessageEnvelopeValidationIsSymmetric
         Protocol.JsonDumpRejectsUnsafeValues
         Protocol.MessageRejectsUnsafeOutboundJson
-        Protocol.MessageRejectsNonObjectBodies)
+        Protocol.MessageRejectsNonObjectBodies
+        Protocol.JsonTextConstructorsKeepTheirType
+        Protocol.ParseMessageMovesTheParsedBody
+        Protocol.JsonObjectKeysResistHashFlooding
+        Protocol.JsonNumbersUnderflowToSignedZero
+        Protocol.JsonParseLimitsValueCount)
 
 set(SERVERCORE_JOB_TEST_NAMES
         Runtime.RequestLimiterBudgetsAndLease
         Runtime.RequestLimiterExpiryAndConcurrency
+        Runtime.RequestLimiterEvictsFullBucketsUnderPressure
         Runtime.TimerSchedulerAdmissionAndReschedule
         Runtime.TimerSchedulerRepeatsAndCancellation
         Runtime.TimerSchedulerShutdownAndExecutorPressure
+        Runtime.TimerSchedulerSaturationBacksOffAndServesEarliestFirst
         Runtime.TaskGroupBoundsAndCollection
         Runtime.TaskGroupCancellationAndDeadlines
         Runtime.TaskGroupWaitAndShutdownRace
@@ -100,7 +108,8 @@ set(SERVERCORE_JOB_TEST_NAMES
         Runtime.PeriodicRunnerInvokesThroughJobRunner
         Runtime.PeriodicRunnerCountsSkippedPeriods
         Runtime.PeriodicRunnerStopsSafelyAfterJobRunnerDestruction
-        Runtime.PeriodicRunnerConcurrentStopsShareCompletedJoin)
+        Runtime.PeriodicRunnerConcurrentStopsShareCompletedJoin
+        Runtime.PeriodicRunnerRejectsUnboundedPeriod)
 
 set(SERVERCORE_SESSION_TEST_NAMES
         SessionRegistry.RegistryIssuesValidDistinctIds
@@ -111,7 +120,8 @@ set(SERVERCORE_SESSION_TEST_NAMES
         SessionRegistry.RegistryDiscardsUnregisteredIssueReservations
         SessionRegistry.RegistrySerializesConcurrentReservationDiscards
         SessionRegistry.SessionMarksAuthenticationWithoutOwningIdentityPolicy
-        SessionRegistry.ForEachUsesSnapshotSoVisitorMayRemoveSessions)
+        SessionRegistry.ForEachUsesSnapshotSoVisitorMayRemoveSessions
+        SessionRegistry.ForEachReportsSnapshotAllocationFailure)
 
 set(SERVERCORE_DISPATCH_TEST_NAMES
         Dispatch.RegisterRoutesAndEnforcesRawBodyLimit
@@ -134,6 +144,17 @@ set(SERVERCORE_NET_TEST_NAMES
         Runtime.HostInputAdmission
         Runtime.HostGracefulDrain
         Runtime.HostConcurrentIsolation
+        Runtime.HostCapacityCallbackOutsideSessionLocks
+        Runtime.HostControlLaneFitsSessionWork
+        Runtime.HostDrainAcceptsGameContinuations
+        Runtime.HostBinaryGracefulClose
+        Runtime.HostBoundsFramesPerReceiveJob
+        Runtime.HostRejectsUnsendableInputRate
+        Runtime.HostObservationAndLogBoundaries
+        Runtime.HostRejectsLateSetupUniformly
+        Runtime.HostLimitsMessageFailureLogs
+        Runtime.HostRejectsReceiveBudgetBelowOneReceive
+        Runtime.HostLimitsJsonValuesPerMessage
         Transport.SendCapacityRetainsPartialStorage
         Transport.SendCapacitySharesBudgetWithoutMissedWake
         Transport.SendCapacityValidatesAndCancels
@@ -151,6 +172,9 @@ set(SERVERCORE_NET_TEST_NAMES
         Transport.IoContextStartsAndStops
         Transport.ListenRejectsInvalidEndpoint
         Transport.AcceptorCanListenAgainAfterStop
+        Transport.AcceptorRetriesAfterAcceptResourceFailure
+        Transport.ConnectionOutlivesIoContext
+        Transport.PeerResetReportsErrorSource
         Transport.EchoRoundTrip
         Transport.DisconnectIsNotifiedExactlyOnce
         Transport.LargePayloadCrossesReceiveBoundaries
@@ -165,7 +189,18 @@ set(SERVERCORE_NET_TEST_NAMES
         Transport.DisconnectWaitsForReceiveCallback
         Transport.LateObserverReceivesPriorDisconnect
         Transport.AcceptorStopWaitsForActiveCompletionHandoff
-        Transport.AcceptorStopDoesNotTimeOutActiveCompletionHandoff)
+        Transport.AcceptorStopDoesNotTimeOutActiveCompletionHandoff
+        Transport.CloseAfterSendWithUnreadInputDeliversQueuedBytes)
+
+# 프로세스의 descriptor 한도를 실제로 낮춰 accept4가 EMFILE을 돌려주게 하는 검사다. Windows에는
+# 소켓 수를 이렇게 낮출 한도가 없으므로 Linux에서만 등록한다.
+if (NOT WIN32)
+    list(APPEND SERVERCORE_NET_TEST_NAMES Transport.AcceptorSurvivesDescriptorExhaustion)
+else ()
+    # IOCP worker가 수락 인계 중 IoContext의 잠금을 잡는 경로는 Windows 구현에만 있다.
+    list(APPEND SERVERCORE_NET_TEST_NAMES Transport.IoContextStopDuringAcceptHandoffReturns
+            Transport.AcceptorStopWaitsForBusyIoWorkers)
+endif ()
 
 # ServerHost는 실제 TCP 수락부터 세션·프레임·디스패치 조립까지 확인한다. 이것도 포트를
 # 열므로 전송 층 검사와 같은 시간 제한을 적용한다.
@@ -203,6 +238,8 @@ set(SERVERCORE_DATAGRAM_TEST_NAMES
         Runtime.DatagramRegistrationLifecycle
         Runtime.DatagramGenericRoundTripAndSendSequence
         Runtime.DatagramInvalidPacketsCannotRebindOrPoisonSequence
+        Runtime.DatagramEndpointMigrationIsOptIn
+        Runtime.DatagramSequenceJumpIsBounded
         Runtime.DatagramReceiverCallbacksCanSendUnregisterAndClose
         Runtime.DatagramAdmissionCallbacksRespectRegistrationLifetime
         Runtime.DatagramCallbackExceptionsEndPoll
@@ -214,6 +251,7 @@ set(SERVERCORE_WEB_TEST_NAMES
         Web.GroupedPoliciesAndJson
         Web.CorsPreflightAndCredentials
         Web.TrustedProxyBoundaries
+        Web.TrustedProxyRightAlignsForwardedFields
         Web.RequestFieldsAndEncoding
         Web.CookiesValidateAndPreserveDuplicates
         Web.MultipartArbitraryChunkBoundaries
@@ -221,11 +259,22 @@ set(SERVERCORE_WEB_TEST_NAMES
         Web.MultipartRejectsMalformedAndLimits
         Web.WebSocketNegotiationAndFragments
         Web.WebSocketHeartbeatCorrelation
+        Web.WebSocketCloseFromApplicationThread
+        Web.WebSocketReceivePauseAndResume
+        Web.WebSocketReceivePauseSuspendsHeartbeat
+        Web.PolicyCallbacksDoNotStallDeadlines
+        Web.ProgressEventsWakeWithoutMaintenance
+        Web.EarlyWebSocketDataResumesAfterPolicy
+        Web.PolicyResponsesKeepConnectionAlive
+        Web.CorsPreflightReachesPolicyBeforeMethodCheck
+        Web.StreamingUploadOutlivesRequestDeadline
         Web.WebSocketFragmentBackpressure
         Web.StreamingUploadBackpressure
+        Web.StreamingBodyChargesPieceBookkeeping
         Web.RequestPolicyAndWebSocketGate
         Web.GracefulDrain
         Web.FileRangesAndConditionals
+        Web.SendFileRejectsWindowsPathAliases
     Web.AsyncRequestOwnershipAndIoProgress
     Web.AsyncRetainedRequestBudget
         Web.AsyncPipelineOrderAndWebSocketUpgrade
@@ -250,6 +299,12 @@ set(SERVERCORE_WEB_TEST_NAMES
         Web.WebSocketSendValidationSymmetry
         Web.HttpParserConformance
         Web.HttpParserRejectsAmbiguousRequests
+        Web.HttpParserReportsConsumedBytes
+        Web.HttpParserInteroperability
+        Web.Http10AndLenientRequestLines
+        Web.PolicyHeadersKeepListFields
+        Web.SilentConnectionsExpire
+        Web.DrainBoundsIdleKeepAliveConnections
         Web.WebSocketProtocolConformance
         Web.HttpSocketIntegration
         Web.WebSocketSocketIntegration
@@ -261,15 +316,21 @@ list(APPEND SERVERCORE_TEST_NAMES
         Core.NumericEndpointBoundaries
         Core.AtomicFilePublication
         Runtime.LogicalTickPoliciesAndCancellation
+        Runtime.TickRunnerRearmsOnFixedRateGrid
         Runtime.DatagramReadinessAndCancellation
         Runtime.DatagramExecutorPressureAndStop
+        Runtime.DatagramPumpRearmDoesNotWaitOnMonitor
+        Runtime.DatagramPumpCountsBatchFailures
         Runtime.DatagramSendRateLimits
         Runtime.OutboundFifoLatestAndBatch
         Runtime.OutboundExpiryAndReentrancy
+        Runtime.OutboundCapacityWakeBeforeArmIsKept
+        Runtime.OutboundQueueFitsOneSchedulerSlot
         Observability.StructuredRecordsAndBounds
         Observability.StructuredLoggerOwnershipAndDrain
         Observability.ObservationAvailabilityAndLifecycle
         Core.AtomicFileFailureAndCleanup
+        Core.AtomicFileSyncFailureIsTerminal
         Protocol.BinaryWireAndBounds
         Protocol.BinaryVersionNegotiation
         Core.CidrMasksAndFamilies
@@ -278,6 +339,8 @@ list(APPEND SERVERCORE_TEST_NAMES
         Transport.Ipv6DatagramEndpoints
         Runtime.Ipv6DatagramSessionEndpoints
         Observability.LoggerFilteringAndRotation
+        Observability.LoggerRotationFailureKeepsArchives
+        Observability.LoggerStartCanRetryAfterFailure
         Observability.HistogramAndPrometheus
         Observability.TaskMetrics
         Observability.HttpMetricsAndTracing
@@ -350,7 +413,8 @@ if (SERVERCORE_BUILD_C_API)
             CAbi.ReadinessLifetimeAndRaces CAbi.ReadinessWebAndTcp
             CAbi.RuntimeWorkAndNotifications CAbi.RuntimeTimersAndGroups
             CAbi.RuntimeDeferredOwnerDestruction CAbi.RuntimeShutdown)
-    target_link_libraries(ServerCoreTests PRIVATE ServerCore::CAbi)
+    # C ABI 구현은 ServerCoreTestHooks에 들어 있다. ServerCore::CAbi는 설치되는 ServerCore를 끌어오므로
+    # 여기서 링크하지 않는다(같은 심볼이 두 번 들어온다).
 endif ()
 
 target_include_directories(ServerCoreTests
@@ -358,26 +422,20 @@ target_include_directories(ServerCoreTests
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${PROJECT_SOURCE_DIR}/src)
 
-# 검사마다 다른 포트를 쓰고 Debug와 Release도 서로 다른 블록을 쓴다. 같은 포트를 잇달아
-# 쓰면 앞 회차가 남긴 연결이 TIME_WAIT에 있는 동안 다음 bind가 실패할 수 있고, 그러면
-# 코드가 아니라 앞 회차 때문에 붉어진다.
-if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(SERVERCORE_TEST_PORT_BASE 17000)
-else ()
-    set(SERVERCORE_TEST_PORT_BASE 17050)
-endif ()
-
+# 시험은 고정 포트 블록을 쓰지 않는다. TCP 리스너가 필요하면 운영체제에게 빈 번호를 받는다
+# (SocketTestSupport.h의 ServerCoreTest::FreeLoopbackTcpPort). 그래서 여러 빌드 트리·구성이 동시에
+# 시험을 돌려도, 이 기계의 다른 프로그램이 어떤 포트를 쓰고 있어도 부딪히지 않는다.
 target_compile_definitions(ServerCoreTests
         PRIVATE
         SERVERCORE_ENABLE_TEST_HOOKS=1
-        SERVERCORE_TEST_PORT_BASE=${SERVERCORE_TEST_PORT_BASE}
         SERVERCORE_PROTOCOL_VECTOR_PATH="${CMAKE_CURRENT_SOURCE_DIR}/Protocol/FramingVectors.txt")
 
-target_link_libraries(ServerCoreTests PRIVATE ServerCore::ServerCore)
+# 시험은 hook이 든 ServerCoreTestHooks를 링크한다. 설치되는 ServerCore에는 hook이 없다(BUILD-1).
+target_link_libraries(ServerCoreTests PRIVATE ServerCoreTestHooks)
 if (WIN32 AND SERVERCORE_BUILD_SHARED)
     add_custom_command(TARGET ServerCoreTests POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:ServerCore> $<TARGET_FILE_DIR:ServerCoreTests>)
+            $<TARGET_FILE:ServerCoreTestHooks> $<TARGET_FILE_DIR:ServerCoreTests>)
 endif ()
 
 if (MSVC)
@@ -390,6 +448,9 @@ endif ()
 
 foreach (test_name IN LISTS SERVERCORE_TEST_NAMES)
     add_test(NAME ServerCore.${test_name} COMMAND ServerCoreTests ${test_name})
+    # ServerCoreTest::Skip이 기록된 검사는 SkipExitCode(TestHarness.h, 77)로 끝난다. ctest는 그것을
+    # 통과가 아니라 건너뜀으로 센다(BUILD-4: IPv6가 없는 환경의 IPv6 검사).
+    set_tests_properties(ServerCore.${test_name} PROPERTIES SKIP_RETURN_CODE 77)
 endforeach ()
 
 # 포트를 여는 검사에만 시간 제한을 건다. 60초는 정상 경로보다 한참 넉넉하다. 이 값은 검사가
@@ -415,8 +476,14 @@ foreach (test_name IN LISTS SERVERCORE_JOB_TEST_NAMES)
     set_tests_properties(ServerCore.${test_name} PROPERTIES TIMEOUT 60)
 endforeach ()
 
+set_tests_properties(ServerCore.Runtime.DatagramPumpRearmDoesNotWaitOnMonitor
+    ServerCore.Runtime.DatagramPumpCountsBatchFailures
+    PROPERTIES TIMEOUT 60 RESOURCE_LOCK ServerCore.UdpPorts)
 set_tests_properties(ServerCore.Runtime.LogicalTickPoliciesAndCancellation
+    ServerCore.Runtime.TickRunnerRearmsOnFixedRateGrid
     ServerCore.Runtime.OutboundFifoLatestAndBatch ServerCore.Runtime.OutboundExpiryAndReentrancy
+    ServerCore.Runtime.OutboundCapacityWakeBeforeArmIsKept
+    ServerCore.Runtime.OutboundQueueFitsOneSchedulerSlot
     PROPERTIES TIMEOUT 60)
 set_tests_properties(ServerCore.Runtime.DatagramReadinessAndCancellation
     ServerCore.Runtime.DatagramExecutorPressureAndStop ServerCore.Runtime.DatagramSendRateLimits
@@ -436,6 +503,60 @@ add_test(NAME ServerCore.Harness.RegisteredChecksMatchCtest
 add_test(NAME ServerCore.Architecture.LayerBoundaries
         COMMAND "${CMAKE_COMMAND}" "-DSERVERCORE_LAYER_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
         -P "${PROJECT_SOURCE_DIR}/cmake/CheckLayers.cmake")
+
+# 공개 헤더가 저마다 스스로 필요한 것을 모두 포함하는지(자기완결) 본다. src/PublicHeaderCompileCheck.cpp는
+# 공개 헤더 전부를 한 번역 단위에 넣으므로, 뒤의 헤더는 앞에서 들어온 선언에 기대도 통과한다. 그래서
+# include/ServerCore 아래 헤더마다 그 헤더 하나만 포함하는 번역 단위를 만들어 C++로 컴파일하고, C ABI
+# 헤더는 C 소비자처럼 C로 한 번 더 컴파일한다. 자기완결이 아닌 헤더가 있으면 빌드가 그 번역 단위에서
+# 멈춘다.
+#
+# 목록은 손으로 적지 않고 include 트리를 그대로 훑는다. 손으로 적으면 새 헤더를 빠뜨려도 신호가 없다.
+# 번역 단위 이름은 헤더 경로의 '/'를 '.'로 바꾼 것이다. 파일 이름이 같은 헤더(C/Endpoint.h와
+# Core/Endpoint.h)도 목적 파일이 겹치지 않고, 아래 시험이 목적 파일 이름에서 헤더를 되짚을 수 있다.
+file(GLOB_RECURSE ServerCorePublicHeaders CONFIGURE_DEPENDS
+        RELATIVE "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/include/ServerCore/*.h")
+if (NOT ServerCorePublicHeaders)
+    message(FATAL_ERROR "No public headers under ${PROJECT_SOURCE_DIR}/include/ServerCore.")
+endif ()
+set(ServerCoreHeaderCheckRoot "${CMAKE_CURRENT_BINARY_DIR}/PublicHeaders")
+set(ServerCoreHeaderCheckCxxSources)
+set(ServerCoreHeaderCheckCSources)
+foreach (header IN LISTS ServerCorePublicHeaders)
+    string(REPLACE "/" "." stem "${header}")
+    # file(CONFIGURE)는 내용이 같으면 다시 쓰지 않으므로, 재구성만으로 다시 컴파일되지 않는다.
+    file(CONFIGURE OUTPUT "${ServerCoreHeaderCheckRoot}/Cxx/${stem}.cpp"
+            CONTENT "#include \"${header}\"\n")
+    list(APPEND ServerCoreHeaderCheckCxxSources "${ServerCoreHeaderCheckRoot}/Cxx/${stem}.cpp")
+    if (SERVERCORE_BUILD_C_API AND header MATCHES "^ServerCore/C/")
+        file(CONFIGURE OUTPUT "${ServerCoreHeaderCheckRoot}/C/${stem}.c"
+                CONTENT "#include \"${header}\"\n")
+        list(APPEND ServerCoreHeaderCheckCSources "${ServerCoreHeaderCheckRoot}/C/${stem}.c")
+    endif ()
+endforeach ()
+add_library(ServerCorePublicHeadersCxx OBJECT ${ServerCoreHeaderCheckCxxSources})
+target_link_libraries(ServerCorePublicHeadersCxx PRIVATE ServerCore)
+set(ServerCoreHeaderCheckObjects
+        "set(SERVERCORE_HEADERS_CXX_OBJECTS \"$<TARGET_OBJECTS:ServerCorePublicHeadersCxx>\")\n")
+if (SERVERCORE_BUILD_C_API)
+    enable_language(C)
+    add_library(ServerCorePublicHeadersC OBJECT ${ServerCoreHeaderCheckCSources})
+    # C 소비자처럼 C ABI target만 링크한다. 네이티브 C++ 요구 사항은 전이되지 않는다.
+    target_link_libraries(ServerCorePublicHeadersC PRIVATE ServerCore::CAbi)
+    string(APPEND ServerCoreHeaderCheckObjects
+            "set(SERVERCORE_HEADERS_C_OBJECTS \"$<TARGET_OBJECTS:ServerCorePublicHeadersC>\")\n")
+endif ()
+file(GENERATE OUTPUT "${ServerCoreHeaderCheckRoot}/Objects-$<CONFIG>.cmake"
+        CONTENT "${ServerCoreHeaderCheckObjects}")
+
+# 빌드가 통과했다는 것만으로는 "헤더를 하나씩 컴파일했다"를 말할 수 없다. 이 시험이 시험 시점의 소스
+# 트리에서 헤더 목록을 다시 읽어, 헤더마다 그 번역 단위의 목적 파일이 있는지와 그 수가 공개 헤더 수와
+# 같은지를 본다. PublicHeaderCompileCheck.cpp가 공개 헤더를 빠짐없이 포함하는지도 여기서 본다.
+add_test(NAME ServerCore.Architecture.PublicHeadersCompile
+        COMMAND "${CMAKE_COMMAND}"
+        "-DSERVERCORE_HEADERS_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+        "-DSERVERCORE_HEADERS_OBJECTS=${ServerCoreHeaderCheckRoot}/Objects-$<CONFIG>.cmake"
+        "-DSERVERCORE_HEADERS_C_API=${SERVERCORE_BUILD_C_API}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/PublicHeadersTest.cmake")
 
 # 설치한 정적 라이브러리와 소스 트리는 모두 별도 CMake 프로젝트에서 같은 target 이름으로 소비할
 # 수 있어야 한다. 이 검사는 C++ 등록 검사와 성질이 달라 목록 동기화 시험에는 넣지 않는다. build
@@ -473,7 +594,10 @@ add_test(NAME ServerCore.CMake.InstallAndSourceTreeConsume
         "-DSERVERCORE_PACKAGE_VERSION=${ServerCore_VERSION}"
         "-DSERVERCORE_PACKAGE_SHARED=${SERVERCORE_BUILD_SHARED}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/CMakePackageTest.cmake")
-set_tests_properties(ServerCore.CMake.InstallAndSourceTreeConsume PROPERTIES TIMEOUT 600)
+# cmake --install은 producer build 디렉터리에 install_manifest.txt를 쓰므로, 같은 build를 설치하는
+# 시험끼리는 ServerCore.InstallTree로 직렬화한다.
+set_tests_properties(ServerCore.CMake.InstallAndSourceTreeConsume PROPERTIES TIMEOUT 600
+        RESOURCE_LOCK ServerCore.InstallTree)
 
 if (WIN32 AND MSVC AND SERVERCORE_BUILD_SHARED)
     add_test(NAME ServerCore.CMake.SharedAbiCompatibility COMMAND "${CMAKE_COMMAND}"
@@ -508,5 +632,48 @@ if (SERVERCORE_BUILD_C_API AND SERVERCORE_BUILD_SHARED)
             "-DSERVERCORE_PACKAGE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
             "-DSERVERCORE_PACKAGE_CROSSCOMPILING=${CMAKE_CROSSCOMPILING}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/CAbiPackageTest.cmake")
-    set_tests_properties(ServerCore.CMake.CAbiPackageConsume PROPERTIES TIMEOUT 180)
+    set_tests_properties(ServerCore.CMake.CAbiPackageConsume PROPERTIES TIMEOUT 180
+            RESOURCE_LOCK ServerCore.InstallTree)
+endif ()
+
+# 설치 결과물의 심볼을 dumpbin(MSVC) 또는 nm으로 직접 읽는다. 도구가 없으면 건너뛰지 않고 실패한다.
+if (MSVC)
+    get_filename_component(ServerCoreCompilerDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    find_program(SERVERCORE_DUMPBIN dumpbin HINTS "${ServerCoreCompilerDirectory}")
+    set(ServerCoreSymbolTool "${SERVERCORE_DUMPBIN}")
+    set(ServerCoreSymbolToolKind dumpbin)
+else ()
+    set(ServerCoreSymbolTool "${CMAKE_NM}")
+    set(ServerCoreSymbolToolKind nm)
+endif ()
+if (WIN32 AND SERVERCORE_BUILD_SHARED)
+    set(ServerCoreInstalledLibraryDirectory "${CMAKE_INSTALL_BINDIR}")
+else ()
+    set(ServerCoreInstalledLibraryDirectory "${CMAKE_INSTALL_LIBDIR}")
+endif ()
+add_test(NAME ServerCore.CMake.InstalledLibraryHasNoTestHooks COMMAND "${CMAKE_COMMAND}"
+        -DSERVERCORE_SYMBOLS_MODE=hooks
+        "-DSERVERCORE_SYMBOLS_BINARY_DIR=${PROJECT_BINARY_DIR}"
+        "-DSERVERCORE_SYMBOLS_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/LibrarySymbols-$<CONFIG>"
+        "-DSERVERCORE_SYMBOLS_CONFIGURATION=$<CONFIG>"
+        "-DSERVERCORE_SYMBOLS_HOOKS_FILE=$<TARGET_FILE:ServerCoreTestHooks>"
+        "-DSERVERCORE_SYMBOLS_INSTALLED_RELATIVE=${ServerCoreInstalledLibraryDirectory}/$<TARGET_FILE_NAME:ServerCore>"
+        "-DSERVERCORE_SYMBOLS_TOOL=${ServerCoreSymbolTool}"
+        "-DSERVERCORE_SYMBOLS_TOOL_KIND=${ServerCoreSymbolToolKind}"
+        "-DSERVERCORE_SYMBOLS_SHARED=${SERVERCORE_BUILD_SHARED}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/LibrarySymbolsTest.cmake")
+set_tests_properties(ServerCore.CMake.InstalledLibraryHasNoTestHooks PROPERTIES TIMEOUT 180
+        RESOURCE_LOCK ServerCore.InstallTree)
+
+if (SERVERCORE_BUILD_SHARED)
+    add_test(NAME ServerCore.CMake.SharedLibraryExportSet COMMAND "${CMAKE_COMMAND}"
+            -DSERVERCORE_SYMBOLS_MODE=exports
+            "-DSERVERCORE_SYMBOLS_PRODUCT_FILE=$<TARGET_FILE:ServerCore>"
+            "-DSERVERCORE_SYMBOLS_C_API=${SERVERCORE_BUILD_C_API}"
+            "-DSERVERCORE_SYMBOLS_C_HEADER_DIR=${PROJECT_SOURCE_DIR}/include/ServerCore/C"
+            "-DSERVERCORE_SYMBOLS_TOOL=${ServerCoreSymbolTool}"
+            "-DSERVERCORE_SYMBOLS_TOOL_KIND=${ServerCoreSymbolToolKind}"
+            "-DSERVERCORE_SYMBOLS_SHARED=${SERVERCORE_BUILD_SHARED}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/LibrarySymbolsTest.cmake")
+    set_tests_properties(ServerCore.CMake.SharedLibraryExportSet PROPERTIES TIMEOUT 120)
 endif ()

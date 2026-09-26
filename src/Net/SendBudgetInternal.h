@@ -17,7 +17,8 @@ class SendCapacityState;
 class SendBudget
 {
 public:
-    SERVERCORE_TEST_API explicit SendBudget(std::size_t limitBytes, std::size_t connectionLimitBytes = 1024 * 1024) noexcept;
+    SERVERCORE_TEST_API explicit SendBudget(
+        std::size_t limitBytes, std::size_t connectionLimitBytes = 1024 * 1024) noexcept;
     [[nodiscard]] SERVERCORE_TEST_API bool TryReserve(std::size_t byteCount) noexcept;
     SERVERCORE_TEST_API void Release(std::size_t byteCount) noexcept;
     [[nodiscard]] SERVERCORE_TEST_API std::size_t LimitBytes() const noexcept;
@@ -37,7 +38,7 @@ private:
     std::mutex mWaitersMutex;
     std::map<std::uint64_t, std::weak_ptr<SendCapacityState>> mWaiters;
     std::uint64_t mNextId = 1;
-    std::atomic<bool> mChanged{false};
+    std::atomic<bool> mChanged{ false };
     std::atomic_flag mNotifying = ATOMIC_FLAG_INIT;
 };
 
@@ -45,8 +46,16 @@ private:
 class SendNotificationScope
 {
 public:
-    explicit SendNotificationScope(std::shared_ptr<SendBudget> budget) noexcept : mBudget(std::move(budget)) {}
-    ~SendNotificationScope() { if (mBudget) mBudget->Notify(); }
+    explicit SendNotificationScope(std::shared_ptr<SendBudget> budget) noexcept
+        : mBudget(std::move(budget))
+    {
+    }
+    ~SendNotificationScope()
+    {
+        if (mBudget)
+            mBudget->Notify();
+    }
+
 private:
     std::shared_ptr<SendBudget> mBudget;
 };

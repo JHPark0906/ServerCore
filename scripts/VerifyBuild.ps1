@@ -9,7 +9,9 @@
       - 판정은 종료 코드로 한다. 로그 문자열이나 경고 개수로 판정하지 않는다.
       - ctest는 빌드를 하지 않는다. 그래서 시험 전에 반드시 빌드를 돌리고,
         빌드가 실패하면 시험 단계로 넘어가지 않는다(오래된 실행 파일로 통과하는 것을 막는다).
-      - 표방하는 성질은 표방하는 모든 구성에서 검증한다. 기본값이 Debug·Release 둘 다인 이유다.
+      - 표방하는 성질은 표방하는 모든 구성에서 검증한다. 기본값이 정적 Debug·Release와 공유 Debug
+        셋인 이유다. 프리셋이 C ABI를 켜 두므로 C ABI 시험과 공유 전용 시험(SharedAbiCompatibility,
+        CAbiPackageConsume, SharedLibraryExportSet)도 이 한 번에 돈다.
       - 건너뛴 것은 통과가 아니다. SKIPPED는 요약에서 PASS와 구분되고 사유가 함께 남는다.
       - 결과보다 대상을 먼저 적는다. 어느 툴체인·어느 빌드 트리·어느 커밋인지를 머리말에 찍는다.
 
@@ -17,7 +19,8 @@
     CMakePresets.json을 그대로 쓰므로, 이 스크립트와 IDE가 같은 구성을 본다.
 
 .PARAMETER Configuration
-    Debug, Release, All(기본값) 중 하나.
+    Debug, Release, SharedDebug, All(기본값) 중 하나. All은 세 구성을 차례로 돈다.
+    SharedDebug는 CI의 Windows 공유 작업과 같은 조합(msvc-shared-debug)이다.
 
 .PARAMETER VsInstallPath
     쓸 Visual Studio 설치 경로를 직접 지정한다. 비우면 vswhere로 찾고 2022를 우선한다.
@@ -33,7 +36,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Debug', 'Release', 'All')]
+    [ValidateSet('Debug', 'Release', 'SharedDebug', 'All')]
     [string] $Configuration = 'All',
 
     [string] $VsInstallPath = '',
@@ -211,14 +214,14 @@ Write-Host ("Ninja        : {0}" -f $ninjaExe)
 Write-Host  "외부 의존성  : 없음"
 
 $configs = @()
-if ($Configuration -eq 'All') { $configs = @('Debug', 'Release') } else { $configs = @($Configuration) }
+if ($Configuration -eq 'All') { $configs = @('Debug', 'Release', 'SharedDebug') } else { $configs = @($Configuration) }
 Write-Host ("검증 구성    : {0}" -f ($configs -join ', '))
 
 # --------------------------------------------------------------------------
 # 구성별 검증
 # --------------------------------------------------------------------------
 foreach ($cfg in $configs) {
-    $preset = 'msvc-' + $cfg.ToLower()
+    $preset = @{ Debug = 'msvc-debug'; Release = 'msvc-release'; SharedDebug = 'msvc-shared-debug' }[$cfg]
     $buildDir = Join-Path $RepoRoot ('build\' + $preset)
 
     Write-Section ("[{0}] 구성 - 빌드 트리 {1}" -f $cfg, $buildDir)

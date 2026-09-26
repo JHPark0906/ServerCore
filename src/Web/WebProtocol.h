@@ -12,13 +12,23 @@
 
 namespace ServerCore::Web::Detail
 {
-[[nodiscard]] SERVERCORE_TEST_API bool EqualInsensitive(std::string_view left, std::string_view right) noexcept;
+[[nodiscard]] SERVERCORE_TEST_API bool EqualInsensitive(
+    std::string_view left, std::string_view right) noexcept;
 [[nodiscard]] SERVERCORE_TEST_API bool IsToken(std::string_view value) noexcept;
-[[nodiscard]] SERVERCORE_TEST_API bool HasToken(const HttpRequest& request, std::string_view header, std::string_view token);
+[[nodiscard]] SERVERCORE_TEST_API bool HasToken(
+    const HttpRequest& request, std::string_view header, std::string_view token);
 [[nodiscard]] SERVERCORE_TEST_API bool ValidHeaderValue(std::string_view value) noexcept;
 [[nodiscard]] SERVERCORE_TEST_API bool ValidUpgradeProtocols(std::string_view value) noexcept;
 
-enum class HttpParseKind { NeedMore, Continue, Complete, Error, Headers, Body };
+enum class HttpParseKind
+{
+    NeedMore,
+    Continue,
+    Complete,
+    Error,
+    Headers,
+    Body
+};
 struct HttpParseResult
 {
     HttpParseKind kind = HttpParseKind::NeedMore;
@@ -29,16 +39,50 @@ struct HttpParseResult
 class HttpParser
 {
 public:
-    SERVERCORE_TEST_API HttpParser(std::size_t maxHeaders, std::size_t maxBody, bool separateHeaders = false);
+    SERVERCORE_TEST_API HttpParser(
+        std::size_t maxHeaders, std::size_t maxBody, bool separateHeaders = false);
     SERVERCORE_TEST_API HttpParseResult Parse(std::string& input, HttpRequest& output);
-    SERVERCORE_TEST_API bool ConfigureBody(bool streaming, std::size_t maxBody, std::size_t maxChunk) noexcept;
-    bool TakeContinue() noexcept { const auto value = mContinue; mContinue = false; return value; }
+    /// <summary>입력을 고치지 않고 앞에서부터 읽고, 이 호출이 처리한 바이트 수를 consumed에 돌려준다.</summary>
+    /// <remarks>
+    /// 처리한 앞부분을 지우는 일은 호출자가 모아서 한 번에 한다. 입력이 string_view이므로 이 함수는
+    /// 호출자의 버퍼를 옮길 수 없고, 그 타입이 청크·줄마다 버퍼 앞을 지우던 O(n²) 복사를 막는다.
+    /// 다음 호출에는 소비하지 않은 나머지를 그대로 넘긴다.
+    /// </remarks>
+    SERVERCORE_TEST_API HttpParseResult Parse(
+        std::string_view input, std::size_t& consumed, HttpRequest& output);
+    SERVERCORE_TEST_API bool ConfigureBody(
+        bool streaming, std::size_t maxBody, std::size_t maxChunk) noexcept;
+    bool TakeContinue() noexcept
+    {
+        const auto value = mContinue;
+        mContinue = false;
+        return value;
+    }
     [[nodiscard]] SERVERCORE_TEST_API bool Started() const noexcept;
     // Preserved on failure so generated HEAD errors also omit their content.
     [[nodiscard]] SERVERCORE_TEST_API bool IsHeadRequest() const noexcept;
+    /// <summary>마지막으로 해석한 요청 줄이 HTTP/1.0이었는지 알려 준다. 다음 요청 줄을 해석할 때 바뀐다.</summary>
+    /// <remarks>
+    /// HTTP/1.0 요청은 Host 없이도 받고, 100-continue 기대를 무시하며, Transfer-Encoding은 잘못된
+    /// 프레이밍으로 보고 400으로 거절한다(RFC 9112 §6.1, RFC 9110 §10.1.1). 연결 유지·청크 응답을
+    /// 끄는 것은 이 값을 읽는 서버 몫이다.
+    /// </remarks>
+    [[nodiscard]] bool IsHttp10() const noexcept { return mHttp10; }
+
 private:
-    enum class Stage { Headers, FixedBody, ChunkSize, ChunkData, ChunkEnd, Trailers, Failed };
+    enum class Stage
+    {
+        Headers,
+        FixedBody,
+        ChunkSize,
+        ChunkData,
+        ChunkEnd,
+        Trailers,
+        Failed
+    };
     SERVERCORE_TEST_API HttpParseResult ParseHeaders(std::string_view block);
+    /// <summary>input의 앞에서 처리한 만큼을 remove_prefix로 넘긴다. 버퍼는 건드리지 않는다.</summary>
+    SERVERCORE_TEST_API HttpParseResult Advance(std::string_view& input, HttpRequest& output);
     SERVERCORE_TEST_API HttpParseResult Fail(unsigned int status);
     SERVERCORE_TEST_API HttpParseResult Complete(HttpRequest& output);
     Stage mStage = Stage::Headers;
@@ -50,6 +94,7 @@ private:
     std::size_t mHeaderSearch = 0;
     bool mContinue = false;
     bool mHeadRequest = false;
+    bool mHttp10 = false;
     bool mSeparateHeaders = false, mStreaming = false;
     std::size_t mBodyBytes = 0, mMaxChunk = 0;
     HttpRequest mRequest;
@@ -63,8 +108,8 @@ SERVERCORE_TEST_API bool SerializeResponse(const HttpResponse& response, bool he
 [[nodiscard]] SERVERCORE_TEST_API std::string HttpDate(std::chrono::system_clock::time_point time);
 [[nodiscard]] SERVERCORE_TEST_API bool WebSocketAccept(std::string_view key, std::string& accept);
 [[nodiscard]] SERVERCORE_TEST_API bool ValidCloseCode(std::uint16_t code) noexcept;
-SERVERCORE_TEST_API bool SelectWebSocketSubprotocol(const HttpRequest& request,
-    const std::vector<std::string>& supported, std::string& selected);
+SERVERCORE_TEST_API bool SelectWebSocketSubprotocol(
+    const HttpRequest& request, const std::vector<std::string>& supported, std::string& selected);
 // Retains at most one incomplete UTF-8 code point, reusing Core validation.
 struct Utf8FragmentState
 {
@@ -73,7 +118,12 @@ struct Utf8FragmentState
     SERVERCORE_TEST_API bool Append(std::span<const std::byte> bytes, bool final) noexcept;
 };
 
-enum class FrameParseKind { NeedMore, Complete, Error };
+enum class FrameParseKind
+{
+    NeedMore,
+    Complete,
+    Error
+};
 struct WebSocketFrame
 {
     bool final = true;
@@ -86,8 +136,8 @@ struct FrameParseResult
     std::size_t consumed = 0;
     std::uint16_t closeCode = 1002;
 };
-SERVERCORE_TEST_API FrameParseResult ParseClientFrame(std::span<const std::byte> input,
-    std::size_t maxPayload, WebSocketFrame& frame);
+SERVERCORE_TEST_API FrameParseResult ParseClientFrame(
+    std::span<const std::byte> input, std::size_t maxPayload, WebSocketFrame& frame);
 [[nodiscard]] SERVERCORE_TEST_API std::vector<std::byte> EncodeServerFrame(
     std::uint8_t opcode, std::span<const std::byte> payload, bool final = true);
 }

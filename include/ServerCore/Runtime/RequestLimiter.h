@@ -1,6 +1,6 @@
 #pragma once
-#include "ServerCore/Export.h"
 #include "ServerCore/Core/Error.h"
+#include "ServerCore/Export.h"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -43,7 +43,8 @@ public:
 
 private:
     friend class RequestLimiter;
-    SERVERCORE_API RequestPermit(std::shared_ptr<Detail::RequestLimitState>, Detail::RequestLimitEntry*) noexcept;
+    SERVERCORE_API RequestPermit(
+        std::shared_ptr<Detail::RequestLimitState>, Detail::RequestLimitEntry*) noexcept;
     std::shared_ptr<Detail::RequestLimitState> mState;
     Detail::RequestLimitEntry* mEntry = nullptr;
 };
@@ -70,11 +71,19 @@ struct RequestLimiterSnapshot
 // Protocol-neutral, thread-safe token bucket and concurrency admission. Keys are
 // opaque bytes supplied by the application (no automatic IP/account selection).
 // Rejections consume no rate/concurrency budget. There is no waiting queue.
+/// <remarks>
+/// 키 표가 가득 차면 활성 permit이 없고 버킷이 가득 찬 항목(새 항목과 구별되지 않는다)을
+/// idleExpiry와 무관하게 비우고 새 키를 받는다. 버킷이 비어 있거나 permit이 살아 있는 항목은 비우지
+/// 않는다(Runtime.RequestLimiterEvictsFullBucketsUnderPressure). 비울 항목이 생길 수 있는 가장 이른
+/// 시각이나 permit 반환 전에는 가득 찬 표를 다시 훑지 않는다.
+/// </remarks>
 class RequestLimiter
 {
 public:
-    SERVERCORE_API static Core::Result<RequestLimiter> Create(const RequestLimiterOptions& options = {});
-    SERVERCORE_API Core::Result<RequestAdmission> TryAcquire(std::string_view key, std::uint64_t cost = 1) const;
+    SERVERCORE_API static Core::Result<RequestLimiter> Create(
+        const RequestLimiterOptions& options = {});
+    SERVERCORE_API Core::Result<RequestAdmission> TryAcquire(
+        std::string_view key, std::uint64_t cost = 1) const;
     // Idle entries expire only when no permit is active AND their bucket is full,
     // preventing a short idleExpiry from resetting a depleted rate allowance.
     SERVERCORE_API std::size_t PruneExpired() const noexcept;

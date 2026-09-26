@@ -1,8 +1,8 @@
 #pragma once
 
-#include "ServerCore/Export.h"
-#include "ServerCore/Core/Endpoint.h"
 #include "Net/DatagramReadinessInternal.h"
+#include "ServerCore/Core/Endpoint.h"
+#include "ServerCore/Export.h"
 
 #ifdef _WIN32
 #include "Net/WinsockInternal.h"
@@ -35,8 +35,10 @@ public:
     DatagramSocket(const DatagramSocket&) = delete;
     DatagramSocket& operator=(const DatagramSocket&) = delete;
 
-    [[nodiscard]] SERVERCORE_TEST_API Core::Status Bind(std::string_view address, std::uint16_t port);
-    [[nodiscard]] SERVERCORE_TEST_API Core::Status Bind(const Core::IpEndpoint& endpoint,bool ipv6Only = true);
+    [[nodiscard]] SERVERCORE_TEST_API Core::Status Bind(
+        std::string_view address, std::uint16_t port);
+    [[nodiscard]] SERVERCORE_TEST_API Core::Status Bind(
+        const Core::IpEndpoint& endpoint, bool ipv6Only = true);
     SERVERCORE_TEST_API void Close() noexcept;
     [[nodiscard]] bool IsOpen() const noexcept
     {
@@ -48,12 +50,16 @@ public:
     }
     [[nodiscard]] std::uint16_t Port() const noexcept { return mPort; }
     [[nodiscard]] Core::IpEndpoint LocalEndpoint() const noexcept { return mLocalEndpoint; }
-    [[nodiscard]] std::shared_ptr<DatagramReadiness> Readiness() const noexcept { return mReadiness; }
+    [[nodiscard]] std::shared_ptr<DatagramReadiness> Readiness() const noexcept
+    {
+        return mReadiness;
+    }
     // An empty datagram succeeds with zero bytes. Oversized datagrams are consumed as TooLarge.
     // Only connection-reset/refused receive errors are retryable platform failures.
-    [[nodiscard]] SERVERCORE_TEST_API DatagramReceiveResult Receive(std::span<std::byte> buffer) noexcept;
-    [[nodiscard]] SERVERCORE_TEST_API Core::Status Send(const Core::IpEndpoint& endpoint,
-        std::span<const std::byte> payload) noexcept;
+    [[nodiscard]] SERVERCORE_TEST_API DatagramReceiveResult Receive(
+        std::span<std::byte> buffer) noexcept;
+    [[nodiscard]] SERVERCORE_TEST_API Core::Status Send(
+        const Core::IpEndpoint& endpoint, std::span<const std::byte> payload) noexcept;
 
 private:
 #ifdef _WIN32
@@ -69,5 +75,6 @@ private:
 };
 
 // Empty output succeeds; spans exceeding a 32-bit byte count are rejected.
-[[nodiscard]] SERVERCORE_TEST_API Core::Status GenerateDatagramSecret(std::span<std::byte> bytes) noexcept;
+[[nodiscard]] SERVERCORE_TEST_API Core::Status GenerateDatagramSecret(
+    std::span<std::byte> bytes) noexcept;
 }

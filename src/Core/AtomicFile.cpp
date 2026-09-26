@@ -1,5 +1,8 @@
 #include "ServerCore/Core/AtomicFile.h"
 #include "Core/Utf8Internal.h"
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+#include "Core/AtomicFileTestAccess.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -39,6 +42,18 @@ Result<std::uint64_t> NextTemporary() noexcept
     } while (!nextTemporary.compare_exchange_weak(value, value + 1, std::memory_order_relaxed));
     return Result<std::uint64_t>::FromValue(value);
 }
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+std::atomic<bool> gFailNextSync{ false };
+#endif
+/// <summary>시험이 요청했으면 이번 파일 동기화 한 번을 실패로 바꾼다. 시험 빌드가 아니면 거짓이다.</summary>
+bool ConsumeInjectedSyncFailure() noexcept
+{
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+    return gFailNextSync.exchange(false, std::memory_order_acq_rel);
+#else
+    return false;
+#endif
+}
 #ifdef _WIN32
 Status OsError() noexcept
 {
@@ -46,6 +61,16 @@ Status OsError() noexcept
     return Fail(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
                     ? ErrorCode::NotFound
                     : ErrorCode::PlatformError);
+}
+/// <summary>파일 내용을 저장 장치까지 내린다. 실패하면 GetLastError()에 원인이 남는다.</summary>
+bool SyncFile(const HANDLE file) noexcept
+{
+    if (ConsumeInjectedSyncFailure())
+    {
+        SetLastError(ERROR_IO_DEVICE);
+        return false;
+    }
+    return FlushFileBuffers(file) != FALSE;
 }
 #else
 Status OsError() noexcept
@@ -61,8 +86,24 @@ int SyncDescriptor(int descriptor) noexcept
     } while (result < 0 && errno == EINTR);
     return result;
 }
+/// <summary>파일 내용을 저장 장치까지 내린다. 실패하면 errno에 원인이 남는다.</summary>
+int SyncFileDescriptor(const int descriptor) noexcept
+{
+    if (ConsumeInjectedSyncFailure())
+    {
+        errno = EIO;
+        return -1;
+    }
+    return SyncDescriptor(descriptor);
+}
 #endif
 }
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+void TestAccess::FailNextAtomicFileSync() noexcept
+{
+    gFailNextSync.store(true, std::memory_order_release);
+}
+#endif
 struct AtomicFile::State
 {
     AtomicFileOptions options;
@@ -134,9 +175,9 @@ Result<std::unique_ptr<AtomicFile>> AtomicFile::Create(
     std::string_view utf8Target, AtomicFileOptions options)
 {
     using R = Result<std::unique_ptr<AtomicFile>>;
-    if (utf8Target.empty() || utf8Target.size() > 32768 ||
-        utf8Target.find('\0') != std::string_view::npos || !Detail::IsValidUtf8(utf8Target) ||
-        !options.maximumBytes || options.maximumBytes > (std::uint64_t{ 1 } << 40) ||
+    if (utf8Target.empty() || utf8Target.size() > 32768 || utf8Target.contains('\0') ||
+        !Detail::IsValidUtf8(utf8Target) || !options.maximumBytes ||
+        options.maximumBytes > (std::uint64_t{ 1 } << 40) ||
         (options.sync != FileSync::None && options.sync != FileSync::File &&
             options.sync != FileSync::FileAndDirectory))
         return R::FromStatus(Fail(ErrorCode::InvalidArgument));
@@ -286,8 +327,14 @@ Status AtomicFile::Commit()
         info->ReplaceIfExists = TRUE;
         info->FileNameLength = static_cast<DWORD>(nameBytes);
         std::memcpy(info->FileName, s.target.data(), nameBytes);
-        if (s.options.sync != FileSync::None && !FlushFileBuffers(s.file))
-            return OsError();
+        // 동기화가 한 번 실패한 writer는 끝낸다. 다시 부른 동기화의 성공은 앞서 잃은 쓰기가
+        // 저장 장치에 닿았다는 뜻이 아니다. Core.AtomicFileSyncFailureIsTerminal이 고정한다.
+        if (s.options.sync != FileSync::None && !SyncFile(s.file))
+        {
+            auto status = OsError();
+            s.failure = status.Code();
+            return status;
+        }
         if (!SetFileInformationByHandle(s.file, FileRenameInfo, info, static_cast<DWORD>(size)))
             return OsError();
         s.committed = true;
@@ -299,8 +346,14 @@ Status AtomicFile::Commit()
         return Status::AllocationFailure();
     }
 #else
-    if (s.options.sync != FileSync::None && SyncDescriptor(s.file) != 0)
-        return OsError();
+    // Linux는 쓰기 되돌림 오류를 fd당 한 번만 보고하므로 다시 부른 fsync는 0을 돌려줄 수 있다.
+    // 그래서 한 번 실패한 writer는 끝낸다. Core.AtomicFileSyncFailureIsTerminal이 고정한다.
+    if (s.options.sync != FileSync::None && SyncFileDescriptor(s.file) != 0)
+    {
+        auto status = OsError();
+        s.failure = status.Code();
+        return status;
+    }
     if (renameat(s.directory, s.temporary.c_str(), s.directory, s.target.c_str()) != 0)
         return OsError();
     s.committed = true;

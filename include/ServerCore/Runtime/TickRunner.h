@@ -69,7 +69,7 @@ private:
     TimerHandle mTimer;
     std::shared_ptr<Detail::TickState> mState;
 };
-// Uses one existing fixed-delay timer; logical time is fixed-rate. No simulation
+// Uses one existing FixedRate timer on the same grid as logical time. No simulation
 // state or additional worker. Skip invokes the newest due tick. CatchUp invokes
 // at most maxCatchUp most-recent due ticks in order, discarding older lag. A long
 // callback never causes overlap. Each batch snapshots time once; later delays

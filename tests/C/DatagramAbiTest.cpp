@@ -28,6 +28,96 @@ Event Next(sc_udp_transport* owner)
     ExpectTrue(sc_udp_transport_next(owner, 5000, &out) == SC_OK, "C event arrives");
     return Event(out, sc_udp_event_destroy);
 }
+/// <summary>metrics를 다시 읽어 조건이 설 때까지 기다린다. 끝내 서지 않으면 마지막 값을 남긴다.</summary>
+template <class Condition>
+bool AwaitMetrics(sc_udp_transport* owner, sc_udp_metrics& metrics, Condition condition)
+{
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    do
+    {
+        if (sc_udp_transport_get_metrics(owner, &metrics) == SC_OK && condition(metrics))
+            return true;
+        std::this_thread::sleep_for(1ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+/// <summary>
+/// 반환 엔드포인트 이전과 시퀀스 점프 상한(UDP-1)이 C 옵션과 metrics로 드러나는지 본다. 기본값은
+/// 이전을 막고 점프 상한 1024이며, 0인 상한과 정의되지 않은 값은 만들기에서 거절한다. 막힌 패킷은
+/// 사건으로 나오지 않고 각자의 metrics와 rejected_datagrams에 센다. 이전을 켜면 같은 패킷이 들어온다.
+/// </summary>
+void EndpointAndSequencePolicy()
+{
+    sc_udp_options options{};
+    ExpectTrue(sc_udp_options_init(&options, sizeof(options)) == SC_OK &&
+                   options.allow_endpoint_migration == 0 && options.max_sequence_jump == 1024,
+        "UDP options default to no migration and a 1024 sequence jump");
+    sc_udp_transport* raw = nullptr;
+    auto invalid = options;
+    invalid.max_sequence_jump = 0;
+    ExpectTrue(sc_udp_transport_create(&invalid, &raw) == SC_INVALID_ARGUMENT && !raw,
+        "a zero sequence jump is rejected");
+    invalid = options;
+    invalid.allow_endpoint_migration = 2;
+    ExpectTrue(sc_udp_transport_create(&invalid, &raw) == SC_INVALID_ARGUMENT && !raw,
+        "an undefined migration flag is rejected");
+    invalid = options;
+    invalid.reserved2 = 1;
+    ExpectTrue(sc_udp_transport_create(&invalid, &raw) == SC_INVALID_ARGUMENT && !raw,
+        "a nonzero reserved field is rejected");
+    for (const uint32_t migration : { 0u, 1u })
+    {
+        options.max_sequence_jump = 4;
+        options.allow_endpoint_migration = migration;
+        raw = nullptr;
+        if (!Check(sc_udp_transport_create(&options, &raw) == SC_OK && raw,
+                "policy transport created"))
+            return;
+        Owner owner(raw, sc_udp_transport_destroy);
+        if (!Check(sc_udp_transport_start(raw) == SC_OK, "policy transport started"))
+            return;
+        sc_ip_endpoint local{};
+        (void)sc_udp_transport_local_endpoint(raw, &local);
+        const auto endpoint = ServerCore::Core::IpEndpoint::Parse("127.0.0.1", local.port).Value();
+        ServerCore::Net::DatagramSocket first, second;
+        if (!Check(first.Bind("127.0.0.1", 0).IsOk() && second.Bind("127.0.0.1", 0).IsOk(),
+                "policy clients bound"))
+            return;
+        sc_udp_token token{};
+        ExpectTrue(sc_udp_transport_register(raw, 9, &token) == SC_OK, "policy session registered");
+        ExpectTrue(first.Send(endpoint, Packet(token, 1)).IsOk(), "first packet sent");
+        auto accepted = Next(raw);
+        if (!accepted)
+            return;
+        auto metrics = View<sc_udp_metrics>();
+        ExpectTrue(first.Send(endpoint, Packet(token, 6)).IsOk(), "jumping packet sent");
+        ExpectTrue(AwaitMetrics(raw, metrics, [](const sc_udp_metrics& value)
+                       { return value.sequence_jump_datagrams == 1; }),
+            "a jump beyond max_sequence_jump is counted");
+        ExpectTrue(second.Send(endpoint, Packet(token, 2)).IsOk(), "packet from a new source sent");
+        if (migration)
+        {
+            auto moved = Next(raw);
+            auto view = View<sc_udp_event_view>();
+            ExpectTrue(moved && sc_udp_event_get(moved.get(), &view) == SC_OK && view.sequence == 2,
+                "migration admits the packet from the new source");
+            ExpectTrue(sc_udp_transport_get_metrics(raw, &metrics) == SC_OK &&
+                           metrics.endpoint_mismatch_datagrams == 0,
+                "migration counts no endpoint mismatch");
+        }
+        else
+        {
+            ExpectTrue(AwaitMetrics(raw, metrics, [](const sc_udp_metrics& value)
+                           { return value.endpoint_mismatch_datagrams == 1; }),
+                "a packet from a new source is counted without migration");
+            sc_udp_event* none = nullptr;
+            ExpectTrue(sc_udp_transport_next(raw, 0, &none) == SC_WOULD_BLOCK && !none,
+                "the mismatched packet produces no event");
+        }
+        ExpectTrue(metrics.rejected_datagrams >= 1, "policy rejections also count as rejected");
+        (void)sc_udp_transport_stop(raw);
+    }
+}
 void Ownership()
 {
     sc_udp_options options{};
@@ -84,6 +174,7 @@ void Ownership()
     owner.reset();
     ExpectTrue(sc_udp_event_get(second.get(), &view) == SC_OK && Text(view.payload) == Body,
         "event bytes survive owner destruction");
+    EndpointAndSequencePolicy();
 }
 void CodecValidation()
 {
@@ -95,7 +186,13 @@ void CodecValidation()
     sc_udp_token token{};
     token.bytes[0] = 42;
     auto packet = Packet(token, 9);
-    sc_udp_packet_view view{};
+    auto stale = View<sc_udp_packet_view>();
+    stale.struct_size = 0;
+    ExpectTrue(
+        sc_udp_packet_decode({ reinterpret_cast<const uint8_t*>(packet.data()), packet.size() },
+            &stale) == SC_INVALID_ARGUMENT,
+        "packet decode requires an initialized output header");
+    auto view = View<sc_udp_packet_view>();
     ExpectTrue(
         sc_udp_packet_decode(
             { reinterpret_cast<const uint8_t*>(packet.data()), packet.size() }, &view) == SC_OK &&
@@ -107,6 +204,23 @@ void CodecValidation()
                    &written) == SC_TOO_LARGE &&
                    sentinel[0] == 1 && written == packet.size(),
         "size probe reports full packet without partial writes");
+    // 페이로드가 쓰일 출력 구간과 겹치면 정의된 결과가 없으므로 거절한다(CABI-5). 쓰이지 않는
+    // 뒤쪽 공간에 놓인 페이로드는 겹침이 아니다.
+    std::array<uint8_t, 256> shared{};
+    std::copy(Body.begin(), Body.end(), shared.begin() + packet.size());
+    const auto encodeFrom = [&](std::size_t offset)
+    {
+        written = 0;
+        return sc_udp_packet_encode(&token, 9, { shared.data() + offset, Body.size() },
+            shared.data(), shared.size(), &written);
+    };
+    const auto header = packet.size() - Body.size();
+    ExpectTrue(encodeFrom(header) == SC_INVALID_ARGUMENT && written == 0,
+        "payload already in place after the header is rejected as overlapping");
+    ExpectTrue(encodeFrom(10) == SC_INVALID_ARGUMENT && written == 0,
+        "payload overlapping the header is rejected");
+    ExpectTrue(encodeFrom(packet.size()) == SC_OK && written == packet.size(),
+        "payload beyond the written range is not an overlap");
     packet[0] = std::byte{ 0 };
     ExpectTrue(
         sc_udp_packet_decode({ reinterpret_cast<const uint8_t*>(packet.data()), packet.size() },

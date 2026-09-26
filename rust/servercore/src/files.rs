@@ -5,7 +5,7 @@ use crate::{bytes, check, pointer, sys, sys::files as ffi, verify_abi, Error, Re
 use std::{path::Path, ptr::NonNull};
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(u32)]
-pub enum Sync {
+pub enum SyncMode {
     None = 0,
     #[default]
     File = 1,
@@ -14,13 +14,13 @@ pub enum Sync {
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub maximum_bytes: u64,
-    pub sync: Sync,
+    pub sync: SyncMode,
 }
 impl Default for Options {
     fn default() -> Self {
         Self {
             maximum_bytes: 64 * 1024 * 1024,
-            sync: Sync::File,
+            sync: SyncMode::File,
         }
     }
 }
@@ -70,6 +70,12 @@ impl Drop for AtomicFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn glob_import_keeps_the_sync_marker_trait() {
+        // `use super::*` above is the glob import users write for this module.
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<Options>();
+    }
     #[test]
     fn replace_and_abandon_preserve_target() {
         let root = std::env::temp_dir().join(format!(

@@ -2,6 +2,9 @@
 
 #include "Net/DatagramSocket.h"
 #include "ServerCore/Runtime/TimerScheduler.h"
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+#include "Runtime/TransportTestAccess.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -44,6 +47,23 @@ void ConsumeBytes(std::size_t& consumed, const std::size_t count) noexcept
 }
 
 using Clock = std::chrono::steady_clock;
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+struct ReceivePumpGateSlot
+{
+    std::mutex mutex;
+    std::weak_ptr<TestAccess::IReceivePumpGate> gate;
+};
+[[nodiscard]] ReceivePumpGateSlot& GetReceivePumpGateSlot()
+{
+    static ReceivePumpGateSlot slot;
+    return slot;
+}
+[[nodiscard]] std::shared_ptr<TestAccess::IReceivePumpGate> ReceivePumpGateForTest()
+{
+    const std::lock_guard guard(GetReceivePumpGateSlot().mutex);
+    return GetReceivePumpGateSlot().gate.lock();
+}
+#endif
 bool ValidRate(const DatagramTransportOptions::SendRate& rate) noexcept
 {
     if (!rate.bytesPerInterval && !rate.burstBytes)
@@ -275,6 +295,8 @@ private:
                 count(true);
                 return;
             }
+            // 이전 readable 구독은 그 콜백(Ready)이 시작하자마자 스스로 꺼내 간다. 그래서 완료 콜백에서
+            // 불린 이 재무장이 교체하는 구독은 비어 있고, 모니터 스레드의 콜백을 기다리지 않는다(EXEC-2).
             Core::CompletionSubscription retired;
             {
                 const std::lock_guard guard(mutex);
@@ -282,8 +304,13 @@ private:
                 {
                     retired = std::move(readable);
                     readable = std::move(result.Value());
+                    readableGeneration = current;
                 }
             }
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+            if (const auto gate = ReceivePumpGateForTest())
+                gate->AfterRearmPublished();
+#endif
         }
         catch (...)
         {
@@ -293,10 +320,16 @@ private:
     }
     void Ready(std::uint64_t current, ErrorCode code) noexcept
     {
+        // 이 콜백을 부른 구독을 여기서 꺼내 이 스레드에서 정리한다. 자기 콜백 안의 Reset은 기다리지
+        // 않으므로, 다른 스레드의 재무장이 이 콜백의 끝을 기다리며 서로 막히는 일이 없다. 재무장이
+        // 인라인으로 Closed를 전달한 경우에는 readable이 아직 이전 구독이라 세대가 달라 꺼내지 않는다.
+        Core::CompletionSubscription consumed;
         {
             const std::lock_guard guard(mutex);
             if (stopping.load() || current != generation)
                 return;
+            if (readableGeneration == current)
+                consumed = std::move(readable);
         }
         if (code != ErrorCode::Ok)
         {
@@ -335,7 +368,10 @@ private:
                         self->pending.store(0);
                         if (!status.IsOk())
                         {
-                            self->stopping.store(true);
+                            // 정지 요청이 먼저 있었다면 그 취소의 결과다. 아니면 배치가 실패해 수신이
+                            // 멈추는 것이므로 pumpFailures로 드러낸다(EXEC-7).
+                            if (!self->stopping.exchange(true))
+                                self->count(true);
                             return;
                         }
                         self->Arm();
@@ -349,6 +385,10 @@ private:
                 count(true);
                 return;
             }
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+            if (const auto gate = ReceivePumpGateForTest())
+                gate->AfterCompletionSubscribed();
+#endif
             // Completion can already have rearmed/readied the next generation.
             Core::CompletionSubscription retired;
             {
@@ -369,7 +409,7 @@ private:
     }
     TimerScheduler scheduler;
     std::mutex mutex;
-    std::uint64_t generation = 0;
+    std::uint64_t generation = 0, readableGeneration = 0;
     Core::CompletionSubscription readable, terminal;
     std::unique_ptr<std::stop_callback<std::function<void()>>> parent;
 };
@@ -414,7 +454,7 @@ DatagramTransport::~DatagramTransport()
 
 Status DatagramTransport::Configure(const DatagramTransportOptions& options)
 {
-    if (options.maxRegisteredSessions == 0 ||
+    if (options.maxRegisteredSessions == 0 || options.maxSequenceJump == 0 ||
         (options.payloadMode != Protocol::PayloadMode::Json &&
             options.payloadMode != Protocol::PayloadMode::Binary) ||
         !ValidRate(options.totalSendRate) || !ValidRate(options.peerSendRate))
@@ -780,8 +820,7 @@ void DatagramTransport::Poll(
                 if (!parsed.IsOk())
                     return PayloadDecision::InvalidPayload;
                 message.emplace(std::move(parsed.Value()));
-                return admission(view.session, *message) ? PayloadDecision::Allow
-                                                         : PayloadDecision::Reject;
+                return admission(view, *message) ? PayloadDecision::Allow : PayloadDecision::Reject;
             },
             [&](const DatagramMessageView& view) { receiver(view.session, *message); }, budget);
     }
@@ -878,6 +917,22 @@ void DatagramTransport::PollPayload(const PayloadAdmission& admission,
                 {
                     ++mImpl->metrics.rejectedDatagrams;
                     ++mImpl->metrics.replayedDatagrams;
+                    continue;
+                }
+                // 수신 시퀀스와 엔드포인트는 이 Poll의 커밋에서만 바뀌고 Poll은 직렬이므로, 여기서 한
+                // 판정이 아래 커밋까지 유지된다.
+                if (!mImpl->options.allowEndpointMigration && peer->second.ready &&
+                    peer->second.endpoint != received.endpoint)
+                {
+                    ++mImpl->metrics.rejectedDatagrams;
+                    ++mImpl->metrics.endpointMismatchDatagrams;
+                    continue;
+                }
+                if (packet.sequence - peer->second.receivedSequence >
+                    mImpl->options.maxSequenceJump)
+                {
+                    ++mImpl->metrics.rejectedDatagrams;
+                    ++mImpl->metrics.sequenceJumpDatagrams;
                     continue;
                 }
                 id = token->second;
@@ -994,8 +1049,7 @@ void DatagramTransport::PollBinary(const BinaryAdmission& admission, const Binar
                 if (!parsed.IsOk())
                     return PayloadDecision::InvalidPayload;
                 message = parsed.Value();
-                return admission(view.session, message) ? PayloadDecision::Allow
-                                                        : PayloadDecision::Reject;
+                return admission(view, message) ? PayloadDecision::Allow : PayloadDecision::Reject;
             },
             [&](const DatagramMessageView& view) { receiver(view.session, message); }, budget);
     }
@@ -1031,4 +1085,17 @@ void DatagramTransport::PollDatagrams(const DatagramAdmission& admission,
         ++mImpl->metrics.rejectedDatagrams;
     }
 }
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+void TestAccess::InstallReceivePumpGate(std::shared_ptr<IReceivePumpGate> gate)
+{
+    const std::lock_guard guard(GetReceivePumpGateSlot().mutex);
+    GetReceivePumpGateSlot().gate = std::move(gate);
+}
+void TestAccess::ClearReceivePumpGate(const std::shared_ptr<IReceivePumpGate>& expected)
+{
+    const std::lock_guard guard(GetReceivePumpGateSlot().mutex);
+    if (GetReceivePumpGateSlot().gate.lock() == expected)
+        GetReceivePumpGateSlot().gate.reset();
+}
+#endif
 }

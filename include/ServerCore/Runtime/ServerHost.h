@@ -6,9 +6,9 @@
 #include "ServerCore/Core/Logging.h"
 #include "ServerCore/Dispatch/Dispatcher.h"
 #include "ServerCore/Protocol/Framing.h"
+#include "ServerCore/Runtime/DatagramTransport.h"
 #include "ServerCore/Runtime/JobRunner.h"
 #include "ServerCore/Runtime/Metrics.h"
-#include "ServerCore/Runtime/DatagramTransport.h"
 #include "ServerCore/Session/Session.h"
 #include "ServerCore/Session/SessionRegistry.h"
 
@@ -92,14 +92,17 @@ struct ServerHostOptions
     /// </summary>
     /// <remarks>
     /// 느린 게임 처리기가 있는 동안 TCP 수신 완료마다 복사본을 무한히 쌓지 않기 위한 역압이다.
-    /// 넘으면 그 연결만 TooLarge로 닫고 다른 세션의 작업 큐는 계속 돈다.
+    /// 넘으면 그 연결만 TooLarge로 닫고 다른 세션의 작업 큐는 계속 돈다. 수신 한 번의 상한인
+    /// Net::MaximumReceiveChunkBytes보다 작으면 Configure가 InvalidArgument를 돌려준다
+    /// (Runtime.HostRejectsReceiveBudgetBelowOneReceive).
     /// </remarks>
     std::uint32_t maxPendingReceiveBytes = 4u * Protocol::DefaultMaxBodySize;
 
     /// <summary>모든 세션이 합쳐 아직 처리 중이거나 대기 중인 수신 바이트에 쓸 수 있는 상한이다.</summary>
     /// <remarks>
     /// 세션별 상한만 있으면 많은 연결이 각각 한도까지 쌓을 수 있다. 이 예산은 그런 합계를
-    /// 막고, 넘는 새 수신은 해당 연결만 TooLarge로 닫는다.
+    /// 막고, 넘는 새 수신은 해당 연결만 TooLarge로 닫는다. Net::MaximumReceiveChunkBytes보다 작으면
+    /// Configure가 InvalidArgument를 돌려준다(Runtime.HostRejectsReceiveBudgetBelowOneReceive).
     /// </remarks>
     std::uint32_t maxTotalPendingReceiveBytes = 128u * Protocol::DefaultMaxBodySize;
 
@@ -140,10 +143,15 @@ struct ServerHostOptions
     /// </remarks>
     std::uint32_t maxTotalSendQueueCapacityBytes = 256u * 1024u * 1024u;
 
-    /// <summary>SendAndDisconnect가 Closing으로 전이한 뒤 송신 큐를 비울 최대 시간이다.</summary>
+    /// <summary>
+    /// SendAndDisconnect나 drain이 세션을 Closing으로 옮긴 뒤 연결이 닫힐 때까지 기다리는 최대
+    /// 시간이다. 송신 큐를 비우는 시간과, 그 뒤 상대가 연결을 닫기를 기다리는 시간을 모두 포함한다.
+    /// </summary>
     /// <remarks>
-    /// 양수만 허용하며 0으로 끌 수 없다. 상대가 읽지 않아 송신이 멈춰도 이 시간이 지나면
-    /// 남은 큐를 버리고 연결을 닫아 세션 슬롯과 공유 송신 예산을 반환한다. 수신 바이트는 이
+    /// 송신 큐를 비운 연결은 보내기 쪽만 닫고 상대가 닫을 때까지 들어오는 바이트를 읽어 버린다.
+    /// 그래서 상대가 EOF를 읽고도 닫지 않으면 이 시간이 지나서야 닫힌다.
+    /// 양수만 허용하며 0으로 끌 수 없다. 상대가 읽지 않아 송신이 멈추거나 닫지 않아도 이 시간이
+    /// 지나면 남은 큐를 버리고 연결을 닫아 세션 슬롯과 공유 송신 예산을 반환한다. 수신 바이트는 이
     /// 절대 기한을 연장하지 않는다. idleSessionTimeout이 0이어도 검사는 계속 실행된다.
     /// 공통 검사 주기는 활성화된 두 제한 중 짧은 값으로 정하며, 실제 종료는 그 주기와
     /// JobRunner 대기 뒤에 일어난다. 따라서 실시간 마감 시각을 약속하지는 않는다.
@@ -155,15 +163,43 @@ struct ServerHostOptions
     std::chrono::milliseconds frameCompletionTimeout{ 0 };
     std::chrono::milliseconds authenticationTimeout{ 0 };
     /// Per-session fixed one-second receive windows. Zero disables; excess closes TooLarge.
+    /// 0이 아니면 maxBodySize + 머리 4바이트 이상이어야 하며, 작으면 Configure가 InvalidArgument를
+    /// 돌려준다(Runtime.HostRejectsUnsendableInputRate).
     std::uint32_t maxInputBytesPerSecond = 0;
     std::uint32_t maxInputFramesPerSecond = 0;
     /// Binary uses the existing length framing and budgets; JSON remains the default adapter.
     Protocol::PayloadMode payloadMode = Protocol::PayloadMode::Json;
+    /// <summary>Host가 소유하는 JobRunner의 작업 수·바이트 상한이다.</summary>
+    /// <remarks>
+    /// maxControlJobs는 Host 내부 작업(세션 열기·수신 batch·parse 완료·종료 정리)만 쓰는 lane이다.
+    /// Configure는 이 값을 3 × maxConcurrentSessions + (parse worker를 켜면 maxTotalPendingParseTasks)
+    /// + 2 아래로 두지 않고 그 하한까지 올려 잡는다. 0은 InvalidArgument다. 따라서 게임 처리기가
+    /// runner를 오래 붙들어도 대기 중인 입력이나 종료 정리가 lane 용량 때문에 실패하지 않으며,
+    /// Runtime.HostControlLaneFitsSessionWork가 이것을 고정한다.
+    /// </remarks>
     JobRunnerOptions jobRunner;
     /// Bounds receive-arrival metadata as well as byte storage; 1..65,536 per session.
     std::uint32_t maxPendingReceiveChunks = 1024;
     /// Explicit IPV6_V6ONLY behavior, identical on Windows/Linux; ignored for IPv4.
     bool ipv6Only = true;
+    /// <summary>원격 메시지마다 생기는 Warn 기록(처리기 실패, 알 수 없는 타입)의 Host 전체 초당 상한이다.</summary>
+    /// <remarks>
+    /// 0이면 제한하지 않는다. 넘은 기록은 버리고 그 수를 다음 창의 첫 기록 앞, 세션 만료 주기 검사,
+    /// Stop에서 suppressed 필드를 단 한 줄로 알린다(Runtime.HostLimitsMessageFailureLogs). 기본 10은
+    /// 한 Host가 원격 입력 때문에 남기는 Warn을 연결 수와 무관하게 초당 약 10줄(약 2 KB)로 묶으면서,
+    /// 오류가 나고 있다는 사실과 첫 사례들은 남기는 값이다.
+    /// </remarks>
+    std::uint32_t maxMessageFailureLogsPerSecond = 10;
+    /// <summary>JSON 본문 하나가 만들 수 있는 값(DOM 노드) 수의 상한이다.</summary>
+    /// <remarks>
+    /// 0이면 maxBodySize / 8과 1024 중 큰 값을 쓴다. 넘는 본문은 처리기에 가지 않고 그 세션을
+    /// TooLarge로 닫는다(Runtime.HostLimitsJsonValuesPerMessage). 파서는 값마다 약 64바이트와 컨테이너
+    /// 여유를 쓰고, [0,0,…]은 두 바이트마다 값 하나를 만들어 DOM이 입력의 수십 배가 된다. 8바이트당
+    /// 값 하나는 키가 붙은 짧은 JSON("k":1234,)의 밀도라서 보통 메시지는 통과하고, 가장 조밀한 입력의
+    /// 값 수는 4분의 1로 줄인다. 기본 64 KiB body에서는 8,192개다. 1024 하한은 body 상한이 작아도
+    /// 보통 메시지를 거절하지 않기 위한 것이다.
+    /// </remarks>
+    std::uint32_t maxJsonValuesPerMessage = 0;
 };
 
 /// <summary>
@@ -229,6 +265,8 @@ public:
     /// - servercore.host.max-input-bytes-per-second, max-input-frames-per-second
     /// - servercore.host.max-pending-receive-chunks
     /// - servercore.host.payload-mode: json 또는 binary
+    /// - servercore.host.max-message-failure-logs-per-second
+    /// - servercore.host.max-json-values-per-message
     ///
     /// 이 어댑터는 위 목록 외의 키를 읽지 않는다. 나머지 키의 소유자와 해석은 호출자가 정한다.
     /// 모든 값을 지역 옵션에 옮긴 뒤 ServerHostOptions overload를 한 번 호출하므로, 기존 옵션
@@ -244,7 +282,11 @@ public:
     SERVERCORE_API Core::Status Configure(const ServerHostOptions& options);
 
     /// <summary>기록을 남길 곳을 정한다. 부팅의 가장 첫 단계다.</summary>
-    SERVERCORE_API void SetLogger(std::shared_ptr<Core::ILogger> logger);
+    /// <returns>
+    /// Start를 부른 뒤에는 바꾸지 않고 Closed다. SetSessionObserver·SetBinaryHandler와 같은 규칙이다
+    /// (Runtime.HostRejectsLateSetupUniformly).
+    /// </returns>
+    [[nodiscard]] SERVERCORE_API Core::Status SetLogger(std::shared_ptr<Core::ILogger> logger);
 
     using BinaryHandler = std::function<Core::Status(
         const std::shared_ptr<Session::Session>&, Protocol::BinaryMessageView)>;
@@ -253,8 +295,10 @@ public:
     /// Optional, already bound transport dedicated to this Host. Automatically registers before OnSessionOpened and
     /// unregisters before OnSessionClosed. The caller still schedules Poll and distributes tokens
     /// over an authenticated control channel. This Host never closes a caller-owned UDP socket.
-    [[nodiscard]] SERVERCORE_API Core::Status AttachDatagramTransport(std::shared_ptr<DatagramTransport> transport);
-    [[nodiscard]] SERVERCORE_API Core::Result<Protocol::DatagramCodec::Token> GetDatagramToken(Session::SessionId id) const;
+    [[nodiscard]] SERVERCORE_API Core::Status AttachDatagramTransport(
+        std::shared_ptr<DatagramTransport> transport);
+    [[nodiscard]] SERVERCORE_API Core::Result<Protocol::DatagramCodec::Token> GetDatagramToken(
+        Session::SessionId id) const;
 
     /// <summary>
     /// 게임 백엔드가 메시지 처리기를 등록하는 자리다.
@@ -271,14 +315,16 @@ public:
 
     /// <summary>세션 목록과 같은 직렬 문맥에 일을 넣을 수 있는 수명 핸들이다.</summary>
     /// <remarks>
-    /// 이 값은 Post와 정지 상태 조회만 제공한다. Host가 스레드와 종료 순서를 소유하므로 게임
-    /// 백엔드는 이 실행자를 멈추거나 직접 돌릴 수 없다. PeriodicRunner에는 이 Lease를 그대로
+    /// 이 값은 Post·Reserve와 정지 상태 조회만 제공하고, Host 내부 작업용 control lane에는 넣을 수
+    /// 없다. Host가 스레드와 종료 순서를 소유하므로 게임 백엔드는 이 실행자를 멈추거나 직접 돌릴 수 없다. PeriodicRunner에는 이 Lease를 그대로
     /// 넘긴다.
     /// </remarks>
     [[nodiscard]] SERVERCORE_API JobRunner::Lease GetJobRunner() const noexcept;
 
     /// <summary>세션이 열리고 닫히는 것을 받을 관찰자를 건다. 약한 참조로 잡는다.</summary>
-    SERVERCORE_API void SetSessionObserver(std::weak_ptr<Session::ISessionObserver> observer);
+    /// <returns>Start를 부른 뒤에는 바꾸지 않고 Closed다(Runtime.HostRejectsLateSetupUniformly).</returns>
+    [[nodiscard]] SERVERCORE_API Core::Status SetSessionObserver(
+        std::weak_ptr<Session::ISessionObserver> observer);
 
     /// <summary>부팅 순서대로 서버를 세운다. 성공으로 돌아오면 포트가 열려 있다.</summary>
     /// <remarks>
@@ -307,13 +353,23 @@ public:
     /// Stops new admission, drains admitted work then locally queued sends, aborting remaining
     /// connections at deadline. Stop remains immediate and may interrupt this drain. Deadline
     /// bounds the drain phase, not joining non-cooperative application callbacks. External thread only.
+    /// 새 연결과 새 입력은 즉시 막지만, GetJobRunner()의 Post·Reserve는 받은 입력과 그 후속 작업이
+    /// 모두 끝나 송신 drain이 시작될 때까지 계속 받는다(Runtime.HostDrainAcceptsGameContinuations).
     [[nodiscard]] SERVERCORE_API Core::Status BeginDrain();
     /// Ok when drained/stopped; WouldBlock while admitted work or sends remain; Closed before Start.
     [[nodiscard]] SERVERCORE_API Core::Status DrainStatus() const;
-    [[nodiscard]] SERVERCORE_API Core::Status StopGracefully(std::chrono::steady_clock::time_point deadline);
+    /// BeginDrain 뒤 모든 세션이 닫히기를 기다린 다음 Stop한다. drain된 세션은 상대가 닫거나
+    /// gracefulCloseTimeout이 지나야 닫힌다. 그래서 EOF를 읽고도 닫지 않는 상대가 있으면 그 둘 중
+    /// 먼저 오는 것이나 deadline까지 기다리고, deadline이 먼저 오면 Timeout을 돌려준다
+    /// (Runtime.HostGracefulDrain은 상대가 닫는 경우를 본다).
+    [[nodiscard]] SERVERCORE_API Core::Status StopGracefully(
+        std::chrono::steady_clock::time_point deadline);
 
     /// <summary>종료가 요청될 때까지 이 스레드를 붙잡아 둔다.</summary>
-    /// <returns>프로세스 종료 코드로 쓸 값. 정상 종료면 0.</returns>
+    /// <returns>
+    /// 프로세스 종료 코드로 쓸 값. 정상 종료면 0이며, Start가 성공했다면 Run보다 Stop이 먼저 끝났어도
+    /// 0이다. Start 전이나 실패한 Start 뒤에는 1이다(Runtime.HostObservationAndLogBoundaries).
+    /// </returns>
     SERVERCORE_API int Run();
 
     /// <summary>지금 포트를 열고 수락 중인지 답한다.</summary>
@@ -327,7 +383,9 @@ public:
     /// SessionRegistry와 같은 JobRunner 문맥에서만 읽는다. 따라서 처리기나 GetJobRunner()으로
     /// 넣은 작업 안에서 부른다. 관리 스레드가 필요하면 별도 지표 실행자를 만들지 말고 기존
     /// JobRunner에 한 번의 요청을 넣어 결과를 가져간다. 벡터 스냅숏 할당이 실패하면
-    /// PlatformError를 돌려준다.
+    /// PlatformError를 돌려준다. 호출한 작업 자신은 jobs.outstandingJobs에 세지 않는다.
+    /// Stop이 끝난 Host는 어느 스레드에서나 읽을 수 있으며 그때 세션 목록은 비어 있다
+    /// (Runtime.HostObservationAndLogBoundaries).
     /// </remarks>
     [[nodiscard]] SERVERCORE_API Core::Result<ServerMetricsSnapshot> SnapshotMetrics() const;
 

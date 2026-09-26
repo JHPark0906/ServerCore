@@ -1,5 +1,6 @@
 #include "TestHarness.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <set>
@@ -22,6 +23,36 @@ std::map<std::string, CheckFunction>& Registry()
 }
 
 int gFailureCount = 0;
+bool gSkipped = false;
+
+/// <summary>환경 변수가 비어 있지 않고 "0"도 아니면 참이다.</summary>
+bool EnvironmentFlag(const char* name)
+{
+#ifdef _MSC_VER
+    char* value = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&value, &length, name) != 0 || value == nullptr)
+        return false;
+    const bool set = value[0] != '\0' && std::string_view(value) != "0";
+    std::free(value);
+    return set;
+#else
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::string_view(value) != "0";
+#endif
+}
+}
+
+void Skip(std::string_view reason, const char* requiredBy)
+{
+    if (requiredBy != nullptr && EnvironmentFlag(requiredBy))
+    {
+        std::cerr << "[FAIL] " << reason << " while " << requiredBy << " requires it\n";
+        ++gFailureCount;
+        return;
+    }
+    std::cerr << "[SKIP] " << reason << "\n";
+    gSkipped = true;
 }
 
 CheckRegistration::CheckRegistration(std::string_view name, CheckFunction function)
@@ -112,7 +143,7 @@ int RunOne(const std::string& name)
         return 1;
     }
 
-    return 0;
+    return gSkipped ? SkipExitCode : 0;
 }
 }
 }

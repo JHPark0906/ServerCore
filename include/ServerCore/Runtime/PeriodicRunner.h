@@ -56,7 +56,10 @@ public:
     PeriodicRunner& operator=(const PeriodicRunner&) = delete;
 
     /// <summary>타이머 스레드를 시작한다.</summary>
-    /// <returns>0 이하 주기나 빈 콜백은 InvalidArgument, 중복 시작은 AlreadyExists다.</returns>
+    /// <returns>
+    /// 0 이하이거나 24시간을 넘는 주기, 빈 콜백은 InvalidArgument, 중복 시작은 AlreadyExists다
+    /// (Runtime.PeriodicRunnerRejectsUnboundedPeriod).
+    /// </returns>
     SERVERCORE_API Core::Status Start();
 
     /// <summary>새 주기 예약을 멈추고 타이머 스레드의 join이 끝날 때까지 기다린다. 스레드 안전하다.</summary>
@@ -78,7 +81,8 @@ public:
     [[nodiscard]] SERVERCORE_API bool IsRunning() const noexcept;
 
 private:
-    SERVERCORE_API static void RecordSkippedPeriods(const JobRunner::Lease& runner, std::uint64_t count) noexcept;
+    SERVERCORE_API static void RecordSkippedPeriods(
+        const JobRunner::Lease& runner, std::uint64_t count) noexcept;
 
     class State;
     std::shared_ptr<State> mState;

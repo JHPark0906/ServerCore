@@ -21,6 +21,25 @@ fn server(options: &web::WebSocketOptions, route: &web::WebSocketRouteOptions) -
     server.start().unwrap();
     server
 }
+#[test]
+fn per_socket_event_budget_reaches_native_options() {
+    // Defaults are read back from sc_web_options_init (Web.h: 64, 1 MiB).
+    let defaults = web::Options::default();
+    assert_eq!(defaults.max_ws_connection_event_count, 64);
+    assert_eq!(defaults.max_ws_connection_event_bytes, 1024 * 1024);
+    for invalid in [
+        web::Options { max_ws_connection_event_count: 0, ..Default::default() },
+        web::Options { max_ws_connection_event_count: 65537, ..Default::default() },
+        web::Options { max_ws_connection_event_bytes: 0, ..Default::default() },
+    ] {
+        assert!(matches!(web::HttpServer::new(&invalid), Err(Error::INVALID_ARGUMENT)));
+    }
+    let limits = web::Options {
+        max_ws_connection_event_count: 65536,
+        ..Default::default()
+    };
+    assert!(web::HttpServer::new(&limits).is_ok());
+}
 fn connect(server: &web::HttpServer) -> TcpStream {
     let mut peer = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -166,12 +185,28 @@ fn heartbeat_requires_matching_pong_and_stops_after_close() {
     server.stop().unwrap();
 }
 
+/// Explicitly skips a test when IPv6 loopback is unavailable. The notice is
+/// written to stderr directly so the test harness does not capture it, and
+/// SERVERCORE_REQUIRE_IPV6 (set by CI) turns the skip into a failure.
+fn ipv6_loopback_or_skip(test: &str) -> bool {
+    if std::net::UdpSocket::bind("[::1]:0").is_ok() {
+        return true;
+    }
+    if std::env::var_os("SERVERCORE_REQUIRE_IPV6").is_some_and(|v| !v.is_empty() && v != "0") {
+        panic!("{test}: IPv6 loopback ::1 is unavailable while SERVERCORE_REQUIRE_IPV6 requires it");
+    }
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        format!("SKIPPED {test}: IPv6 loopback ::1 is unavailable\n").as_bytes(),
+    );
+    false
+}
+
 #[test]
 fn http_ipv6_and_explicit_dual_stack_preserve_transport_endpoints() {
-    let Ok(probe) = TcpListener::bind("[::1]:0") else {
+    if !ipv6_loopback_or_skip("http_ipv6_and_explicit_dual_stack_preserve_transport_endpoints") {
         return;
-    };
-    drop(probe);
+    }
     for dual_stack in [false, true] {
         let port = TcpListener::bind("[::1]:0")
             .unwrap()

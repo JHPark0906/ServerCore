@@ -5,7 +5,60 @@ on:
   pull_request:
   workflow_dispatch:
 
+# The jobs only read the repository. A read-only token limits what a compromised
+# step or action could do with it.
+permissions:
+  contents: read
+
+env:
+  # GitHub-hosted runners have IPv6 loopback. IPv6 checks skip explicitly where it
+  # is missing; this makes a missing ::1 a failure here instead of silently lost
+  # coverage (tests/TestHarness.h ServerCoreTest::Skip, Rust ipv6_loopback_or_skip).
+  SERVERCORE_REQUIRE_IPV6: "1"
+
+# Actions stay on major-version tags: the only action is GitHub's own
+# actions/checkout, the token above is read-only, and checkout does not persist
+# it. Pin to commit SHAs if a third-party action is ever added.
 jobs:
+  format:
+    name: clang-format 19.1.5
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # The exact version bundled with Visual Studio 2022 (VC/Tools/Llvm), which
+      # is the toolchain scripts/VerifyBuild.ps1 builds with and the one that
+      # formatted the tree. Patch releases can change clang-format output, so
+      # the pin is exact rather than whichever 19.x Ubuntu's clang-format-19
+      # package carries. Update it together with a reformat when the local
+      # toolchain moves.
+      CLANG_FORMAT_VERSION: "19.1.5"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # A tool for this check only; nothing is linked into the product.
+      # Binary wheels only, so pip never tries to build LLVM from source.
+      - name: Install the pinned clang-format
+        run: |
+          python3 -m venv "$RUNNER_TEMP/clang-format"
+          "$RUNNER_TEMP/clang-format/bin/python" -m pip install --disable-pip-version-check \
+            --only-binary=:all: "clang-format==$CLANG_FORMAT_VERSION"
+      # Fails on a wrong tool version and on an empty file list, so a green run
+      # means the pinned tool actually checked files rather than nothing.
+      - name: Check formatting of C and C++ sources
+        shell: bash
+        run: |
+          clang_format="$RUNNER_TEMP/clang-format/bin/clang-format"
+          "$clang_format" --version | grep -F "clang-format version $CLANG_FORMAT_VERSION"
+          mapfile -t files < <(git ls-files -- src include tests \
+            | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx|inl|ipp)$')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No C or C++ files found under src, include or tests."
+            exit 1
+          fi
+          echo "Checking ${#files[@]} files."
+          "$clang_format" --dry-run --Werror "${files[@]}"
+
   regression:
     name: ${{ matrix.os }} ${{ matrix.configuration }} native-${{ matrix.linkage }}
     strategy:
@@ -24,6 +77,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Configure C++23 and required standard library capabilities
         run: >-
           cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
@@ -43,15 +98,36 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # --no-fail-fast: a failing unit test binary must not stop the integration
+      # test binaries from running and reporting.
       - name: Build native component through Cargo and test wrappers
         working-directory: rust
-        run: cargo test --workspace --all-targets --locked --offline
+        run: cargo test --workspace --all-targets --locked --offline --no-fail-fast
+
+  rust-msrv:
+    name: Rust MSRV 1.82
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Matches rust-version in rust/Cargo.toml. rustup is preinstalled on the runner.
+      - name: Install the minimum supported Rust toolchain
+        run: rustup toolchain install 1.82 --profile minimal
+      - name: Build native component through Cargo and test wrappers with Rust 1.82
+        working-directory: rust
+        run: cargo +1.82 test --workspace --all-targets --locked --offline --no-fail-fast
 
   sanitizers:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # Ubuntu's GCC/libstdc++ pair provides both required C++23 library types.
       # Clang 18 with libstdc++ 13 hides expected behind its concepts feature guard.
       - name: Configure GCC with ASan and UBSan
@@ -69,3 +145,32 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build/sanitizers --output-on-failure --no-tests=error --parallel 4 -E CMake
+
+  thread-sanitizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Same GCC/libstdc++ pair as the ASan job. RelWithDebInfo keeps the
+      # instrumented timing close to the bounded waits in the tests while
+      # keeping symbolized stacks.
+      - name: Configure GCC with TSan
+        run: >-
+          cmake -S . -B build/tsan -G Ninja
+          -DCMAKE_CXX_COMPILER=g++ -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+          -DSERVERCORE_BUILD_SHARED=OFF
+          -DSERVERCORE_BUILD_C_API=ON
+      - name: Build
+        run: cmake --build build/tsan --parallel 4
+      # GCC 13's libtsan cannot map its shadow memory when the kernel uses the
+      # 32-bit mmap randomization of current runner images.
+      - name: Reduce address-space randomization for TSan
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Test
+        env:
+          TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 suppressions=${{ github.workspace }}/tests/tsan-suppressions.txt
+        run: ctest --test-dir build/tsan --output-on-failure --no-tests=error --parallel 4 -E CMake

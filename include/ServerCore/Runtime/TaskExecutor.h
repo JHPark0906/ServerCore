@@ -1,8 +1,8 @@
 #pragma once
 #include "ServerCore/Export.h"
 
-#include "ServerCore/Core/Error.h"
 #include "ServerCore/Core/CompletionSubscription.h"
+#include "ServerCore/Core/Error.h"
 #include "ServerCore/Observability/Metrics.h"
 
 #include <chrono>
@@ -60,7 +60,8 @@ public:
     // Unfinished waits from this executor's threads or cancellation callbacks
     // return InvalidArgument.
     [[nodiscard]] SERVERCORE_API Core::Status Wait() const;
-    [[nodiscard]] SERVERCORE_API Core::Status WaitUntil(std::chrono::steady_clock::time_point deadline) const;
+    [[nodiscard]] SERVERCORE_API Core::Status WaitUntil(
+        std::chrono::steady_clock::time_point deadline) const;
     // At most 16 pending observers per task; terminal calls may complete inline.
     // Fires after work/completion captures retire and the handle is terminal.
     SERVERCORE_API Core::Result<Core::CompletionSubscription> WaitForCompletion(
@@ -107,13 +108,14 @@ public:
     // Rejection never retains the function or consumes count/byte capacity.
     SERVERCORE_API Core::Result<TaskHandle> Submit(Task task, const TaskOptions& options = {});
     // Keep legacy std::function inputs, including empty-input validation.
-    template<class Callback>
+    template <class Callback>
         requires std::same_as<std::remove_cvref_t<Callback>,
             std::function<Core::Status(std::stop_token)>>
     Core::Result<TaskHandle> Submit(Callback&& task, const TaskOptions& options = {})
     {
-        return Submit(NormalizeCallback<Core::Status(std::stop_token)>(
-            std::forward<Callback>(task)), options);
+        return Submit(
+            NormalizeCallback<Core::Status(std::stop_token)>(std::forward<Callback>(task)),
+            options);
     }
     // Runs once for every accepted task, including queued cancellation, on an
     // executor worker/coordinator after the task releases its captures. It must
@@ -122,13 +124,12 @@ public:
     // A rejected submission never invokes completion.
     SERVERCORE_API Core::Result<TaskHandle> SubmitWithCompletion(
         Task task, Completion completion, const TaskOptions& options = {});
-    template<class Work = Task, class Done = Completion>
-        requires (std::same_as<std::remove_cvref_t<Work>,
-                      std::function<Core::Status(std::stop_token)>> ||
-                     std::same_as<std::remove_cvref_t<Done>,
-                         std::function<void(const Core::Status&)>>) &&
-                 std::constructible_from<Task, Work> &&
-                 std::constructible_from<Completion, Done>
+    template <class Work = Task, class Done = Completion>
+        requires(std::same_as<std::remove_cvref_t<Work>,
+                     std::function<Core::Status(std::stop_token)>> ||
+                    std::same_as<std::remove_cvref_t<Done>,
+                        std::function<void(const Core::Status&)>>) &&
+                std::constructible_from<Task, Work> && std::constructible_from<Completion, Done>
     Core::Result<TaskHandle> SubmitWithCompletion(
         Work&& task, Done&& completion, const TaskOptions& options = {})
     {
@@ -144,10 +145,11 @@ public:
     [[nodiscard]] SERVERCORE_API std::size_t PendingCount() const noexcept;
     [[nodiscard]] SERVERCORE_API std::size_t RunningCount() const noexcept;
     [[nodiscard]] SERVERCORE_API std::size_t RetainedBytes() const noexcept;
-    [[nodiscard]] SERVERCORE_API Observability::TaskExecutorMetricsSnapshot GetMetrics() const noexcept;
+    [[nodiscard]] SERVERCORE_API Observability::TaskExecutorMetricsSnapshot GetMetrics()
+        const noexcept;
 
 private:
-    template<class Signature, class Callback>
+    template <class Signature, class Callback>
     static std::move_only_function<Signature> NormalizeCallback(Callback&& callback)
     {
         if constexpr (std::same_as<std::remove_cvref_t<Callback>, std::function<Signature>>)

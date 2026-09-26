@@ -19,10 +19,15 @@ struct MultipartOptions
     std::uint64_t maxPartBytes = 1024 * 1024; // Parts without filename.
     std::uint64_t maxFileBytes = 64 * 1024 * 1024;
     std::uint64_t maxTotalBytes = 128 * 1024 * 1024; // Entire encoded input.
-    std::size_t maxRetainedBytes = 256 * 1024; // Input + outstanding event payload.
+    std::size_t maxRetainedBytes = 256 * 1024;       // Input + outstanding event payload.
     std::size_t maxEventBytes = 32 * 1024;
 };
-enum class MultipartEventKind { PartBegin, Data, PartEnd };
+enum class MultipartEventKind
+{
+    PartBegin,
+    Data,
+    PartEnd
+};
 struct MultipartEvent
 {
     MultipartEventKind kind = MultipartEventKind::PartBegin;
@@ -32,7 +37,7 @@ struct MultipartEvent
     std::string name;
     std::optional<std::string> filename{};
     std::string contentType;
-    FormFields headers; // Lowercase names, owned values.
+    FormFields headers;          // Lowercase names, owned values.
     std::vector<std::byte> data; // Data events only; opaque, possibly non-UTF8.
 };
 // Serialized feed/pull parser, no worker or foreign callbacks. Concurrent calls
@@ -64,6 +69,7 @@ public:
     SERVERCORE_API Core::Status Finish() noexcept;
     SERVERCORE_API void Cancel() noexcept;
     [[nodiscard]] SERVERCORE_API std::size_t RetainedBytes() const noexcept;
+
 private:
     class State;
     SERVERCORE_API explicit MultipartParser(std::unique_ptr<State> state) noexcept;

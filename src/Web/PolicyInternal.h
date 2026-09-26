@@ -61,8 +61,7 @@ inline bool Authority(std::string_view text) noexcept
     if (text.empty() || text.size() > 255)
         return false;
     for (unsigned char c : text)
-        if (c <= 32 || c >= 127 ||
-            std::string_view("/@\\?#,;\"").find(static_cast<char>(c)) != std::string_view::npos)
+        if (c <= 32 || c >= 127 || std::string_view("/@\\?#,;\"").contains(static_cast<char>(c)))
             return false;
     std::string_view host = text;
     if (text.front() == '[')

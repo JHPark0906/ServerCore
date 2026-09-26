@@ -87,7 +87,10 @@ public:
 
     /// <param name="operation">완료된 요청. 이 호출 안에서 다시 걸어도 된다.</param>
     /// <param name="bytesTransferred">실제로 옮겨진 바이트 수.</param>
-    /// <param name="errorCode">0이면 성공. 아니면 WSAGetLastError()나 GetLastError()의 값.</param>
+    /// <param name="errorCode">
+    /// 0이면 성공. 아니면 GetQueuedCompletionStatus가 실패한 뒤의 GetLastError() 값이다. WSA 번호가
+    /// 아니다. 예를 들어 상대의 재설정은 WSAECONNRESET(10054)이 아니라 ERROR_NETNAME_DELETED(64)로 온다.
+    /// </param>
     virtual void OnIoCompleted(
         IoOperation& operation, DWORD bytesTransferred, unsigned long errorCode) = 0;
 

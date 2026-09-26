@@ -33,7 +33,8 @@ using RoutePath = std::vector<std::string>;
 [[nodiscard]] bool SameRouteShape(const RoutePattern& left, const RoutePattern& right) noexcept;
 // Compare patterns already known to match the same path. A static segment wins
 // at the first static/parameter difference; indistinguishable precedence ties.
-[[nodiscard]] bool MoreSpecificRoutePattern(const RoutePattern& left, const RoutePattern& right) noexcept;
+[[nodiscard]] bool MoreSpecificRoutePattern(
+    const RoutePattern& left, const RoutePattern& right) noexcept;
 
 // Requires MatchesRoutePattern(pattern, path). Replaces output on success;
 // allocation failures leave its previous contents intact.

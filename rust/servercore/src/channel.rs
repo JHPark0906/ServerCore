@@ -172,7 +172,7 @@ impl Drop for LatestBytes {
 mod tests {
     use super::*;
     use crate::{block_on, Error};
-    use std::{future::Future, sync::{Arc, Condvar, Mutex}, task::{Context, Wake, Waker}, time::Duration};
+    use std::{future::Future, sync::{Arc, Condvar, Mutex}, task::{Context, Poll, Wake, Waker}, time::Duration};
 
     #[derive(Default)]
     struct Wakes { count: Mutex<usize>, changed: Condvar }
@@ -272,5 +272,23 @@ mod tests {
         drop(latest);
         drop(clone);
         assert_eq!(newer.bytes(), b"second");
+    }
+    #[test]
+    fn latest_observer_cap_is_not_reported_as_would_block() {
+        let latest = LatestBytes::new(8).unwrap();
+        let waker = Waker::from(Arc::new(Wakes::default()));
+        let mut cx = Context::from_waker(&waker);
+        // Channel.h caps pending change subscriptions at 64 per state.
+        let mut observers = Vec::new();
+        for _ in 0..64 {
+            let mut observer = Box::pin(latest.wait_after(0));
+            assert!(observer.as_mut().poll(&mut cx).is_pending());
+            observers.push(observer);
+        }
+        let mut refused = Box::pin(latest.wait_after(0));
+        match refused.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => assert_eq!(result.err(), Some(Error::TOO_LARGE)),
+            Poll::Pending => panic!("observer beyond the native cap is pending"),
+        }
     }
 }

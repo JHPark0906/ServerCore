@@ -2,7 +2,7 @@
 
 // This file explicitly verifies the deprecated application's compatibility API.
 #if defined(_MSC_VER)
-#pragma warning(disable: 4996)
+#pragma warning(disable : 4996)
 #elif defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
@@ -113,6 +113,40 @@ void InstallingAgainReplacesTheLogger()
         std::size_t{ 1 }, second->Count(), "the logger installed last receives the write");
 }
 
+/// <summary>파괴되는 순간 전역 조회가 무엇을 돌려주는지 적어 두는 시험용 로거다.</summary>
+class DestructionProbeLogger final : public ServerCore::Core::ILogger
+{
+public:
+    explicit DestructionProbeLogger(ServerCore::Core::ILogger** observed)
+        : mObserved(observed)
+    {
+    }
+
+    ~DestructionProbeLogger() override { *mObserved = &ServerCore::Core::GetGlobalLogger(); }
+
+    void Write(ServerCore::Core::LogLevel, std::string_view) noexcept override {}
+
+private:
+    ServerCore::Core::ILogger** mObserved;
+};
+
+void ReplacingPublishesTheNewLoggerBeforeDestroyingTheOld()
+{
+    ServerCore::Core::ILogger* observedDuringDestruction = nullptr;
+    auto first = std::make_shared<DestructionProbeLogger>(&observedDuringDestruction);
+    const ServerCore::Core::ILogger* const firstAddress = first.get();
+    ServerCore::Core::SetGlobalLogger(std::move(first));
+
+    // 전역 자리가 첫 로거의 유일한 소유자이므로, 교체가 그 로거를 파괴한다.
+    const auto second = std::make_shared<RecordingLogger>();
+    ServerCore::Core::SetGlobalLogger(second);
+
+    ServerCoreTest::ExpectTrue(observedDuringDestruction != firstAddress,
+        "a lookup while the replaced logger is destroyed does not return that logger");
+    ServerCoreTest::ExpectTrue(observedDuringDestruction == second.get(),
+        "a lookup while the replaced logger is destroyed returns the new logger");
+}
+
 const ServerCoreTest::CheckRegistration gLoggerIsUsableBeforeInstall{
     "Logging.LoggerIsUsableBeforeInstall", LoggerIsUsableBeforeInstall
 };
@@ -121,5 +155,9 @@ const ServerCoreTest::CheckRegistration gInstalledLoggerReceivesLevelAndMessage{
 };
 const ServerCoreTest::CheckRegistration gInstallingAgainReplacesTheLogger{
     "Logging.InstallingAgainReplacesTheLogger", InstallingAgainReplacesTheLogger
+};
+const ServerCoreTest::CheckRegistration gReplacingPublishesTheNewLoggerBeforeDestroyingTheOld{
+    "Logging.ReplacingPublishesTheNewLoggerBeforeDestroyingTheOld",
+    ReplacingPublishesTheNewLoggerBeforeDestroyingTheOld
 };
 }

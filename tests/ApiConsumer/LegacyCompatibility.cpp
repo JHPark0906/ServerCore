@@ -13,9 +13,8 @@ int main()
     using ServerCore::Core::ErrorCode;
 
     ServerCore::Web::HttpServer http;
-    const auto handler = [](const ServerCore::Web::HttpRequest&) {
-        return ServerCore::Web::HttpResponse{200, {}, "ok"};
-    };
+    const auto handler = [](const ServerCore::Web::HttpRequest&)
+    { return ServerCore::Web::HttpResponse{ 200, {}, "ok" }; };
     if (!http.Route("GET", "/legacy", handler).IsOk() ||
         http.RegisterRoute("GET", "/legacy", handler).Code() != ErrorCode::AlreadyExists ||
         !http.RegisterRoute("GET", "/canonical", handler).IsOk() ||
@@ -35,7 +34,8 @@ int main()
     if (datagrams.Send(id, {}).Code() != ErrorCode::Closed ||
         datagrams.SendSerialized(id, {}).Code() != ErrorCode::Closed)
         return 1;
-    if (!datagrams.Bind("127.0.0.1", 0).IsOk()) return 1;
+    if (!datagrams.Bind("127.0.0.1", 0).IsOk())
+        return 1;
     const auto registered = datagrams.RegisterSession(id);
     if (!registered.IsOk() || datagrams.Send(id, {}).Code() != ErrorCode::WouldBlock ||
         datagrams.SendSerialized(id, {}).Code() != ErrorCode::WouldBlock)
@@ -43,9 +43,10 @@ int main()
 
     ServerCore::Runtime::JobRunner runner;
     unsigned int completed = 0;
-    if (!runner.Post([&completed] { ++completed; }).IsOk()) return 1;
+    if (!runner.Post([&completed] { ++completed; }).IsOk())
+        return 1;
     runner.Stop();
-    if (!runner.IsStopRequested() || runner.PendingCount() != std::size_t{1} ||
+    if (!runner.IsStopRequested() || runner.PendingCount() != std::size_t{ 1 } ||
         runner.Post([] {}).Code() != ErrorCode::Closed)
         return 1;
     // Stop is a request. The accepted job still drains on the owning context.

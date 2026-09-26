@@ -12,7 +12,11 @@
 namespace ServerCore::Protocol
 {
 /// Explicit endpoint protocol selection; there is no content sniffing or automatic downgrade.
-enum class PayloadMode { Json, Binary };
+enum class PayloadMode
+{
+    Json,
+    Binary
+};
 
 /// Binary envelope: four little-endian type bytes followed by uninterpreted application bytes.
 /// Type zero is reserved. Views remain valid only while their source storage remains alive.

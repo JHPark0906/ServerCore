@@ -1,13 +1,18 @@
 #include "TestHarness.h"
 
 #include "ServerCore/Core/Error.h"
+#include "ServerCore/Core/Logging.h"
 #include "ServerCore/Net/Acceptor.h"
 #include "ServerCore/Net/Connection.h"
+#include "ServerCore/Net/ConnectionFlowControl.h"
 #include "ServerCore/Net/IoContext.h"
 
 #include "Net/AcceptorInternal.h"
 #include "Net/ConnectionInternal.h"
 #include "Net/SendQueueInternal.h"
+#ifdef _WIN32
+#include "Net/IoContextInternal.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -21,10 +26,16 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include "SocketTestSupport.h"
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/resource.h>
+#endif
 
 /// <summary>
 /// 전송 층이 실제로 포트를 열고 바이트를 주고받는지 고정하는 검사들이다.
@@ -42,22 +53,16 @@
 /// 수와 바이트 수가 0보다 크다는 것을 직접 확인하고, 큰 payload 검사는 수신 호출이 두 번
 /// 이상 일어났다는 것까지 확인한다.
 ///
-/// 포트는 검사 전용 블록에서만 쓴다. 검사마다 다른 포트를 쓰고 구성마다도 다르게 둔다. 값은
-/// CMake가 SERVERCORE_TEST_PORT_BASE로 준다.
+/// 포트는 검사마다 운영체제에게 빈 번호를 받아 쓴다(ServerCoreTest::FreeLoopbackTcpPort). 고정 번호를
+/// 쓰지 않으므로 여러 빌드 트리가 동시에 시험을 돌려도 서로 부딪히지 않는다.
 ///
 /// 계약 위반 경로는 여기 없다. 잘못된 endpoint는 Status로 오므로 검사할 수 있지만, 처리기
 /// 없이 Start()하거나 SetObserver()를 두 번 부르는 것은 단언이 프로세스를 끊으므로 시험
 /// 대상이 아니다.
 /// </remarks>
 
-#ifndef SERVERCORE_TEST_PORT_BASE
-#error "SERVERCORE_TEST_PORT_BASE must be defined by the build"
-#endif
-
 namespace
 {
-constexpr std::uint16_t PortBase = static_cast<std::uint16_t>(SERVERCORE_TEST_PORT_BASE);
-
 /// <summary>기다림의 기본 제한이다. 정상 경로는 이보다 훨씬 빨리 끝난다.</summary>
 constexpr std::chrono::milliseconds WaitLimit{ 10000 };
 
@@ -120,6 +125,7 @@ public:
             const std::lock_guard<std::mutex> guard(mMutex);
             ++mDisconnectCallCount;
             mLastDisconnectCode = reason.Code();
+            mLastDisconnectMessage = reason.Message();
         }
 
         mChanged.notify_all();
@@ -161,6 +167,12 @@ public:
         return mLastDisconnectCode;
     }
 
+    [[nodiscard]] std::string LastDisconnectMessage() const
+    {
+        const std::lock_guard<std::mutex> guard(mMutex);
+        return mLastDisconnectMessage;
+    }
+
     [[nodiscard]] std::size_t EchoFailureCount() const
     {
         const std::lock_guard<std::mutex> guard(mMutex);
@@ -191,6 +203,7 @@ private:
     std::size_t mEchoFailureCount = 0;
     std::string mLastEchoFailure;
     ServerCore::Core::ErrorCode mLastDisconnectCode = ServerCore::Core::ErrorCode::Ok;
+    std::string mLastDisconnectMessage;
 
     bool mEcho = false;
     std::weak_ptr<ServerCore::Net::Connection> mConnection;
@@ -423,8 +436,9 @@ public:
         std::size_t offset = 0;
         while (offset < bytes.size())
         {
-            const int chunk = ServerCoreTest::Send(mSocket, reinterpret_cast<const char*>(bytes.data() + offset),
-                static_cast<int>(bytes.size() - offset), 0);
+            const int chunk =
+                ServerCoreTest::Send(mSocket, reinterpret_cast<const char*>(bytes.data() + offset),
+                    static_cast<int>(bytes.size() - offset), 0);
             if (chunk <= 0)
             {
                 return false;
@@ -684,6 +698,53 @@ private:
     return true;
 }
 
+/// <summary>수락기가 남기는 진단 줄을 모아 두는 로거다.</summary>
+/// <remarks>
+/// 자원 고갈처럼 밖에서 직접 볼 수 없는 경로가 실제로 돌았는지를 이 기록으로 확인한다.
+/// 스레드 안전성: 스레드 안전. 쓰기는 I/O 스레드에서, 확인은 검사 스레드에서 온다.
+/// </remarks>
+class RecordingLogger final : public ServerCore::Core::ILogger
+{
+public:
+    void Write(ServerCore::Core::LogLevel, std::string_view message) noexcept override
+    {
+        try
+        {
+            const std::lock_guard<std::mutex> guard(mMutex);
+            mLines.emplace_back(message);
+        }
+        catch (...)
+        {
+            return;
+        }
+        mChanged.notify_all();
+    }
+
+    [[nodiscard]] std::size_t CountContaining(const std::string_view text) const
+    {
+        const std::lock_guard<std::mutex> guard(mMutex);
+        return static_cast<std::size_t>(std::count_if(mLines.begin(), mLines.end(),
+            [text](const std::string& line) { return line.find(text) != std::string::npos; }));
+    }
+
+    [[nodiscard]] bool WaitForLineContaining(
+        const std::string_view text, const std::chrono::milliseconds limit)
+    {
+        std::unique_lock<std::mutex> guard(mMutex);
+        return mChanged.wait_for(guard, limit,
+            [this, text]
+            {
+                return std::any_of(mLines.begin(), mLines.end(), [text](const std::string& line)
+                    { return line.find(text) != std::string::npos; });
+            });
+    }
+
+private:
+    mutable std::mutex mMutex;
+    std::condition_variable mChanged;
+    std::vector<std::string> mLines;
+};
+
 // ---------------------------------------------------------------------------
 // 검사
 // ---------------------------------------------------------------------------
@@ -764,7 +825,8 @@ void IoContextStartsAndStops()
 void ListenRejectsInvalidEndpoint()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
     ServerCore::Net::Acceptor acceptor;
 
@@ -772,18 +834,19 @@ void ListenRejectsInvalidEndpoint()
     ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::InvalidArgument),
         static_cast<int>(zeroPort.Code()), "the error code for an unconfigured port");
 
-    const ServerCore::Core::Status emptyAddress = acceptor.Listen("", PortBase, 8);
+    const ServerCore::Core::Status emptyAddress =
+        acceptor.Listen("", ServerCoreTest::FreeLoopbackTcpPort(), 8);
     ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::InvalidArgument),
         static_cast<int>(emptyAddress.Code()), "the error code for an empty listen address");
 
     const ServerCore::Core::Status malformedAddress =
-        acceptor.Listen("not-an-ipv4-address", PortBase, 8);
+        acceptor.Listen("not-an-ipv4-address", ServerCoreTest::FreeLoopbackTcpPort(), 8);
     ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::InvalidArgument),
         static_cast<int>(malformedAddress.Code()), "the error code for a malformed listen address");
 
     // 거절이 전부를 거절하는 것이 아니라는 것을 같은 자리에서 고정한다. 이것이 없으면
     // Listen이 늘 실패하도록 망가져도 위의 두 단언은 통과한다.
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 0);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     const ServerCore::Core::Status loopback = acceptor.Listen("127.0.0.1", port, 8);
     ServerCoreTest::ExpectTrue(loopback.IsOk(),
         loopback.IsOk()
@@ -807,45 +870,62 @@ void SendQueueRetainsPartiallySentStorage()
     const auto oneByte = MakeFilledBytes(1, 0x42);
     const auto queued = queue.Enqueue(payload);
     ServerCoreTest::ExpectTrue(queued.IsOk(), "the portable queue accepts a full-limit payload");
-    if (!queued.IsOk()) return;
+    if (!queued.IsOk())
+        return;
 
     const auto borrowed = queue.Front();
     queue.Consume(payload.size() - 1);
-    ServerCoreTest::ExpectEqual(std::size_t{1}, queue.QueuedBytes(), "only the unsent suffix is logically queued");
-    ServerCoreTest::ExpectEqual(payload.size(), queue.RetainedBytes(), "a sent prefix remains allocated with its suffix");
-    ServerCoreTest::ExpectEqual(payload.size(), budget->UsedBytes(), "partial completion cannot refund retained storage");
+    ServerCoreTest::ExpectEqual(
+        std::size_t{ 1 }, queue.QueuedBytes(), "only the unsent suffix is logically queued");
+    ServerCoreTest::ExpectEqual(
+        payload.size(), queue.RetainedBytes(), "a sent prefix remains allocated with its suffix");
+    ServerCoreTest::ExpectEqual(
+        payload.size(), budget->UsedBytes(), "partial completion cannot refund retained storage");
     ServerCoreTest::ExpectTrue(queue.Front().data() == borrowed.data() + payload.size() - 1,
         "partial completion keeps the original payload storage alive");
     ServerCoreTest::ExpectEqual(static_cast<int>(ErrorCode::WouldBlock),
-        static_cast<int>(queue.Enqueue(oneByte).Code()), "retained prefixes count against the connection limit");
-    ServerCoreTest::ExpectEqual(std::size_t{1}, queue.QueuedBytes(), "overflow is rejected without adding bytes");
+        static_cast<int>(queue.Enqueue(oneByte).Code()),
+        "retained prefixes count against the connection limit");
+    ServerCoreTest::ExpectEqual(
+        std::size_t{ 1 }, queue.QueuedBytes(), "overflow is rejected without adding bytes");
 
     queue.Consume(1);
     ServerCoreTest::ExpectTrue(queue.Empty(), "the completed vector leaves the queue");
-    ServerCoreTest::ExpectEqual(std::size_t{0}, budget->UsedBytes(), "fully released storage refunds its reservation");
+    ServerCoreTest::ExpectEqual(
+        std::size_t{ 0 }, budget->UsedBytes(), "fully released storage refunds its reservation");
     const auto retried = queue.Enqueue(oneByte);
-    ServerCoreTest::ExpectTrue(retried.IsOk(), "a send can retry after retained storage is released");
-    if (!retried.IsOk()) return;
+    ServerCoreTest::ExpectTrue(
+        retried.IsOk(), "a send can retry after retained storage is released");
+    if (!retried.IsOk())
+        return;
     const auto front = queue.Front();
-    ServerCoreTest::ExpectTrue(queue.Enqueue(oneByte).IsOk(), "another payload can queue behind a borrowed front");
-    ServerCoreTest::ExpectTrue(front.data() == queue.Front().data() && front.front() == oneByte.front(),
+    ServerCoreTest::ExpectTrue(
+        queue.Enqueue(oneByte).IsOk(), "another payload can queue behind a borrowed front");
+    ServerCoreTest::ExpectTrue(
+        front.data() == queue.Front().data() && front.front() == oneByte.front(),
         "appending another payload cannot invalidate an in-flight front buffer");
     queue.Clear();
     queue.Clear();
-    ServerCoreTest::ExpectEqual(std::size_t{0}, queue.QueuedBytes(), "discard clears all logical bytes");
-    ServerCoreTest::ExpectEqual(std::size_t{0}, budget->UsedBytes(), "repeated discard releases reservations exactly once");
+    ServerCoreTest::ExpectEqual(
+        std::size_t{ 0 }, queue.QueuedBytes(), "discard clears all logical bytes");
+    ServerCoreTest::ExpectEqual(std::size_t{ 0 }, budget->UsedBytes(),
+        "repeated discard releases reservations exactly once");
     {
         ServerCore::Net::SendQueue temporary(budget);
-        ServerCoreTest::ExpectTrue(temporary.Enqueue(oneByte).IsOk(), "a scoped queue owns its reservation");
+        ServerCoreTest::ExpectTrue(
+            temporary.Enqueue(oneByte).IsOk(), "a scoped queue owns its reservation");
     }
-    ServerCoreTest::ExpectEqual(std::size_t{0}, budget->UsedBytes(), "queue destruction refunds remaining owned storage");
+    ServerCoreTest::ExpectEqual(
+        std::size_t{ 0 }, budget->UsedBytes(), "queue destruction refunds remaining owned storage");
 }
 
 void AcceptorReusesHandlerStateAndReleasesOnStop()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initializes for handler ownership");
-    if (!sockets.IsReady()) return;
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initializes for handler ownership");
+    if (!sockets.IsReady())
+        return;
     ServerCore::Net::IoContext io;
     ServerCore::Net::Acceptor acceptor;
     std::mutex mutex;
@@ -857,53 +937,72 @@ void AcceptorReusesHandlerStateAndReleasesOnStop()
     {
         auto lifetime = std::make_shared<int>(17);
         captured = lifetime;
-        acceptor.SetConnectionHandler([lifetime, invocation = 0U, &mutex, &changed, &counts,
-            &connections, &observers](std::shared_ptr<ServerCore::Net::Connection> connection) mutable
-        {
-            (void)lifetime;
-            auto observer = std::make_shared<RecordingObserver>();
-            connection->SetObserver(observer);
+        acceptor.SetConnectionHandler(
+            [lifetime, invocation = 0U, &mutex, &changed, &counts, &connections, &observers](
+                std::shared_ptr<ServerCore::Net::Connection> connection) mutable
             {
-                const std::lock_guard guard(mutex);
-                counts.push_back(++invocation);
-                connections.push_back(std::move(connection));
-                observers.push_back(std::move(observer));
-            }
-            changed.notify_all();
-        });
+                (void)lifetime;
+                auto observer = std::make_shared<RecordingObserver>();
+                connection->SetObserver(observer);
+                {
+                    const std::lock_guard guard(mutex);
+                    counts.push_back(++invocation);
+                    connections.push_back(std::move(connection));
+                    observers.push_back(std::move(observer));
+                }
+                changed.notify_all();
+            });
     }
     ServerCoreTest::ExpectTrue(!captured.expired(), "the acceptor owns the registered callable");
     const auto started = io.Start(1);
     ServerCoreTest::ExpectTrue(started.IsOk(), "one I/O worker serializes mutable handler calls");
-    if (!started.IsOk()) return;
-    const auto listening = acceptor.Listen("127.0.0.1", static_cast<std::uint16_t>(PortBase + 40), 8);
+    if (!started.IsOk())
+        return;
+    const auto listening = acceptor.Listen("127.0.0.1", ServerCoreTest::FreeLoopbackTcpPort(), 8);
     ServerCoreTest::ExpectTrue(listening.IsOk(), "handler ownership listener binds");
-    if (!listening.IsOk()) { acceptor.Stop(); io.Stop(); return; }
+    if (!listening.IsOk())
+    {
+        acceptor.Stop();
+        io.Stop();
+        return;
+    }
     const auto accepting = acceptor.Start(io);
     ServerCoreTest::ExpectTrue(accepting.IsOk(), "handler ownership listener starts");
-    if (!accepting.IsOk()) { acceptor.Stop(); io.Stop(); return; }
+    if (!accepting.IsOk())
+    {
+        acceptor.Stop();
+        io.Stop();
+        return;
+    }
 
     TestClient first;
     TestClient second;
     const bool firstConnected = first.Connect(acceptor.Port());
     const bool secondConnected = second.Connect(acceptor.Port());
-    ServerCoreTest::ExpectTrue(firstConnected && secondConnected, "two clients connect to the same registered callable");
+    ServerCoreTest::ExpectTrue(
+        firstConnected && secondConnected, "two clients connect to the same registered callable");
     if (firstConnected && secondConnected)
     {
         std::unique_lock guard(mutex);
-        const bool bothAccepted = changed.wait_for(guard, WaitLimit, [&counts] { return counts.size() == 2; });
+        const bool bothAccepted =
+            changed.wait_for(guard, WaitLimit, [&counts] { return counts.size() == 2; });
         ServerCoreTest::ExpectTrue(bothAccepted, "both accepted connections invoke the handler");
         if (bothAccepted)
         {
-            ServerCoreTest::ExpectEqual(1U, counts[0], "the registered handler receives its first invocation");
-            ServerCoreTest::ExpectEqual(2U, counts[1], "mutable callable state persists across accepted connections");
+            ServerCoreTest::ExpectEqual(
+                1U, counts[0], "the registered handler receives its first invocation");
+            ServerCoreTest::ExpectEqual(
+                2U, counts[1], "mutable callable state persists across accepted connections");
         }
     }
     acceptor.Stop();
-    ServerCoreTest::ExpectTrue(captured.expired(), "Stop releases registered captures after handoffs drain");
-    for (const auto& connection : connections) connection->Close();
+    ServerCoreTest::ExpectTrue(
+        captured.expired(), "Stop releases registered captures after handoffs drain");
+    for (const auto& connection : connections)
+        connection->Close();
     for (const auto& observer : observers)
-        ServerCoreTest::ExpectTrue(observer->WaitForDisconnect(WaitLimit), "accepted connections drain before I/O shutdown");
+        ServerCoreTest::ExpectTrue(observer->WaitForDisconnect(WaitLimit),
+            "accepted connections drain before I/O shutdown");
     first.Close();
     second.Close();
     io.Stop();
@@ -918,7 +1017,8 @@ void AcceptorReusesHandlerStateAndReleasesOnStop()
 void AcceptorCanListenAgainAfterStop()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the relisten test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the relisten test succeeded");
     if (!sockets.IsReady())
     {
         return;
@@ -982,7 +1082,7 @@ void AcceptorCanListenAgainAfterStop()
         return observer->WaitForDisconnect(WaitLimit);
     };
 
-    const std::uint16_t firstPort = static_cast<std::uint16_t>(PortBase + 33);
+    const std::uint16_t firstPort = ServerCoreTest::FreeLoopbackTcpPort();
     std::shared_ptr<ServerCore::Net::Connection> firstAcceptedConnection;
     const std::shared_ptr<RecordingObserver> firstObserver = std::make_shared<RecordingObserver>();
     configureHandler(firstObserver, &firstAcceptedConnection);
@@ -1047,7 +1147,7 @@ void AcceptorCanListenAgainAfterStop()
     }
 
     // Stop()은 handler도 비우므로, 두 번째 Start() 전에 새 cycle 전용 처리기를 다시 건다.
-    const std::uint16_t secondPort = static_cast<std::uint16_t>(PortBase + 34);
+    const std::uint16_t secondPort = ServerCoreTest::FreeLoopbackTcpPort();
     std::shared_ptr<ServerCore::Net::Connection> secondAcceptedConnection;
     const std::shared_ptr<RecordingObserver> secondObserver = std::make_shared<RecordingObserver>();
     configureHandler(secondObserver, &secondAcceptedConnection);
@@ -1106,9 +1206,10 @@ void AcceptorCanListenAgainAfterStop()
 void EchoRoundTrip()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 1);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
 
     TestServer server;
     server.Observer().SetEcho(true);
@@ -1150,9 +1251,10 @@ void EchoRoundTrip()
 void DisconnectIsNotifiedExactlyOnce()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 2);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
 
     TestServer server;
     server.Start(port);
@@ -1202,9 +1304,10 @@ void DisconnectIsNotifiedExactlyOnce()
 void LargePayloadCrossesReceiveBoundaries()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 3);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     constexpr std::size_t payloadSize = 256 * 1024;
 
     TestServer server;
@@ -1249,9 +1352,10 @@ void LargePayloadCrossesReceiveBoundaries()
 void SendAfterCloseIsRefused()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 4);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
 
     TestServer server;
     server.Start(port);
@@ -1302,8 +1406,8 @@ void SendAfterCloseIsRefused()
 void CloseDiscardsQueuedSendBytes()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the queued-send discard test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the queued-send discard test succeeded");
     if (!sockets.IsReady())
     {
         return;
@@ -1340,7 +1444,7 @@ void CloseDiscardsQueuedSendBytes()
             acceptedChanged.notify_all();
         });
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 12);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
     ServerCoreTest::ExpectTrue(
         listening.IsOk(), "Acceptor listened for the queued-send discard test");
@@ -1457,8 +1561,8 @@ void CloseDiscardsQueuedSendBytes()
 void SharedSendBudgetRejectsAcrossConnectionsAndRecovers()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the shared send-budget test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the shared send-budget test succeeded");
     if (!sockets.IsReady())
     {
         return;
@@ -1502,7 +1606,7 @@ void SharedSendBudgetRejectsAcrossConnectionsAndRecovers()
             acceptedChanged.notify_all();
         });
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 22);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
     const ServerCore::Core::Status accepting =
         listening.IsOk()
@@ -1673,7 +1777,7 @@ void SendQueueLimitRejectsWholeOverflowAndRecovers()
             acceptedChanged.notify_all();
         });
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 11);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
     ServerCoreTest::ExpectTrue(listening.IsOk(), "Acceptor listened for the send queue limit");
     if (!listening.IsOk())
@@ -1818,13 +1922,14 @@ void SendQueueLimitRejectsWholeOverflowAndRecovers()
 void CloseAfterSendOnEmptyConnectionCloses()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
     if (!sockets.IsReady())
     {
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 9);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
 
     TestServer server;
     server.Start(port);
@@ -1864,6 +1969,8 @@ void CloseAfterSendOnEmptyConnectionCloses()
     ServerCoreTest::ExpectTrue(client.WaitForPeerClose(),
         "the client observed the peer close from an empty CloseAfterSend()");
 
+    // CloseAfterSend()는 상대가 보내기를 닫을 때까지 입력을 읽어 버린 뒤 소켓을 닫고 통지한다.
+    client.Close();
     ServerCoreTest::ExpectTrue(server.Observer().WaitForDisconnect(WaitLimit),
         "the observer was notified after an empty CloseAfterSend()");
     ServerCoreTest::ExpectEqual(static_cast<std::size_t>(1),
@@ -1887,7 +1994,8 @@ void CloseAfterSendOnEmptyConnectionCloses()
 void CloseAfterSendDrainsQueuedBytes()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
     if (!sockets.IsReady())
     {
         return;
@@ -1920,7 +2028,7 @@ void CloseAfterSendDrainsQueuedBytes()
             acceptedChanged.notify_all();
         });
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 8);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
     ServerCoreTest::ExpectTrue(listening.IsOk(), "Acceptor listened for CloseAfterSend()");
     if (!listening.IsOk())
@@ -2023,6 +2131,8 @@ void CloseAfterSendDrainsQueuedBytes()
     ServerCoreTest::ExpectTrue(client.WaitForPeerClose(),
         "the client observed the peer close after every queued byte arrived");
 
+    // CloseAfterSend()는 상대가 보내기를 닫을 때까지 입력을 읽어 버린 뒤 소켓을 닫고 통지한다.
+    client.Close();
     ServerCoreTest::ExpectTrue(observer->WaitForDisconnect(WaitLimit),
         "the observer was notified after CloseAfterSend() completed");
     ServerCoreTest::ExpectEqual(std::size_t{ 1 }, observer->DisconnectCount(),
@@ -2033,6 +2143,275 @@ void CloseAfterSendDrainsQueuedBytes()
         !connection->IsOpen(), "the connection is closed after CloseAfterSend() drains");
 
     client.Close();
+    acceptor.Stop();
+    connection->Close();
+    connection.reset();
+    io.Stop();
+}
+
+/// <summary>첫 수신에서 수신을 멈추고 응답을 큐에 넣은 뒤 CloseAfterSend()를 부르는 관찰자다.</summary>
+/// <remarks>
+/// 첫 콜백 안에서 PauseReceive()를 부르므로 상대가 보낸 나머지 바이트는 서버 커널의 수신
+/// 버퍼에 읽히지 않은 채 남는다. HTTP 서버가 업로드 도중 오류 응답을 보내고 닫는 모양이다.
+///
+/// 스레드 안전성: 스레드 안전. 관찰자 호출은 I/O 스레드에서, 확인은 검사 스레드에서 온다.
+/// </remarks>
+class ReplyThenCloseObserver final : public ServerCore::Net::IConnectionObserver
+{
+public:
+    explicit ReplyThenCloseObserver(std::vector<std::byte> reply)
+        : mReply(std::move(reply))
+    {
+    }
+
+    void SetConnection(std::weak_ptr<ServerCore::Net::Connection> connection)
+    {
+        const std::lock_guard<std::mutex> guard(mMutex);
+        mConnection = std::move(connection);
+    }
+
+    void OnBytesReceived(std::span<const std::byte> bytes) override
+    {
+        std::shared_ptr<ServerCore::Net::Connection> connection;
+        bool first = false;
+        {
+            const std::lock_guard<std::mutex> guard(mMutex);
+            ++mReceiveCallCount;
+            mReceivedByteCount += bytes.size();
+            first = !mReplied;
+            mReplied = true;
+            connection = mConnection.lock();
+        }
+
+        if (first && connection)
+        {
+            const std::shared_ptr<ServerCore::Net::ConnectionFlowControl> flow =
+                ServerCore::Net::GetConnectionFlowControl(connection);
+            const ServerCore::Core::Status paused =
+                flow != nullptr ? flow->PauseReceive()
+                                : ServerCore::Core::Status::FailWithoutMessage(
+                                      ServerCore::Core::ErrorCode::InvalidArgument);
+            const ServerCore::Core::Status queued = connection->Send(mReply);
+            connection->CloseAfterSend();
+
+            const std::lock_guard<std::mutex> guard(mMutex);
+            mPauseCode = paused.Code();
+            mReplyCode = queued.Code();
+        }
+
+        mChanged.notify_all();
+    }
+
+    void OnDisconnected(ServerCore::Core::Status reason) override
+    {
+        {
+            const std::lock_guard<std::mutex> guard(mMutex);
+            ++mDisconnectCallCount;
+            mLastDisconnectCode = reason.Code();
+        }
+        mChanged.notify_all();
+    }
+
+    [[nodiscard]] bool WaitForDisconnect(const std::chrono::milliseconds limit)
+    {
+        std::unique_lock<std::mutex> guard(mMutex);
+        return mChanged.wait_for(guard, limit, [this] { return mDisconnectCallCount > 0; });
+    }
+
+    [[nodiscard]] std::size_t ReceiveCallCount() const
+    {
+        const std::lock_guard<std::mutex> guard(mMutex);
+        return mReceiveCallCount;
+    }
+
+    [[nodiscard]] std::size_t ReceivedByteCount() const
+    {
+        const std::lock_guard<std::mutex> guard(mMutex);
+        return mReceivedByteCount;
+    }
+
+    [[nodiscard]] std::size_t DisconnectCallCount() const
+    {
+        const std::lock_guard<std::mutex> guard(mMutex);
+        return mDisconnectCallCount;
+    }
+
+    [[nodiscard]] ServerCore::Core::ErrorCode LastDisconnectCode() const
+    {
+        const std::lock_guard<std::mutex> guard(mMutex);
+        return mLastDisconnectCode;
+    }
+
+    [[nodiscard]] ServerCore::Core::ErrorCode PauseCode() const
+    {
+        const std::lock_guard<std::mutex> guard(mMutex);
+        return mPauseCode;
+    }
+
+    [[nodiscard]] ServerCore::Core::ErrorCode ReplyCode() const
+    {
+        const std::lock_guard<std::mutex> guard(mMutex);
+        return mReplyCode;
+    }
+
+private:
+    const std::vector<std::byte> mReply;
+
+    mutable std::mutex mMutex;
+    std::condition_variable mChanged;
+    std::weak_ptr<ServerCore::Net::Connection> mConnection;
+    bool mReplied = false;
+    std::size_t mReceiveCallCount = 0;
+    std::size_t mReceivedByteCount = 0;
+    std::size_t mDisconnectCallCount = 0;
+    ServerCore::Core::ErrorCode mLastDisconnectCode = ServerCore::Core::ErrorCode::Ok;
+    ServerCore::Core::ErrorCode mPauseCode = ServerCore::Core::ErrorCode::Unimplemented;
+    ServerCore::Core::ErrorCode mReplyCode = ServerCore::Core::ErrorCode::Unimplemented;
+};
+
+/// <summary>읽지 않은 수신 바이트가 남은 채 CloseAfterSend()해도 큐의 응답이 끝까지 가는지 본다.</summary>
+/// <remarks>
+/// 커널 수신 버퍼에 읽지 않은 바이트가 있는 소켓을 닫으면 TCP는 FIN 대신 RST를 보내고 아직 보내지
+/// 못한 송신 바이트를 버린다(NET-2). 그래서 상대는 응답 도중 연결 재설정을 본다.
+///
+/// 검사 클라이언트는 업로드를 다 보낸 뒤에야 응답을 읽기 시작한다. 응답은 소켓 버퍼보다 크므로
+/// 서버가 마지막 송신을 커널에 넘기는 순간에도 커널 송신 큐에 보내지 못한 바이트가 남는다.
+/// 서버는 첫 수신 콜백에서 수신을 멈추므로 그 순간 업로드의 나머지는 읽히지 않은 채 남아 있다.
+/// 그 경로가 실제로 돌았다는 것은 수신 콜백이 한 번뿐이고 받은 바이트가 업로드보다 적다는
+/// 단언이 확인한다.
+/// </remarks>
+void CloseAfterSendWithUnreadInputDeliversQueuedBytes()
+{
+    constexpr std::size_t UploadBytes = 64 * 1024;
+    constexpr std::size_t ReplyBytes = 512 * 1024;
+
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    if (!sockets.IsReady())
+    {
+        return;
+    }
+
+    std::vector<std::byte> reply(ReplyBytes);
+    for (std::size_t index = 0; index < reply.size(); ++index)
+    {
+        reply[index] = static_cast<std::byte>(index % 251);
+    }
+
+    ServerCore::Net::IoContext io;
+    ServerCore::Net::Acceptor acceptor;
+    const std::shared_ptr<ReplyThenCloseObserver> observer =
+        std::make_shared<ReplyThenCloseObserver>(reply);
+    std::mutex acceptedMutex;
+    std::condition_variable acceptedChanged;
+    std::shared_ptr<ServerCore::Net::Connection> connection;
+
+    const ServerCore::Core::Status ioStarted = io.Start(1);
+    ServerCoreTest::ExpectTrue(
+        ioStarted.IsOk(), "IoContext started for CloseAfterSend() with unread input");
+    if (!ioStarted.IsOk())
+    {
+        return;
+    }
+
+    acceptor.SetConnectionHandler(
+        [&observer, &acceptedMutex, &acceptedChanged, &connection](
+            std::shared_ptr<ServerCore::Net::Connection> accepted)
+        {
+            observer->SetConnection(accepted);
+            accepted->SetObserver(observer);
+            {
+                const std::lock_guard<std::mutex> guard(acceptedMutex);
+                connection = std::move(accepted);
+            }
+            acceptedChanged.notify_all();
+        });
+
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
+    const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
+    ServerCoreTest::ExpectTrue(listening.IsOk(),
+        listening.IsOk() ? "Acceptor listened for CloseAfterSend() with unread input"
+                         : ("Acceptor listened for CloseAfterSend() with unread input, message: " +
+                               listening.Message()));
+    if (!listening.IsOk())
+    {
+        io.Stop();
+        return;
+    }
+
+    const ServerCore::Core::Status accepting = acceptor.Start(io);
+    ServerCoreTest::ExpectTrue(
+        accepting.IsOk(), "Acceptor started for CloseAfterSend() with unread input");
+    if (!accepting.IsOk())
+    {
+        acceptor.Stop();
+        io.Stop();
+        return;
+    }
+
+    TestClient client;
+    const bool connected = client.Connect(port);
+    ServerCoreTest::ExpectTrue(connected, "the uploading client connected");
+    if (!connected)
+    {
+        acceptor.Stop();
+        io.Stop();
+        return;
+    }
+
+    {
+        std::unique_lock<std::mutex> guard(acceptedMutex);
+        const bool accepted = acceptedChanged.wait_for(
+            guard, WaitLimit, [&connection] { return connection != nullptr; });
+        ServerCoreTest::ExpectTrue(accepted, "the uploading connection was accepted");
+    }
+    if (connection == nullptr)
+    {
+        client.Close();
+        acceptor.Stop();
+        io.Stop();
+        return;
+    }
+
+    const std::vector<std::byte> upload = MakeFilledBytes(UploadBytes, 0x55);
+    ServerCoreTest::ExpectTrue(
+        client.SendAll(upload), "the client sent its whole upload before reading");
+
+    std::vector<std::byte> received;
+    const bool replyArrived = client.ReceiveExactly(ReplyBytes, received);
+    const int replyError = replyArrived ? 0 : ServerCoreTest::LastSocketError();
+    const std::string replyObservation = "(received " + std::to_string(received.size()) + " of " +
+                                         std::to_string(ReplyBytes) + " bytes, last socket error " +
+                                         std::to_string(replyError) + ")";
+    ServerCoreTest::ExpectTrue(replyArrived,
+        "the client read every reply byte queued before CloseAfterSend() while its upload was "
+        "unread " +
+            replyObservation);
+    ServerCoreTest::ExpectTrue(received == reply, "the reply bytes arrived intact and in order");
+    ServerCoreTest::ExpectTrue(client.WaitForPeerClose(),
+        "the client observed an orderly peer close after the whole reply");
+
+    ServerCoreTest::ExpectEqual(std::size_t{ 1 }, observer->ReceiveCallCount(),
+        "the number of receive callbacks before the reply paused input");
+    ServerCoreTest::ExpectTrue(
+        observer->ReceivedByteCount() > 0 && observer->ReceivedByteCount() < UploadBytes,
+        "the server received part, but not all, of the upload before CloseAfterSend()");
+    ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::Ok),
+        static_cast<int>(observer->PauseCode()),
+        "the error code of PauseReceive() in the reply callback");
+    ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::Ok),
+        static_cast<int>(observer->ReplyCode()), "the error code of the queued reply Send()");
+
+    client.Close();
+    ServerCoreTest::ExpectTrue(observer->WaitForDisconnect(WaitLimit),
+        "the observer was notified after the client closed its side");
+    ServerCoreTest::ExpectEqual(std::size_t{ 1 }, observer->DisconnectCallCount(),
+        "the number of disconnect notifications after CloseAfterSend() with unread input");
+    ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::Closed),
+        static_cast<int>(observer->LastDisconnectCode()),
+        "the disconnect reason after CloseAfterSend() with unread input");
+
     acceptor.Stop();
     connection->Close();
     connection.reset();
@@ -2051,9 +2430,10 @@ void CloseAfterSendDrainsQueuedBytes()
 void ConcurrentSendsDoNotInterleave()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 5);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
 
     constexpr std::size_t senderCount = 4;
     constexpr std::size_t blocksPerSender = 64;
@@ -2138,8 +2518,8 @@ void ConcurrentSendsDoNotInterleave()
 void MultiWorkerDeliversDifferentConnectionsConcurrently()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the multi-worker delivery test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the multi-worker delivery test succeeded");
     if (!sockets.IsReady())
     {
         return;
@@ -2176,7 +2556,7 @@ void MultiWorkerDeliversDifferentConnectionsConcurrently()
             acceptedChanged.notify_all();
         });
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 10);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
     ServerCoreTest::ExpectTrue(listening.IsOk(), "Acceptor listened for multi-worker delivery");
     if (!listening.IsOk())
@@ -2323,7 +2703,7 @@ void DisconnectWaitsForReceiveCallback()
             acceptedChanged.notify_all();
         });
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 6);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
     ServerCoreTest::ExpectTrue(listening.IsOk(), "Acceptor listened for callback serialization");
     if (!listening.IsOk())
@@ -2407,8 +2787,8 @@ void DisconnectWaitsForReceiveCallback()
 void LateObserverReceivesPriorDisconnect()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for late observer registration succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for late observer registration succeeded");
     if (!sockets.IsReady())
     {
         return;
@@ -2435,7 +2815,7 @@ void LateObserverReceivesPriorDisconnect()
             connection->SetObserver(observer);
         });
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 6);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
     ServerCoreTest::ExpectTrue(
         listening.IsOk(), "Acceptor listened for late observer registration");
@@ -2482,7 +2862,8 @@ void AcceptorStopWaitsForActiveCompletionHandoff()
     constexpr std::chrono::milliseconds EarlyReturnWindow{ 500 };
 
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
     if (!sockets.IsReady())
     {
         return;
@@ -2503,7 +2884,7 @@ void AcceptorStopWaitsForActiveCompletionHandoff()
         [&handoff](std::shared_ptr<ServerCore::Net::Connection> connection)
         { handoff.Handle(std::move(connection)); });
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 7);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
     ServerCoreTest::ExpectTrue(listening.IsOk(),
         listening.IsOk()
@@ -2606,7 +2987,8 @@ void AcceptorStopDoesNotTimeOutActiveCompletionHandoff()
     constexpr std::chrono::seconds TimeoutOverrun{ 1 };
 
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
     if (!sockets.IsReady())
     {
         return;
@@ -2628,7 +3010,7 @@ void AcceptorStopDoesNotTimeOutActiveCompletionHandoff()
         [&handoff](std::shared_ptr<ServerCore::Net::Connection> connection)
         { handoff.Handle(std::move(connection)); });
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 21);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
     ServerCoreTest::ExpectTrue(listening.IsOk(),
         listening.IsOk() ? "Acceptor::Listen() for long handoff drain succeeded"
@@ -2719,6 +3101,786 @@ void AcceptorStopDoesNotTimeOutActiveCompletionHandoff()
     io.Stop();
 }
 
+#ifndef _WIN32
+/// <summary>프로세스 descriptor 한도를 낮추고 채운 뒤 되돌리는 시험용 범위다.</summary>
+/// <remarks>소멸자가 채운 descriptor를 닫고 원래 한도를 되돌린다. 실패 경로에서도 그렇다.</remarks>
+class DescriptorExhaustion final
+{
+public:
+    DescriptorExhaustion() { mSaved = ::getrlimit(RLIMIT_NOFILE, &mOriginal) == 0; }
+
+    ~DescriptorExhaustion() { Release(); }
+
+    DescriptorExhaustion(const DescriptorExhaustion&) = delete;
+    DescriptorExhaustion& operator=(const DescriptorExhaustion&) = delete;
+
+    /// <summary>한도를 가장 낮은 빈 번호 조금 위로 낮추고 EMFILE이 날 때까지 채운다.</summary>
+    /// <returns>EMFILE로 멈췄고 하나 이상 채웠으면 참.</returns>
+    [[nodiscard]] bool Exhaust()
+    {
+        if (!mSaved)
+            return false;
+        const int probe = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (probe < 0)
+            return false;
+        ::close(probe);
+
+        // 한도를 낮추는 이유는 채우는 수를 작게 두기 위해서다. 기본 한도가 큰 러너도 있다.
+        rlimit lowered = mOriginal;
+        const rlim_t target = static_cast<rlim_t>(probe) + 8;
+        if (lowered.rlim_cur == RLIM_INFINITY || lowered.rlim_cur > target)
+            lowered.rlim_cur = target;
+        if (::setrlimit(RLIMIT_NOFILE, &lowered) != 0)
+            return false;
+        mLowered = true;
+
+        for (;;)
+        {
+            const int filler = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (filler < 0)
+                return errno == EMFILE && !mFillers.empty();
+            mFillers.push_back(filler);
+        }
+    }
+
+    void Release() noexcept
+    {
+        for (const int filler : mFillers)
+            ::close(filler);
+        mFillers.clear();
+        if (mLowered)
+        {
+            (void)::setrlimit(RLIMIT_NOFILE, &mOriginal);
+            mLowered = false;
+        }
+    }
+
+private:
+    rlimit mOriginal{};
+    bool mSaved = false;
+    bool mLowered = false;
+    std::vector<int> mFillers;
+};
+
+/// <summary>accept4가 EMFILE을 돌려준 뒤에도 리스너가 살아 있고, descriptor가 돌아오면 다시 받는지 본다.</summary>
+/// <remarks>
+/// 예전에는 자원 고갈 한 번에 리스너를 닫아, 공격이 끝난 뒤에도 서버가 모든 새 접속을 거절했다
+/// (NET-1). 클라이언트 소켓은 한도를 채우기 전에 만들어 두고, 채운 뒤에 connect한다. 그러면 서버의
+/// accept4만 EMFILE을 만난다. 그 경로가 실제로 돌았다는 것은 수락기 로거에 errno=EMFILE 줄이 남은
+/// 것으로 확인하고, 그 줄을 본 뒤에야 descriptor를 돌려준다. 재시도 사이의 실패는 다시 기록하지
+/// 않으므로 그 줄은 정확히 하나다.
+///
+/// 한도를 채우기 전에 같은 경로를 한 번 미리 돈다. 주입한 ENOBUFS로 리스너를 쉬게 하고, 재시도
+/// 타이머가 다시 부른 뒤 주입을 끄고 첫 연결을 받는다. 이유는 UBSan이다. GCC 13 libsanitizer의
+/// vptr 검사는 처음 보는 (vptr, 정적 타입) 쌍마다 IsAccessibleMemoryRange를 부르고, 그 함수는
+/// pipe()를 만든다. descriptor 표가 가득 차 있으면 pipe()가 실패해 살아 있는 객체를 "invalid vptr"로
+/// 보고한다. 한 번 통과한 쌍은 전역 해시 집합에 남아 다시 pipe()를 부르지 않는다. 한도를 채운 동안
+/// 도는 다형 호출은 I/O 스레드의 ILogger::Write와 등록 콜백 shared_ptr의 참조 수 조작, 그리고 이
+/// 스레드의 RecordingLogger 멤버 호출이다. 준비 단계가 그 셋을 모두 한 번씩 거친다.
+/// </remarks>
+void AcceptorSurvivesDescriptorExhaustion()
+{
+    ServerCore::Net::IoContext io;
+    ServerCore::Net::Acceptor acceptor;
+    const std::shared_ptr<RecordingLogger> logger = std::make_shared<RecordingLogger>();
+    std::mutex acceptedMutex;
+    std::condition_variable acceptedChanged;
+    std::vector<std::shared_ptr<ServerCore::Net::Connection>> accepted;
+
+    const ServerCore::Core::Status ioStarted = io.Start(1);
+    ServerCoreTest::ExpectTrue(ioStarted.IsOk(), "IoContext started for descriptor exhaustion");
+    if (!ioStarted.IsOk())
+    {
+        return;
+    }
+
+    acceptor.SetLogger(logger);
+    acceptor.SetConnectionHandler(
+        [&acceptedMutex, &acceptedChanged, &accepted](
+            std::shared_ptr<ServerCore::Net::Connection> connection)
+        {
+            {
+                const std::lock_guard<std::mutex> guard(acceptedMutex);
+                accepted.push_back(std::move(connection));
+            }
+            acceptedChanged.notify_all();
+        });
+
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
+    const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
+    ServerCoreTest::ExpectTrue(listening.IsOk(), "Acceptor listened for descriptor exhaustion");
+    const ServerCore::Core::Status accepting = listening.IsOk() ? acceptor.Start(io) : listening;
+    ServerCoreTest::ExpectTrue(accepting.IsOk(), "Acceptor started for descriptor exhaustion");
+    if (!accepting.IsOk())
+    {
+        acceptor.Stop();
+        io.Stop();
+        return;
+    }
+
+    // 준비 단계. 한도를 채운 동안 돌 경로를 주입한 ENOBUFS로 먼저 돈다(위 remarks).
+    ServerCore::Net::AcceptorAccess::SetAcceptFailureInjection(acceptor, true);
+    TestClient warmUp;
+    const bool warmUpConnected = warmUp.Connect(port);
+    ServerCoreTest::ExpectTrue(warmUpConnected, "the warm-up client connected");
+    const std::string enobufsText = "errno=" + std::to_string(ENOBUFS);
+    const bool warmUpParked =
+        warmUpConnected && logger->WaitForLineContaining(enobufsText, WaitLimit);
+    ServerCoreTest::ExpectTrue(warmUpParked, "an injected ENOBUFS parked the listener");
+    const auto warmUpDeadline = std::chrono::steady_clock::now() + WaitLimit;
+    while (warmUpParked &&
+           ServerCore::Net::AcceptorAccess::InjectedAcceptFailureCount(acceptor) < 2 &&
+           std::chrono::steady_clock::now() < warmUpDeadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool warmUpRetried =
+        ServerCore::Net::AcceptorAccess::InjectedAcceptFailureCount(acceptor) >= 2;
+    ServerCoreTest::ExpectTrue(warmUpRetried, "the retry timer rearmed the parked listener");
+    ServerCore::Net::AcceptorAccess::SetAcceptFailureInjection(acceptor, false);
+    bool warmUpAccepted = false;
+    if (warmUpRetried)
+    {
+        std::unique_lock<std::mutex> guard(acceptedMutex);
+        warmUpAccepted = acceptedChanged.wait_for(
+            guard, WaitLimit, [&accepted] { return accepted.size() == 1; });
+    }
+    ServerCoreTest::ExpectTrue(
+        warmUpAccepted, "the warm-up connection was accepted once injection stopped");
+
+    const int client = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+    ServerCoreTest::ExpectTrue(client >= 0, "the client socket was created before exhaustion");
+    if (!warmUpAccepted || client < 0)
+    {
+        if (client >= 0)
+            ::close(client);
+        warmUp.Close();
+        acceptor.Stop();
+        {
+            const std::lock_guard<std::mutex> guard(acceptedMutex);
+            for (const auto& connection : accepted)
+                connection->Close();
+            accepted.clear();
+        }
+        io.Stop();
+        return;
+    }
+
+    DescriptorExhaustion exhaustion;
+    const bool exhausted = exhaustion.Exhaust();
+    ServerCoreTest::ExpectTrue(exhausted, "the process descriptor limit was filled up to EMFILE");
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = ::htons(port);
+    ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+    const bool connected =
+        ::connect(client, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0;
+    ServerCoreTest::ExpectTrue(connected, "the client connected while descriptors were exhausted");
+
+    const std::string emfileText = "errno=" + std::to_string(EMFILE);
+    const bool reported =
+        exhausted && connected && logger->WaitForLineContaining(emfileText, WaitLimit);
+    ServerCoreTest::ExpectTrue(reported, "the acceptor reported accept4 EMFILE");
+    ServerCoreTest::ExpectEqual(
+        port, acceptor.Port(), "the listening port while accept4 reports descriptor exhaustion");
+
+    exhaustion.Release();
+
+    bool acceptedAfterRelease = false;
+    {
+        std::unique_lock<std::mutex> guard(acceptedMutex);
+        acceptedAfterRelease = acceptedChanged.wait_for(
+            guard, WaitLimit, [&accepted] { return accepted.size() == 2; });
+    }
+    ServerCoreTest::ExpectTrue(acceptedAfterRelease,
+        "the pending connection was accepted after descriptors were released");
+    ServerCoreTest::ExpectEqual(std::size_t{ 1 }, logger->CountContaining(emfileText),
+        "the number of EMFILE lines logged across accept retries");
+
+    ::close(client);
+    warmUp.Close();
+    acceptor.Stop();
+    std::vector<std::shared_ptr<ServerCore::Net::Connection>> connections;
+    {
+        const std::lock_guard<std::mutex> guard(acceptedMutex);
+        connections.swap(accepted);
+    }
+    for (const auto& connection : connections)
+        connection->Close();
+    connections.clear();
+    io.Stop();
+}
+#endif
+
+/// <summary>수락 준비가 자원 부족으로 거듭 실패해도 리스너가 살아 있고, 실패가 멎으면 다시 받는지 본다.</summary>
+/// <remarks>
+/// Windows에서는 AcceptEx 재게시가 실패할 때마다 수락 자리가 영구히 줄고 0이 되면 리슨 소켓을
+/// 닫았다(NET-3). Linux에서는 accept4의 ENOBUFS 한 번에 리슨 소켓을 닫았다(NET-1). 실패는 시험 전용
+/// 주입으로 만든다. 그 경로가 실제로 돌았다는 것은 Windows에서는 걸린 AcceptEx가 0이 될 때까지
+/// 연결을 받은 것으로, Linux에서는 주입 실패가 두 번 이상, 즉 첫 실패 뒤 재시도가 일어난 것으로
+/// 확인한다. 주입을 끈 뒤 연결이 받아지면 통과다.
+/// </remarks>
+void AcceptorRetriesAfterAcceptResourceFailure()
+{
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    if (!sockets.IsReady())
+    {
+        return;
+    }
+
+    ServerCore::Net::IoContext io;
+    ServerCore::Net::Acceptor acceptor;
+    std::mutex acceptedMutex;
+    std::condition_variable acceptedChanged;
+    std::vector<std::shared_ptr<ServerCore::Net::Connection>> accepted;
+    std::vector<std::unique_ptr<TestClient>> clients;
+
+    const ServerCore::Core::Status ioStarted = io.Start(2);
+    ServerCoreTest::ExpectTrue(ioStarted.IsOk(), "IoContext started for accept retries");
+    if (!ioStarted.IsOk())
+    {
+        return;
+    }
+
+    acceptor.SetConnectionHandler(
+        [&acceptedMutex, &acceptedChanged, &accepted](
+            std::shared_ptr<ServerCore::Net::Connection> connection)
+        {
+            {
+                const std::lock_guard<std::mutex> guard(acceptedMutex);
+                accepted.push_back(std::move(connection));
+            }
+            acceptedChanged.notify_all();
+        });
+
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
+    const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
+    ServerCoreTest::ExpectTrue(listening.IsOk(), "Acceptor listened for accept retries");
+    const ServerCore::Core::Status accepting = listening.IsOk() ? acceptor.Start(io) : listening;
+    ServerCoreTest::ExpectTrue(accepting.IsOk(), "Acceptor started for accept retries");
+    if (!accepting.IsOk())
+    {
+        acceptor.Stop();
+        io.Stop();
+        return;
+    }
+
+    const auto acceptedCount = [&acceptedMutex, &accepted]
+    {
+        const std::lock_guard<std::mutex> guard(acceptedMutex);
+        return accepted.size();
+    };
+    const auto waitForAccepted = [&acceptedMutex, &acceptedChanged, &accepted](
+                                     const std::size_t expected)
+    {
+        std::unique_lock<std::mutex> guard(acceptedMutex);
+        return acceptedChanged.wait_for(
+            guard, WaitLimit, [&accepted, expected] { return accepted.size() >= expected; });
+    };
+
+    ServerCore::Net::AcceptorAccess::SetAcceptFailureInjection(acceptor, true);
+
+#ifdef _WIN32
+    // 연결 하나가 걸린 AcceptEx 하나를 끝내고, 그 자리의 재게시는 주입으로 실패한다.
+    constexpr std::size_t MaxProbeConnections = 16;
+    bool drained = false;
+    for (std::size_t attempt = 0; attempt < MaxProbeConnections; ++attempt)
+    {
+        if (ServerCore::Net::AcceptorAccess::PendingAcceptCount(acceptor) == 0)
+        {
+            drained = true;
+            break;
+        }
+        auto client = std::make_unique<TestClient>();
+        const std::size_t before = acceptedCount();
+        const bool connected = client->Connect(port);
+        clients.push_back(std::move(client));
+        if (!connected || !waitForAccepted(before + 1))
+        {
+            break;
+        }
+    }
+    ServerCoreTest::ExpectTrue(
+        drained, "every posted AcceptEx was consumed while re-posting kept failing");
+#else
+    auto first = std::make_unique<TestClient>();
+    ServerCoreTest::ExpectTrue(first->Connect(port), "the client connected while accept4 failed");
+    clients.push_back(std::move(first));
+    const auto deadline = std::chrono::steady_clock::now() + WaitLimit;
+    while (ServerCore::Net::AcceptorAccess::InjectedAcceptFailureCount(acceptor) < 2 &&
+           std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ServerCoreTest::ExpectTrue(
+        ServerCore::Net::AcceptorAccess::InjectedAcceptFailureCount(acceptor) >= 2,
+        "accept4 was retried after an injected resource failure");
+#endif
+
+    ServerCoreTest::ExpectTrue(
+        ServerCore::Net::AcceptorAccess::InjectedAcceptFailureCount(acceptor) > 0,
+        "at least one injected accept failure fired");
+    ServerCoreTest::ExpectEqual(
+        port, acceptor.Port(), "the listening port while accept preparation keeps failing");
+
+    ServerCore::Net::AcceptorAccess::SetAcceptFailureInjection(acceptor, false);
+    const std::size_t beforeRecovery = acceptedCount();
+#ifdef _WIN32
+    auto late = std::make_unique<TestClient>();
+    ServerCoreTest::ExpectTrue(
+        late->Connect(port), "a client connected after injected failures stopped");
+    clients.push_back(std::move(late));
+#endif
+    ServerCoreTest::ExpectTrue(waitForAccepted(beforeRecovery + 1),
+        "a connection was accepted after injected failures stopped");
+
+    for (const auto& client : clients)
+        client->Close();
+    acceptor.Stop();
+    std::vector<std::shared_ptr<ServerCore::Net::Connection>> connections;
+    {
+        const std::lock_guard<std::mutex> guard(acceptedMutex);
+        connections.swap(accepted);
+    }
+    for (const auto& connection : connections)
+        connection->Close();
+    connections.clear();
+    io.Stop();
+}
+
+/// <summary>IoContext가 먼저 소멸한 뒤에도 연결의 공개 함수가 정의된 동작을 하는지 본다.</summary>
+/// <remarks>
+/// 종료 순서를 어긴 경우다. Linux 연결은 IoContext를 참조로 들고 있어, 그것이 소멸한 뒤 부른
+/// PauseReceive·ResumeReceive·Close가 해제된 상태를 읽었다(NET-4). 해제된 메모리 접근은 그 자리에서
+/// 드러나지 않을 수 있으므로, 이 검사가 실패로 잡는 곳은 AddressSanitizer를 켠 빌드다. 그래서
+/// IoContext를 힙에 둔다. 연결이 실제로 시작되어 이벤트 등록을 가졌다는 것은 수신 콜백이 바이트를
+/// 받은 것으로 확인한다. IoContext가 없으면 완료를 처리할 곳이 없으므로 그 뒤의 끊김 통지는 보지
+/// 않는다.
+/// </remarks>
+void ConnectionOutlivesIoContext()
+{
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    if (!sockets.IsReady())
+    {
+        return;
+    }
+
+    auto io = std::make_unique<ServerCore::Net::IoContext>();
+    const std::shared_ptr<RecordingObserver> observer = std::make_shared<RecordingObserver>();
+    std::mutex acceptedMutex;
+    std::condition_variable acceptedChanged;
+    std::shared_ptr<ServerCore::Net::Connection> connection;
+    TestClient client;
+
+    const ServerCore::Core::Status ioStarted = io->Start(1);
+    ServerCoreTest::ExpectTrue(ioStarted.IsOk(), "IoContext started before it is destroyed early");
+    if (!ioStarted.IsOk())
+    {
+        return;
+    }
+
+    {
+        ServerCore::Net::Acceptor acceptor;
+        acceptor.SetConnectionHandler(
+            [&observer, &acceptedMutex, &acceptedChanged, &connection](
+                std::shared_ptr<ServerCore::Net::Connection> accepted)
+            {
+                accepted->SetObserver(observer);
+                {
+                    const std::lock_guard<std::mutex> guard(acceptedMutex);
+                    connection = std::move(accepted);
+                }
+                acceptedChanged.notify_all();
+            });
+
+        const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
+        const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
+        const ServerCore::Core::Status accepting =
+            listening.IsOk() ? acceptor.Start(*io) : listening;
+        ServerCoreTest::ExpectTrue(
+            accepting.IsOk(), "Acceptor started before IoContext destruction");
+        const bool connected = accepting.IsOk() && client.Connect(port);
+        ServerCoreTest::ExpectTrue(connected, "the client connected before IoContext destruction");
+
+        bool accepted = false;
+        if (connected)
+        {
+            std::unique_lock<std::mutex> guard(acceptedMutex);
+            accepted = acceptedChanged.wait_for(
+                guard, WaitLimit, [&connection] { return connection != nullptr; });
+        }
+        ServerCoreTest::ExpectTrue(
+            accepted, "the connection was accepted before IoContext destruction");
+
+        const std::array<std::byte, 1> payload{ static_cast<std::byte>(0x4E) };
+        if (accepted && client.SendAll(payload))
+        {
+            const auto deadline = std::chrono::steady_clock::now() + WaitLimit;
+            while (
+                observer->ReceivedByteCount() == 0 && std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        acceptor.Stop();
+    }
+
+    ServerCoreTest::ExpectTrue(observer->ReceivedByteCount() > 0,
+        "the connection received bytes before its IoContext was destroyed");
+    if (connection == nullptr)
+    {
+        io.reset();
+        return;
+    }
+
+    // 연결을 닫지 않고 IoContext부터 멈추고 소멸시킨다. 아래 호출들이 그 뒤에 온다.
+    io.reset();
+
+    const std::shared_ptr<ServerCore::Net::ConnectionFlowControl> flow =
+        ServerCore::Net::GetConnectionFlowControl(connection);
+    ServerCoreTest::ExpectTrue(flow != nullptr, "the accepted connection exposes flow control");
+    if (flow != nullptr)
+    {
+        // 결과는 플랫폼마다 다를 수 있다. Linux는 이벤트 등록을 되살릴 수 없어 Closed로 닫고,
+        // Windows는 상태만 바꾼다. 이 검사가 보는 것은 해제된 메모리에 닿지 않는 것이다.
+        (void)flow->PauseReceive();
+        (void)flow->ResumeReceive();
+    }
+    connection->Close();
+    ServerCoreTest::ExpectTrue(
+        !connection->IsOpen(), "the connection is closed after IoContext destruction and Close()");
+    const std::array<std::byte, 1> late{ static_cast<std::byte>(0x4F) };
+    ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::Closed),
+        static_cast<int>(connection->Send(late).Code()),
+        "the error code of Send() after IoContext destruction and Close()");
+
+    client.Close();
+}
+
+/// <summary>상대가 연결을 재설정했을 때 끊김 사유가 오류 코드의 출처를 바르게 적는지 본다.</summary>
+/// <remarks>
+/// Windows 완료 오류는 GetQueuedCompletionStatus 뒤의 GetLastError() 값인데, 예전에는
+/// "WSAGetLastError()="로 적어 다른 번호 체계로 읽히게 했다(NET-8). 그 경로가 실제로 돌았다는 것은
+/// 끊김 사유가 PlatformError인 것으로 확인한다. 상대가 정상 종료했다면 Closed다.
+/// </remarks>
+void PeerResetReportsErrorSource()
+{
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    if (!sockets.IsReady())
+    {
+        return;
+    }
+
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
+    TestServer server;
+    server.Start(port);
+
+    const ServerCoreTest::Socket client = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ServerCoreTest::ExpectTrue(
+        client != ServerCoreTest::InvalidSocket, "the resetting client socket was created");
+    if (client == ServerCoreTest::InvalidSocket)
+    {
+        server.Shutdown();
+        return;
+    }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = ::htons(port);
+    ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+    const bool connected = ::connect(client, reinterpret_cast<const sockaddr*>(&address),
+                               sizeof(address)) != ServerCoreTest::SocketError;
+    ServerCoreTest::ExpectTrue(connected, "the resetting client connected");
+    const bool accepted = connected && server.WaitForConnection(WaitLimit) != nullptr;
+    ServerCoreTest::ExpectTrue(accepted, "the server accepted the resetting client");
+
+    // SO_LINGER를 0초로 켜고 닫으면 FIN 대신 RST가 간다.
+    linger abortive{};
+    abortive.l_onoff = 1;
+    abortive.l_linger = 0;
+    (void)::setsockopt(
+        client, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&abortive), sizeof(abortive));
+    ServerCoreTest::CloseSocket(client);
+
+    ServerCoreTest::ExpectTrue(accepted && server.Observer().WaitForDisconnect(WaitLimit),
+        "the observer was notified after the peer reset");
+    ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::PlatformError),
+        static_cast<int>(server.Observer().LastDisconnectCode()),
+        "the disconnect reason code after a peer reset");
+    const std::string message = server.Observer().LastDisconnectMessage();
+    ServerCoreTest::ExpectTrue(message.find("WSAGetLastError()=") == std::string::npos,
+        "the peer-reset reason does not label its code as WSAGetLastError(): " + message);
+#ifdef _WIN32
+    ServerCoreTest::ExpectTrue(message.find(" GetLastError()=") != std::string::npos,
+        "the peer-reset reason labels its code as GetLastError(): " + message);
+#endif
+
+    server.Shutdown();
+}
+
+#ifdef _WIN32
+/// <summary>수락 인계가 IoContext에 소켓을 붙이려는 순간 IoContext::Stop()을 불러도 돌아오는지 본다.</summary>
+/// <remarks>
+/// 수락기보다 IoContext를 먼저 멈춘, 종료 순서를 어긴 경우다(NET-5). Stop()이 잠금을 쥔 채 worker를
+/// 기다리는데 worker가 인계 경로의 AssociateSocket에서 같은 잠금을 기다리면 둘 다 멈춘다. 시험 전용
+/// 문으로 worker를 붙이기 직전에 세우고, Stop()이 종료 신호를 다 보낸 뒤에야 문을 열어 그 경합을 시간
+/// 없이 만든다. 그 경로가 실제로 돌았다는 것은 인계가 IoContext가 돌지 않는다는 실패를 기록한 것으로
+/// 확인한다.
+///
+/// Stop()이 제한 안에 돌아오지 않으면 멈춘 스레드와 객체를 버리고 끝낸다. 소멸시키면 검사가 매달린다.
+/// 멈춘 IoContext 뒤의 수락기는 취소 완료를 처리할 스레드가 없어 Acceptor::Stop()이 단언으로 끊으므로,
+/// 성공해도 수락기는 버린다. 그것이 헤더가 적은 계약 위반의 결과다.
+/// </remarks>
+void IoContextStopDuringAcceptHandoffReturns()
+{
+    struct Shared
+    {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool handoffEntered = false;
+        bool handoffReleased = false;
+        bool stopSignalled = false;
+        bool stopReturned = false;
+    };
+
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    if (!sockets.IsReady())
+    {
+        return;
+    }
+
+    const auto shared = std::make_shared<Shared>();
+    const std::shared_ptr<RecordingLogger> logger = std::make_shared<RecordingLogger>();
+    auto io = std::make_unique<ServerCore::Net::IoContext>();
+    auto acceptor = std::make_unique<ServerCore::Net::Acceptor>();
+
+    const ServerCore::Core::Status ioStarted = io->Start(1);
+    ServerCoreTest::ExpectTrue(ioStarted.IsOk(), "IoContext started for a stop during handoff");
+    if (!ioStarted.IsOk())
+    {
+        return;
+    }
+
+    acceptor->SetLogger(logger);
+    acceptor->SetConnectionHandler(
+        [](std::shared_ptr<ServerCore::Net::Connection> connection) { connection->Close(); });
+    ServerCore::Net::AcceptorAccess::SetBeforeAssociateHook(*acceptor,
+        [shared]
+        {
+            std::unique_lock<std::mutex> guard(shared->mutex);
+            shared->handoffEntered = true;
+            shared->changed.notify_all();
+            shared->changed.wait(guard, [&shared] { return shared->handoffReleased; });
+        });
+    ServerCore::Net::IoContextAccess::SetAfterStopSignalHook(*io,
+        [shared]
+        {
+            {
+                const std::lock_guard<std::mutex> guard(shared->mutex);
+                shared->stopSignalled = true;
+            }
+            shared->changed.notify_all();
+        });
+
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
+    const ServerCore::Core::Status listening = acceptor->Listen("127.0.0.1", port, 8);
+    const ServerCore::Core::Status accepting = listening.IsOk() ? acceptor->Start(*io) : listening;
+    ServerCoreTest::ExpectTrue(accepting.IsOk(), "Acceptor started for a stop during handoff");
+    TestClient client;
+    const bool connected = accepting.IsOk() && client.Connect(port);
+    ServerCoreTest::ExpectTrue(connected, "the client connected for a stop during handoff");
+
+    bool entered = false;
+    if (connected)
+    {
+        std::unique_lock<std::mutex> guard(shared->mutex);
+        entered = shared->changed.wait_for(
+            guard, WaitLimit, [&shared] { return shared->handoffEntered; });
+    }
+    ServerCoreTest::ExpectTrue(entered, "the accept handoff stopped just before AssociateSocket");
+    if (!entered)
+    {
+        {
+            const std::lock_guard<std::mutex> guard(shared->mutex);
+            shared->handoffReleased = true;
+        }
+        shared->changed.notify_all();
+        client.Close();
+        (void)acceptor.release();
+        return;
+    }
+
+    ServerCore::Net::IoContext* const rawIo = io.get();
+    std::thread stopper(
+        [shared, rawIo]
+        {
+            rawIo->Stop();
+            {
+                const std::lock_guard<std::mutex> guard(shared->mutex);
+                shared->stopReturned = true;
+            }
+            shared->changed.notify_all();
+        });
+
+    bool signalled = false;
+    {
+        std::unique_lock<std::mutex> guard(shared->mutex);
+        signalled =
+            shared->changed.wait_for(guard, WaitLimit, [&shared] { return shared->stopSignalled; });
+        shared->handoffReleased = true;
+    }
+    shared->changed.notify_all();
+    ServerCoreTest::ExpectTrue(
+        signalled, "IoContext::Stop() posted its stop signals during the handoff");
+
+    bool returned = false;
+    {
+        std::unique_lock<std::mutex> guard(shared->mutex);
+        returned =
+            shared->changed.wait_for(guard, WaitLimit, [&shared] { return shared->stopReturned; });
+    }
+    ServerCoreTest::ExpectTrue(
+        returned, "IoContext::Stop() returned while an accept handoff attached its socket");
+    client.Close();
+    if (!returned)
+    {
+        stopper.detach();
+        (void)io.release();
+        (void)acceptor.release();
+        return;
+    }
+
+    stopper.join();
+    ServerCoreTest::ExpectEqual(std::size_t{ 1 },
+        logger->CountContaining("IoContext is not running"),
+        "the number of handoffs refused because IoContext::Stop() had begun");
+    ServerCore::Net::AcceptorAccess::SetBeforeAssociateHook(*acceptor, {});
+    (void)acceptor.release();
+    io.reset();
+}
+
+/// <summary>I/O 스레드가 다른 연결의 긴 수신 콜백에 묶여 있어도 Acceptor::Stop()이 끊지 않고 기다리는지 본다.</summary>
+/// <remarks>
+/// 정상 종료 순서다. 예전에는 리슨 소켓을 닫은 뒤 취소된 AcceptEx 완료를 10초만 기다리고 넘기면 단언으로
+/// 끊었는데, 유일한 I/O 스레드가 수신 콜백에 묶여 있으면 그 완료를 처리할 수 없어 정상 순서에서도
+/// 프로세스가 끝났다(NET-7). 벽시계를 기다리지 않도록 시험 전용으로 그 제한을 0으로 둔다. 그 경로가
+/// 실제로 돌았다는 것은 포트가 닫힌 뒤에도 걸린 AcceptEx가 남아 있는 것, 즉 Stop()이 취소 완료를
+/// 기다리는 자리에 있음을 보는 것으로 확인한다.
+/// </remarks>
+void AcceptorStopWaitsForBusyIoWorkers()
+{
+    const SocketRuntime sockets;
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    if (!sockets.IsReady())
+    {
+        return;
+    }
+
+    ServerCore::Net::IoContext io;
+    ServerCore::Net::Acceptor acceptor;
+    const std::shared_ptr<BlockingReceiveObserver> observer =
+        std::make_shared<BlockingReceiveObserver>();
+    std::mutex acceptedMutex;
+    std::condition_variable acceptedChanged;
+    std::shared_ptr<ServerCore::Net::Connection> connection;
+
+    const ServerCore::Core::Status ioStarted = io.Start(1);
+    ServerCoreTest::ExpectTrue(ioStarted.IsOk(), "IoContext started for a busy-worker stop");
+    if (!ioStarted.IsOk())
+    {
+        return;
+    }
+
+    acceptor.SetConnectionHandler(
+        [&observer, &acceptedMutex, &acceptedChanged, &connection](
+            std::shared_ptr<ServerCore::Net::Connection> accepted)
+        {
+            accepted->SetObserver(observer);
+            {
+                const std::lock_guard<std::mutex> guard(acceptedMutex);
+                connection = std::move(accepted);
+            }
+            acceptedChanged.notify_all();
+        });
+    ServerCore::Net::AcceptorAccess::SetPendingAcceptDrainTimeout(
+        acceptor, std::chrono::milliseconds{ 0 });
+
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
+    const ServerCore::Core::Status listening = acceptor.Listen("127.0.0.1", port, 8);
+    const ServerCore::Core::Status accepting = listening.IsOk() ? acceptor.Start(io) : listening;
+    ServerCoreTest::ExpectTrue(accepting.IsOk(), "Acceptor started for a busy-worker stop");
+    TestClient client;
+    const bool connected = accepting.IsOk() && client.Connect(port);
+    ServerCoreTest::ExpectTrue(connected, "the client connected for a busy-worker stop");
+
+    bool accepted = false;
+    if (connected)
+    {
+        std::unique_lock<std::mutex> guard(acceptedMutex);
+        accepted = acceptedChanged.wait_for(
+            guard, WaitLimit, [&connection] { return connection != nullptr; });
+    }
+    const std::array<std::byte, 1> trigger{ static_cast<std::byte>(0x42) };
+    const bool blocked =
+        accepted && client.SendAll(trigger) && observer->WaitForReceiveEntry(WaitLimit);
+    ServerCoreTest::ExpectTrue(blocked, "the only I/O worker is held in a receive callback");
+    if (!blocked)
+    {
+        observer->ReleaseReceive();
+        acceptor.Stop();
+        if (connection)
+            connection->Close();
+        client.Close();
+        io.Stop();
+        return;
+    }
+
+    std::mutex stopMutex;
+    std::condition_variable stopChanged;
+    bool stopReturned = false;
+    std::thread stopper(
+        [&acceptor, &stopMutex, &stopChanged, &stopReturned]
+        {
+            acceptor.Stop();
+            {
+                const std::lock_guard<std::mutex> guard(stopMutex);
+                stopReturned = true;
+            }
+            stopChanged.notify_all();
+        });
+
+    const bool portClosed = WaitForClosedPort(acceptor, WaitLimit);
+    ServerCoreTest::ExpectTrue(portClosed, "Acceptor::Stop() closed the listening port");
+    ServerCoreTest::ExpectTrue(ServerCore::Net::AcceptorAccess::PendingAcceptCount(acceptor) > 0,
+        "cancelled AcceptEx requests were still pending while the worker was busy");
+
+    observer->ReleaseReceive();
+    bool returned = false;
+    {
+        std::unique_lock<std::mutex> guard(stopMutex);
+        returned = stopChanged.wait_for(guard, WaitLimit, [&stopReturned] { return stopReturned; });
+    }
+    ServerCoreTest::ExpectTrue(
+        returned, "Acceptor::Stop() returned after the busy worker drained the cancellations");
+    stopper.join();
+
+    connection->Close();
+    (void)observer->WaitForDisconnect(WaitLimit);
+    client.Close();
+    connection.reset();
+    io.Stop();
+}
+#endif
+
 const ServerCoreTest::CheckRegistration gIoContextStartsAndStops{
     "Transport.IoContextStartsAndStops", &IoContextStartsAndStops
 };
@@ -2729,13 +3891,37 @@ const ServerCoreTest::CheckRegistration gSendQueueRetainsPartiallySentStorage{
     "Transport.SendQueueRetainsPartiallySentStorage", &SendQueueRetainsPartiallySentStorage
 };
 const ServerCoreTest::CheckRegistration gAcceptorReusesHandlerStateAndReleasesOnStop{
-    "Transport.AcceptorReusesHandlerStateAndReleasesOnStop", &AcceptorReusesHandlerStateAndReleasesOnStop
+    "Transport.AcceptorReusesHandlerStateAndReleasesOnStop",
+    &AcceptorReusesHandlerStateAndReleasesOnStop
 };
 const ServerCoreTest::CheckRegistration gListenRejectsInvalidEndpoint{
     "Transport.ListenRejectsInvalidEndpoint", &ListenRejectsInvalidEndpoint
 };
 const ServerCoreTest::CheckRegistration gAcceptorCanListenAgainAfterStop{
     "Transport.AcceptorCanListenAgainAfterStop", &AcceptorCanListenAgainAfterStop
+};
+#ifndef _WIN32
+const ServerCoreTest::CheckRegistration gAcceptorSurvivesDescriptorExhaustion{
+    "Transport.AcceptorSurvivesDescriptorExhaustion", &AcceptorSurvivesDescriptorExhaustion
+};
+#endif
+#ifdef _WIN32
+const ServerCoreTest::CheckRegistration gIoContextStopDuringAcceptHandoffReturns{
+    "Transport.IoContextStopDuringAcceptHandoffReturns", &IoContextStopDuringAcceptHandoffReturns
+};
+const ServerCoreTest::CheckRegistration gAcceptorStopWaitsForBusyIoWorkers{
+    "Transport.AcceptorStopWaitsForBusyIoWorkers", &AcceptorStopWaitsForBusyIoWorkers
+};
+#endif
+const ServerCoreTest::CheckRegistration gPeerResetReportsErrorSource{
+    "Transport.PeerResetReportsErrorSource", &PeerResetReportsErrorSource
+};
+const ServerCoreTest::CheckRegistration gConnectionOutlivesIoContext{
+    "Transport.ConnectionOutlivesIoContext", &ConnectionOutlivesIoContext
+};
+const ServerCoreTest::CheckRegistration gAcceptorRetriesAfterAcceptResourceFailure{
+    "Transport.AcceptorRetriesAfterAcceptResourceFailure",
+    &AcceptorRetriesAfterAcceptResourceFailure
 };
 const ServerCoreTest::CheckRegistration gEchoRoundTrip{ "Transport.EchoRoundTrip", &EchoRoundTrip };
 const ServerCoreTest::CheckRegistration gDisconnectIsNotifiedExactlyOnce{
@@ -2784,5 +3970,9 @@ const ServerCoreTest::CheckRegistration gAcceptorStopWaitsForActiveCompletionHan
 const ServerCoreTest::CheckRegistration gAcceptorStopDoesNotTimeOutActiveCompletionHandoff{
     "Transport.AcceptorStopDoesNotTimeOutActiveCompletionHandoff",
     &AcceptorStopDoesNotTimeOutActiveCompletionHandoff
+};
+const ServerCoreTest::CheckRegistration gCloseAfterSendWithUnreadInputDeliversQueuedBytes{
+    "Transport.CloseAfterSendWithUnreadInputDeliversQueuedBytes",
+    &CloseAfterSendWithUnreadInputDeliversQueuedBytes
 };
 }

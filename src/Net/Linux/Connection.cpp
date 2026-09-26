@@ -1,8 +1,8 @@
 #include "Net/Linux/ConnectionInternal.h"
 
+#include "Net/EndpointInternal.h"
 #include "Net/Linux/EpollInternal.h"
 #include "Net/Linux/PosixInternal.h"
-#include "Net/EndpointInternal.h"
 #include "ServerCore/Core/Assert.h"
 
 #include <array>
@@ -14,17 +14,23 @@
 
 namespace ServerCore::Net
 {
-std::shared_ptr<TcpConnection> TcpConnection::Create(const int descriptor,
-    IoContext& context, std::shared_ptr<SendBudget> budget,Core::IpEndpoint local,Core::IpEndpoint remote)
+std::shared_ptr<TcpConnection> TcpConnection::Create(const int descriptor, IoContext& context,
+    std::shared_ptr<SendBudget> budget, Core::IpEndpoint local, Core::IpEndpoint remote)
 {
     SERVERCORE_ASSERT(descriptor >= 0, "a connection requires a valid descriptor");
-    return std::make_shared<TcpConnection>(CreationKey{}, descriptor, context, std::move(budget),local,remote);
+    return std::make_shared<TcpConnection>(
+        CreationKey{}, descriptor, context, std::move(budget), local, remote);
 }
 
-TcpConnection::TcpConnection(CreationKey, const int descriptor,
-    IoContext& context, std::shared_ptr<SendBudget> budget,Core::IpEndpoint local,Core::IpEndpoint remote)
-    : mContext(context), mDescriptor(descriptor), mLocalEndpoint(local.IsValid()?local:ReadSocketEndpoint(descriptor,false)),
-      mRemoteEndpoint(remote.IsValid()?remote:ReadSocketEndpoint(descriptor,true)), mSends(std::move(budget)) {}
+TcpConnection::TcpConnection(CreationKey, const int descriptor, IoContext& context,
+    std::shared_ptr<SendBudget> budget, Core::IpEndpoint local, Core::IpEndpoint remote)
+    : mEvents(IoContextAccess::Share(context))
+    , mDescriptor(descriptor)
+    , mLocalEndpoint(local.IsValid() ? local : ReadSocketEndpoint(descriptor, false))
+    , mRemoteEndpoint(remote.IsValid() ? remote : ReadSocketEndpoint(descriptor, true))
+    , mSends(std::move(budget))
+{
+}
 
 TcpConnection::~TcpConnection()
 {
@@ -38,6 +44,7 @@ TcpConnection::~TcpConnection()
         ::close(mDescriptor);
         mDescriptor = -1;
     }
+    mLingering = false;
     mSends.CloseCapacityWaits();
     DiscardSendsLocked();
     if (!mClosed.exchange(true))
@@ -53,18 +60,26 @@ Core::Status TcpConnection::Start()
         const std::lock_guard guard(mMutex);
         SERVERCORE_ASSERT(!mStarted, "a connection can only start once");
         mStarted = true;
-        if (mClosed.load()) return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+        if (mClosed.load())
+            return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
         try
         {
-            auto registration = IoContextAccess::Register(mContext, mDescriptor, InterestLocked(),
+            auto registration = IoContextAccess::Register(mEvents, mDescriptor, InterestLocked(),
                 [self = shared_from_this()](const std::uint32_t events) { self->OnReady(events); });
-            if (registration.IsOk()) mRegistration = registration.Value();
-            else status = std::move(registration).TakeStatus();
+            if (registration.IsOk())
+                mRegistration = registration.Value();
+            else
+                status = std::move(registration).TakeStatus();
         }
-        catch (...) { status = Core::Status::AllocationFailure(); }
-        if (!status.IsOk()) CloseWithFailureLocked(status);
+        catch (...)
+        {
+            status = Core::Status::AllocationFailure();
+        }
+        if (!status.IsOk())
+            CloseWithFailureLocked(status);
     }
-    if (!status.IsOk()) NotifyDisconnected();
+    if (!status.IsOk())
+        NotifyDisconnected();
     return status;
 }
 
@@ -83,10 +98,12 @@ ConnectionSendOutcome TcpConnection::SendWithOutcome(const std::span<const std::
     {
         const std::lock_guard guard(mMutex);
         if (mClosed.load() || mCloseAfterSend)
-            return {Core::Status::FailWithoutMessage(Core::ErrorCode::Closed), false};
-        if (bytes.empty()) return {Core::Status::Ok(), false};
+            return { Core::Status::FailWithoutMessage(Core::ErrorCode::Closed), false };
+        if (bytes.empty())
+            return { Core::Status::Ok(), false };
         status = mSends.Enqueue(bytes);
-        if (!status.IsOk()) return {std::move(status), false};
+        if (!status.IsOk())
+            return { std::move(status), false };
         // Queue acceptance is synchronous; actual writes always run on an I/O
         // worker. This preserves callback affinity and bounded queue accounting.
         if (mStarted && !mProcessing)
@@ -99,15 +116,22 @@ ConnectionSendOutcome TcpConnection::SendWithOutcome(const std::span<const std::
             }
         }
     }
-    catch (...) { status = Core::Status::AllocationFailure(); }
-    if (closedByFailure) NotifyDisconnected();
-    return {std::move(status), closedByFailure};
+    catch (...)
+    {
+        status = Core::Status::AllocationFailure();
+    }
+    if (closedByFailure)
+        NotifyDisconnected();
+    return { std::move(status), closedByFailure };
 }
 
 std::uint32_t TcpConnection::InterestLocked() const noexcept
 {
+    // A lingering close drains input regardless of pause and has nothing to send.
+    if (mLingering)
+        return static_cast<std::uint32_t>(EPOLLIN | EPOLLRDHUP);
     return (mReceivePaused ? 0U : static_cast<std::uint32_t>(EPOLLIN | EPOLLRDHUP)) |
-        (mSends.Empty() ? 0U : static_cast<std::uint32_t>(EPOLLOUT));
+           (mSends.Empty() ? 0U : static_cast<std::uint32_t>(EPOLLOUT));
 }
 
 Core::Status TcpConnection::RearmLocked() noexcept
@@ -116,8 +140,9 @@ Core::Status TcpConnection::RearmLocked() noexcept
     // A paused idle connection keeps its registry owner but parks its one-shot
     // event. EPOLLHUP is reported even with an empty mask; rearming it repeatedly
     // would busy-loop until the application resumes or closes the connection.
-    if (interests == 0) return Core::Status::Ok();
-    return IoContextAccess::Rearm(mContext, mDescriptor, mRegistration, interests);
+    if (interests == 0)
+        return Core::Status::Ok();
+    return IoContextAccess::Rearm(mEvents, mDescriptor, mRegistration, interests);
 }
 
 void TcpConnection::DiscardSendsLocked() noexcept
@@ -130,7 +155,10 @@ void TcpConnection::CloseWithFailureLocked(Core::Status& failure) noexcept
     // Both the initiating call and OnDisconnected own the same diagnostic.
     // As in the IOCP backend, failure to copy that diagnostic degrades both
     // results to the allocation-free PlatformError instead of throwing.
-    try { CloseLocked(failure); }
+    try
+    {
+        CloseLocked(failure);
+    }
     catch (...)
     {
         failure = Core::Status::AllocationFailure();
@@ -138,25 +166,54 @@ void TcpConnection::CloseWithFailureLocked(Core::Status& failure) noexcept
     }
 }
 
+void TcpConnection::ReleaseDescriptorLocked(const int how) noexcept
+{
+    mLingering = false;
+    if (mDescriptor < 0)
+        return;
+    if (mRegistration != 0)
+    {
+        IoContextAccess::Remove(mEvents, mDescriptor, mRegistration);
+        mRegistration = 0;
+    }
+    ::shutdown(mDescriptor, how);
+    ::close(mDescriptor);
+    mDescriptor = -1;
+}
+
 void TcpConnection::CloseLocked(Core::Status reason, const bool graceful) noexcept
 {
-    if (mClosed.exchange(true, std::memory_order_acq_rel)) return;
+    if (mClosed.exchange(true, std::memory_order_acq_rel))
+    {
+        // A lingering close already owns the first reason. Any later close,
+        // including the peer's EOF, ends the drain and releases the socket.
+        if (mLingering)
+            ReleaseDescriptorLocked(SHUT_RDWR);
+        return;
+    }
     mSends.CloseCapacityWaits();
     mCloseReason = std::move(reason);
-    if (mDescriptor >= 0)
+    if (graceful && mDescriptor >= 0 && mRegistration != 0)
     {
-        if (mRegistration != 0)
-        {
-            IoContextAccess::Remove(mContext, mDescriptor, mRegistration);
-            mRegistration = 0;
-        }
-        ::shutdown(mDescriptor, graceful ? SHUT_WR : SHUT_RDWR);
-        ::close(mDescriptor);
-        mDescriptor = -1;
+        // close() with unread input, or input arriving after close(), makes the
+        // kernel send RST and drop unsent bytes (NET-2). Send FIN only and keep
+        // draining input until the peer closes. Pinned by
+        // Transport.CloseAfterSendWithUnreadInputDeliversQueuedBytes.
+        ::shutdown(mDescriptor, SHUT_WR);
+        mLingering = true;
+        // A processing worker rearms before returning. Otherwise a paused
+        // connection may have no armed interest left to report the drain.
+        if (!mProcessing && !RearmLocked().IsOk())
+            ReleaseDescriptorLocked(SHUT_RDWR);
+    }
+    else
+    {
+        ReleaseDescriptorLocked(graceful ? SHUT_WR : SHUT_RDWR);
     }
     // A callback may be paused while Close runs. Keep its accepted work alive
     // until the worker exits that callback, matching the disconnect barrier.
-    if (!mProcessing) DiscardSendsLocked();
+    if (!mProcessing)
+        DiscardSendsLocked();
 }
 
 void TcpConnection::Close()
@@ -178,7 +235,8 @@ void TcpConnection::CloseAfterSend()
         {
             mCloseAfterSend = true;
             mSends.CloseCapacityWaits();
-            if (mSends.Empty()) CloseLocked(Core::Status::FailWithoutMessage(Core::ErrorCode::Closed), true);
+            if (mSends.Empty())
+                CloseLocked(Core::Status::FailWithoutMessage(Core::ErrorCode::Closed), true);
         }
     }
     NotifyDisconnected();
@@ -195,7 +253,10 @@ void TcpConnection::SetObserver(std::weak_ptr<IConnectionObserver> observer)
     NotifyDisconnected();
 }
 
-bool TcpConnection::IsOpen() const noexcept { return !mClosed.load(std::memory_order_acquire); }
+bool TcpConnection::IsOpen() const noexcept
+{
+    return !mClosed.load(std::memory_order_acquire);
+}
 std::size_t TcpConnection::QueuedSendBytes() const noexcept
 {
     const std::lock_guard guard(mMutex);
@@ -208,19 +269,23 @@ Core::Status TcpConnection::PauseReceive()
     Core::Status status = Core::Status::Ok();
     {
         const std::lock_guard guard(mMutex);
-        if (mClosed.load()) return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
-        if (mReceivePaused) return status;
+        if (mClosed.load())
+            return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+        if (mReceivePaused)
+            return status;
         mReceivePaused = true;
         // A processing worker will apply the new interests before returning.
         // Otherwise remove the previously armed read interest now, including
         // when the resulting mask is empty. A queued event still checks pause.
         if (mStarted && !mProcessing)
         {
-            status = IoContextAccess::Rearm(mContext, mDescriptor, mRegistration, InterestLocked());
-            if (!status.IsOk()) CloseWithFailureLocked(status);
+            status = IoContextAccess::Rearm(mEvents, mDescriptor, mRegistration, InterestLocked());
+            if (!status.IsOk())
+                CloseWithFailureLocked(status);
         }
     }
-    if (!status.IsOk()) NotifyDisconnected();
+    if (!status.IsOk())
+        NotifyDisconnected();
     return status;
 }
 
@@ -230,18 +295,22 @@ Core::Status TcpConnection::ResumeReceive()
     Core::Status status = Core::Status::Ok();
     {
         const std::lock_guard guard(mMutex);
-        if (mClosed.load()) return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
-        if (!mReceivePaused) return status;
+        if (mClosed.load())
+            return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
+        if (!mReceivePaused)
+            return status;
         mReceivePaused = false;
         // Acceptor invokes its handler before Start. Resuming there must not
         // register the descriptor or let received bytes precede the handler.
         if (mStarted && !mProcessing)
         {
             status = RearmLocked();
-            if (!status.IsOk()) CloseWithFailureLocked(status);
+            if (!status.IsOk())
+                CloseWithFailureLocked(status);
         }
     }
-    if (!status.IsOk()) NotifyDisconnected();
+    if (!status.IsOk())
+        NotifyDisconnected();
     return status;
 }
 
@@ -272,12 +341,16 @@ void TcpConnection::NotifyDisconnected()
     Core::Status reason = Core::Status::Ok();
     {
         const std::lock_guard guard(mMutex);
-        if (!mClosed.load() || mProcessing || !mObserverAssigned || mDisconnectNotified) return;
+        // A lingering close still owns the socket and its registration.
+        if (!mClosed.load() || mLingering || mProcessing || !mObserverAssigned ||
+            mDisconnectNotified)
+            return;
         mDisconnectNotified = true;
         observer = mObserver;
         reason = std::move(mCloseReason);
     }
-    if (auto target = observer.lock()) target->OnDisconnected(std::move(reason));
+    if (auto target = observer.lock())
+        target->OnDisconnected(std::move(reason));
 }
 
 void TcpConnection::OnReady(const std::uint32_t events)
@@ -286,7 +359,8 @@ void TcpConnection::OnReady(const std::uint32_t events)
     std::array<std::byte, ReceiveBufferSize> buffer{};
     {
         const std::lock_guard guard(mMutex);
-        if (mClosed.load() || mProcessing) return;
+        if ((mClosed.load() && !mLingering) || mProcessing)
+            return;
         mProcessing = true;
     }
     // Cap each readiness dispatch so a continuously readable peer cannot starve
@@ -299,13 +373,16 @@ void TcpConnection::OnReady(const std::uint32_t events)
             ssize_t count = -1;
             {
                 const std::lock_guard guard(mMutex);
-                if (mClosed.load() || mReceivePaused) break;
+                if (!mLingering && (mClosed.load() || mReceivePaused))
+                    break;
                 count = ::recv(mDescriptor, buffer.data(), buffer.size(), 0);
                 if (count < 0)
                 {
                     const int error = errno;
-                    if (error == EINTR) continue;
-                    if (!IsWouldBlock(error)) CloseLocked(MakePosixFailure("recv", error));
+                    if (error == EINTR)
+                        continue;
+                    if (!IsWouldBlock(error))
+                        CloseLocked(MakePosixFailure("recv", error));
                     break;
                 }
                 if (count == 0)
@@ -313,9 +390,14 @@ void TcpConnection::OnReady(const std::uint32_t events)
                     CloseLocked(Core::Status::FailWithoutMessage(Core::ErrorCode::Closed));
                     break;
                 }
+                // After CloseAfterSend shut down the send side, input is drained
+                // and discarded instead of reaching the observer.
+                if (mLingering)
+                    continue;
                 observer = mObserver.lock();
             }
-            if (observer) observer->OnBytesReceived(std::span(buffer).first(static_cast<std::size_t>(count)));
+            if (observer)
+                observer->OnBytesReceived(std::span(buffer).first(static_cast<std::size_t>(count)));
         }
     }
     {
@@ -329,20 +411,25 @@ void TcpConnection::OnReady(const std::uint32_t events)
             socklen_t length = sizeof(error);
             if (::getsockopt(mDescriptor, SOL_SOCKET, SO_ERROR, &error, &length) < 0)
                 CloseLocked(MakePosixFailure("getsockopt(SO_ERROR)", errno));
-            else if (error != 0) CloseLocked(MakePosixFailure("socket", error));
+            else if (error != 0)
+                CloseLocked(MakePosixFailure("socket", error));
         }
         // A receive callback may have just queued a reply even without EPOLLOUT.
         bool sendBlocked = false;
-        for (unsigned int attempt = 0; attempt < 64 && !mClosed.load() && !mSends.Empty(); ++attempt)
+        for (unsigned int attempt = 0; attempt < 64 && !mClosed.load() && !mSends.Empty();
+            ++attempt)
         {
             const auto front = mSends.Front();
             const ssize_t count = ::send(mDescriptor, front.data(), front.size(), MSG_NOSIGNAL);
             if (count < 0)
             {
                 const int error = errno;
-                if (error == EINTR) continue;
-                if (IsWouldBlock(error)) sendBlocked = true;
-                else CloseLocked(MakePosixFailure("send", error));
+                if (error == EINTR)
+                    continue;
+                if (IsWouldBlock(error))
+                    sendBlocked = true;
+                else
+                    CloseLocked(MakePosixFailure("send", error));
                 break;
             }
             if (count == 0)
@@ -360,11 +447,13 @@ void TcpConnection::OnReady(const std::uint32_t events)
         if (!mClosed.load() && mCloseAfterSend && mSends.Empty())
             CloseLocked(Core::Status::FailWithoutMessage(Core::ErrorCode::Closed), true);
         mProcessing = false;
-        if (mClosed.load()) DiscardSendsLocked();
+        if (mClosed.load() && !mLingering)
+            DiscardSendsLocked();
         else
         {
             auto status = RearmLocked();
-            if (!status.IsOk()) CloseLocked(std::move(status));
+            if (!status.IsOk())
+                CloseLocked(std::move(status));
         }
     }
     NotifyDisconnected();

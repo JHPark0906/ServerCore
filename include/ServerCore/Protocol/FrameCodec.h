@@ -43,10 +43,7 @@ struct AppendResult
     Error error = Error::None;
     std::size_t consumed = 0;
 
-    [[nodiscard]] bool IsOk() const noexcept
-    {
-        return error == Error::None;
-    }
+    [[nodiscard]] bool IsOk() const noexcept { return error == Error::None; }
 };
 
 /// <summary>완결된 본문을 동기적으로 받는 함수다.</summary>
@@ -64,10 +61,7 @@ struct EncodeResult
     std::size_t required = 0;
     std::size_t written = 0;
 
-    [[nodiscard]] bool IsOk() const noexcept
-    {
-        return error == Error::None;
-    }
+    [[nodiscard]] bool IsOk() const noexcept { return error == Error::None; }
 };
 
 /// <summary>
@@ -99,8 +93,8 @@ public:
     /// bytes는 생성 때 넘긴 storage와 겹치지 않아야 한다. Reader는 미완성 바이트를 압축할 수
     /// 있으므로, 그 저장소를 입력으로 재사용하면 호출자가 기대한 입력 순서를 보장할 수 없다.
     /// </remarks>
-    [[nodiscard]] AppendResult Append(
-        std::span<const std::byte> bytes, void* const context, const FrameCallback callback) noexcept
+    [[nodiscard]] AppendResult Append(std::span<const std::byte> bytes, void* const context,
+        const FrameCallback callback) noexcept
     {
         if (mTerminalError != Error::None)
         {
@@ -159,10 +153,7 @@ public:
         return mStart == mEnd ? Error::None : Error::InvalidFormat;
     }
 
-    [[nodiscard]] bool HasIncompleteFrame() const noexcept
-    {
-        return mStart != mEnd;
-    }
+    [[nodiscard]] bool HasIncompleteFrame() const noexcept { return mStart != mEnd; }
 
 private:
     [[nodiscard]] static constexpr std::size_t RequiredStorageSize(
@@ -177,9 +168,9 @@ private:
     {
         const std::byte* const bytes = mStorage.data() + mStart;
         return static_cast<std::uint32_t>(std::to_integer<unsigned char>(bytes[0])) |
-            (static_cast<std::uint32_t>(std::to_integer<unsigned char>(bytes[1])) << 8U) |
-            (static_cast<std::uint32_t>(std::to_integer<unsigned char>(bytes[2])) << 16U) |
-            (static_cast<std::uint32_t>(std::to_integer<unsigned char>(bytes[3])) << 24U);
+               (static_cast<std::uint32_t>(std::to_integer<unsigned char>(bytes[1])) << 8U) |
+               (static_cast<std::uint32_t>(std::to_integer<unsigned char>(bytes[2])) << 16U) |
+               (static_cast<std::uint32_t>(std::to_integer<unsigned char>(bytes[3])) << 24U);
     }
 
     // 길이 머리는 본문을 다 받기 전에 검증한다. 0바이트 프레임도 여기서는 완결 프레임이며,
@@ -203,8 +194,8 @@ private:
             }
 
             mInvokingCallback = true;
-            callback(context, std::span<const std::byte>(
-                                  mStorage.data() + mStart + HeaderSize, bodyLength));
+            callback(context,
+                std::span<const std::byte>(mStorage.data() + mStart + HeaderSize, bodyLength));
             mInvokingCallback = false;
             if (mTerminalError != Error::None)
             {

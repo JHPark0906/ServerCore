@@ -510,7 +510,6 @@ void UnknownTypePolicyControlsDisconnect()
         "disconnect policy does not allocate a second diagnostic for the session reason");
     ServerCoreTest::ExpectEqual(
         2, logger->WriteCount(), "disconnect policy also records the unknown type");
-
 }
 
 void HandlerStatusIsPropagatedWithoutDisconnect()

@@ -97,12 +97,31 @@ class IoContext::State
 {
 public:
     /// <summary>스레드를 멈추고 포트를 닫는다. lifecycleMutex를 쥔 채 부른다.</summary>
+    /// <remarks>
+    /// 잠금을 쥔 채 worker를 기다리므로 Start()의 실패 경로에서만 쓴다. 그때는 아직 붙은 소켓이
+    /// 없어 worker가 이 잠금을 잡을 일이 없다. Stop()은 잠금을 놓고 기다린다.
+    /// </remarks>
     void ShutDownLocked();
+
+    /// <summary>worker마다 종료 신호를 하나씩 보낸다. 못 보내면 포트를 닫아 대기를 푼다.</summary>
+    /// <remarks>lifecycleMutex를 쥔 채 부른다.</remarks>
+    void SignalWorkersLocked();
+
+    /// <summary>Stop() 호출끼리 줄 세운다. worker를 기다리는 동안에도 쥐고 있는 잠금이다.</summary>
+    /// <remarks>worker는 이 잠금을 잡지 않으므로 기다리는 동안 쥐어도 교착이 없다.</remarks>
+    std::mutex stopMutex;
 
     std::mutex lifecycleMutex;
     HANDLE completionPort = nullptr;
     std::vector<std::thread> workerThreads;
-    std::atomic<bool> running{ false };
+    /// <summary>돌고 있는지. 수락기가 이 객체보다 오래 쥘 수 있도록 공유한다.</summary>
+    /// <remarks>Acceptor::Stop()이 IoContext 객체에 닿지 않고 멈춤을 확인하는 데 쓴다.</remarks>
+    const std::shared_ptr<std::atomic<bool>> running = std::make_shared<std::atomic<bool>>(false);
+
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+    /// <summary>종료 신호를 다 보낸 직후 부르는 시험 전용 함수다. 부팅 스레드가 Start 전에 건다.</summary>
+    std::function<void()> afterStopSignalHook;
+#endif
 };
 
 void IoContext::State::ShutDownLocked()
@@ -112,6 +131,28 @@ void IoContext::State::ShutDownLocked()
         return;
     }
 
+    SignalWorkersLocked();
+
+    for (std::thread& worker : workerThreads)
+    {
+        if (worker.joinable())
+        {
+            worker.join();
+        }
+    }
+    workerThreads.clear();
+
+    if (completionPort != nullptr)
+    {
+        ::CloseHandle(completionPort);
+        completionPort = nullptr;
+    }
+
+    running->store(false, std::memory_order_release);
+}
+
+void IoContext::State::SignalWorkersLocked()
+{
     // 깨움 신호는 하나에 스레드 하나만 깨운다. 그래서 스레드 수만큼 보낸다.
     bool everySignalWasPosted = true;
     for (std::size_t index = 0; index < workerThreads.size(); ++index)
@@ -131,23 +172,6 @@ void IoContext::State::ShutDownLocked()
         ::CloseHandle(completionPort);
         completionPort = nullptr;
     }
-
-    for (std::thread& worker : workerThreads)
-    {
-        if (worker.joinable())
-        {
-            worker.join();
-        }
-    }
-    workerThreads.clear();
-
-    if (completionPort != nullptr)
-    {
-        ::CloseHandle(completionPort);
-        completionPort = nullptr;
-    }
-
-    running.store(false, std::memory_order_release);
 }
 
 IoContext::IoContext()
@@ -186,7 +210,7 @@ Core::Status IoContext::Start(int workerThreadCount)
     }
 
     mState->completionPort = port;
-    mState->running.store(true, std::memory_order_release);
+    mState->running->store(true, std::memory_order_release);
     try
     {
         mState->workerThreads.reserve(static_cast<std::size_t>(workerThreadCount));
@@ -195,7 +219,7 @@ Core::Status IoContext::Start(int workerThreadCount)
     {
         ::CloseHandle(mState->completionPort);
         mState->completionPort = nullptr;
-        mState->running.store(false, std::memory_order_release);
+        mState->running->store(false, std::memory_order_release);
         return Core::Status::AllocationFailure();
     }
 
@@ -237,13 +261,55 @@ void IoContext::Stop()
     SERVERCORE_ASSERT(
         !IsCurrentThreadIoThread(), "Stop() was called from an I/O thread of this IoContext");
 
+    // worker는 수락 인계의 AssociateSocket에서 lifecycleMutex를 잡는다. 그 잠금을 쥔 채 worker를
+    // 기다리면 둘 다 멈춘다(NET-5). 그래서 Stop() 호출끼리는 stopMutex로 줄 세우고, 기다리는 동안에는
+    // lifecycleMutex를 놓는다. 이것을 고정하는 것은 Transport.IoContextStopDuringAcceptHandoffReturns다.
+    const std::lock_guard<std::mutex> stopGuard(mState->stopMutex);
+    std::vector<std::thread> workers;
+    {
+        const std::lock_guard<std::mutex> guard(mState->lifecycleMutex);
+        if (mState->completionPort == nullptr)
+        {
+            return;
+        }
+
+        // 이 뒤로 AssociateSocket은 Closed를 돌려준다. 멈추는 포트에 새 소켓을 붙이지 않는다.
+        mState->running->store(false, std::memory_order_release);
+        mState->SignalWorkersLocked();
+        workers.swap(mState->workerThreads);
+    }
+
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+    std::function<void()> afterStopSignal;
+    {
+        const std::lock_guard<std::mutex> guard(mState->lifecycleMutex);
+        afterStopSignal = mState->afterStopSignalHook;
+    }
+    if (afterStopSignal)
+    {
+        afterStopSignal();
+    }
+#endif
+
+    for (std::thread& worker : workers)
+    {
+        if (worker.joinable())
+        {
+            worker.join();
+        }
+    }
+
     const std::lock_guard<std::mutex> guard(mState->lifecycleMutex);
-    mState->ShutDownLocked();
+    if (mState->completionPort != nullptr)
+    {
+        ::CloseHandle(mState->completionPort);
+        mState->completionPort = nullptr;
+    }
 }
 
 bool IoContext::IsRunning() const noexcept
 {
-    return mState->running.load(std::memory_order_acquire);
+    return mState->running->load(std::memory_order_acquire);
 }
 
 bool IoContext::IsCurrentThreadIoThread() const noexcept
@@ -256,7 +322,7 @@ Core::Status IoContextAccess::AssociateSocket(IoContext& context, SOCKET socket)
     IoContext::State& state = *context.mState;
     const std::lock_guard<std::mutex> guard(state.lifecycleMutex);
 
-    if (state.completionPort == nullptr)
+    if (state.completionPort == nullptr || !state.running->load(std::memory_order_acquire))
     {
         return Core::Status::Fail(Core::ErrorCode::Closed,
             "the socket was not attached because IoContext is not running");
@@ -271,4 +337,17 @@ Core::Status IoContextAccess::AssociateSocket(IoContext& context, SOCKET socket)
 
     return Core::Status::Ok();
 }
+
+std::shared_ptr<const std::atomic<bool>> IoContextAccess::RunningFlag(IoContext& context) noexcept
+{
+    return context.mState->running;
+}
+
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+void IoContextAccess::SetAfterStopSignalHook(IoContext& context, std::function<void()> hook)
+{
+    const std::lock_guard<std::mutex> guard(context.mState->lifecycleMutex);
+    context.mState->afterStopSignalHook = std::move(hook);
+}
+#endif
 }

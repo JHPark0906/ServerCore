@@ -29,7 +29,8 @@ public:
     SendQueue(const SendQueue&) = delete;
     SendQueue& operator=(const SendQueue&) = delete;
 
-    [[nodiscard]] SERVERCORE_TEST_API Core::Status Enqueue(std::span<const std::byte> bytes) noexcept;
+    [[nodiscard]] SERVERCORE_TEST_API Core::Status Enqueue(
+        std::span<const std::byte> bytes) noexcept;
     [[nodiscard]] SERVERCORE_TEST_API bool Empty() const noexcept;
     [[nodiscard]] SERVERCORE_TEST_API std::span<std::byte> Front() noexcept;
     SERVERCORE_TEST_API void Consume(std::size_t bytes) noexcept;
@@ -40,8 +41,9 @@ public:
     // Mark send admission closed under the transport lock, then use
     // SendNotificationScope outside the lock to dispatch terminal notifications.
     SERVERCORE_TEST_API void CloseCapacityWaits() noexcept;
-    SERVERCORE_TEST_API Core::Result<SendCapacitySubscription> WaitForCapacity(std::size_t requiredBytes,
-        std::function<void(Core::Status)> callback, std::stop_token cancellation);
+    SERVERCORE_TEST_API Core::Result<SendCapacitySubscription> WaitForCapacity(
+        std::size_t requiredBytes, std::function<void(Core::Status)> callback,
+        std::stop_token cancellation);
 
 private:
     std::shared_ptr<SendBudget> mBudget;

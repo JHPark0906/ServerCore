@@ -1,16 +1,16 @@
 #pragma once
 
-#include "ServerCore/Core/Error.h"
-#include "ServerCore/Core/Endpoint.h"
 #include "ServerCore/Core/CompletionSubscription.h"
-#include "ServerCore/Protocol/Message.h"
+#include "ServerCore/Core/Endpoint.h"
+#include "ServerCore/Core/Error.h"
 #include "ServerCore/Protocol/BinaryMessage.h"
+#include "ServerCore/Protocol/Message.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <string_view>
 #include <stop_token>
+#include <string_view>
 #include <utility>
 
 /// <summary>
@@ -95,7 +95,9 @@ public:
 
     /// Available on explicitly binary-mode Host sessions; copies bytes into the bounded send queue.
     [[nodiscard]] virtual Core::Status SendBinary(std::uint32_t, std::span<const std::byte>)
-    { return Core::Status::FailWithoutMessage(Core::ErrorCode::Unimplemented); }
+    {
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::Unimplemented);
+    }
 
     /// <summary>검증을 마친 신원이 있음을 세션 수명 상태에 반영한다.</summary>
     /// <remarks>
@@ -115,11 +117,13 @@ public:
     /// 구현은 기존 Send를 재사용해 소스 호환성을 보존한다. 호출 후 송신 큐가 바이트를 소유한다.</remarks>
     [[nodiscard]] virtual Core::Status SendPrepared(const Protocol::PreparedMessage& prepared)
     {
-        if (prepared.Size() == 0) return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+        if (prepared.Size() == 0)
+            return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
         auto message = Protocol::ParseMessage(prepared.Bytes());
-        if (!message.IsOk()) return std::move(message).TakeStatus();
+        if (!message.IsOk())
+            return std::move(message).TakeStatus();
         const auto& value = message.Value();
-        return Send({value.Type(), value.Body(), value.Sequence(), value.Error()});
+        return Send({ value.Type(), value.Body(), value.Sequence(), value.Error() });
     }
 
     /// <summary>전송 큐의 미완료 바이트 관측값이다. 예약이나 이후 송신 성공을 보장하지 않는다.</summary>
@@ -133,10 +137,15 @@ public:
     // dispatch state changes to the application's executor. Closing/disconnect
     // cancels the wait. Reset the subscription to quiesce capture access.
     // Custom session implementations may opt out with Unimplemented.
+    // ServerHost 세션에서 callback이 세션 잠금 밖에서 불린다는 것은
+    // Runtime.HostCapacityCallbackOutsideSessionLocks가 Disconnect·SendAndDisconnect·유휴 만료·drain
+    // 경로에서 고정한다. 사용자 정의 세션 구현에는 이 시험이 닿지 않는다.
     [[nodiscard]] virtual Core::Result<Core::CompletionSubscription> WaitForSendCapacity(
         std::size_t, std::function<void(Core::Status)>, std::stop_token = {})
-    { return Core::Result<Core::CompletionSubscription>::FromStatus(
-        Core::Status::FailWithoutMessage(Core::ErrorCode::Unimplemented)); }
+    {
+        return Core::Result<Core::CompletionSubscription>::FromStatus(
+            Core::Status::FailWithoutMessage(Core::ErrorCode::Unimplemented));
+    }
 
     /// <summary>마지막 봉투를 보낼 큐에 넣고, 그 큐를 비운 뒤 이 세션을 닫는다.</summary>
     /// <param name="fields">type, body, seq, error를 담은 마지막 직렬화 전 봉투 필드.</param>
@@ -154,9 +163,28 @@ public:
     /// peer 종료가 오면 즉시 종료가 drain을 중단해 마지막 바이트가 버려질 수 있다.
     /// ServerHost는 ServerHostOptions::gracefulCloseTimeout도 적용한다. Closing 시작 뒤 그
     /// 시간이 지나면 수신 활동과 관계없이 남은 송신을 버리고 닫으므로, 성공은 도착 보장이 아니다.
+    ///
+    /// ServerHost 세션은 큐를 비운 뒤 보내기 쪽만 닫고 상대가 닫을 때까지 들어오는 바이트를 읽어
+    /// 버린다. 그래서 OnSessionClosed는 상대가 연결을 닫거나 gracefulCloseTimeout이 지난 뒤에 온다
+    /// (Runtime.HostBinaryGracefulClose는 상대가 닫은 뒤 종료 통지가 오는 것을 본다).
+    ///
+    /// Binary 모드 ServerHost 세션에서는 상태를 바꾸지 않고 InvalidArgument를 돌려준다. 그 세션의
+    /// 종료 경로는 SendBinaryAndDisconnect다(Runtime.HostBinaryGracefulClose).
     /// </remarks>
     [[nodiscard]] virtual Core::Status SendAndDisconnect(
         const Protocol::MessageFields& fields, Core::Status reason) = 0;
+
+    /// <summary>마지막 Binary 봉투를 보낼 큐에 넣고, 그 큐를 비운 뒤 이 세션을 닫는다.</summary>
+    /// <remarks>
+    /// SendAndDisconnect의 Binary 짝이다. 순서·성공·기한의 뜻은 SendAndDisconnect와 같다.
+    /// JSON 모드 ServerHost 세션에서는 상태를 바꾸지 않고 InvalidArgument를 돌려준다. 사용자 정의
+    /// 세션의 기본 구현은 Unimplemented다.
+    /// </remarks>
+    [[nodiscard]] virtual Core::Status SendBinaryAndDisconnect(
+        std::uint32_t, std::span<const std::byte>, Core::Status)
+    {
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::Unimplemented);
+    }
 
     /// <summary>body만 가진 보통 봉투를 보내는 편의 함수다.</summary>
     /// <remarks>

@@ -18,7 +18,11 @@ public:
             if (!mReady)
             {
                 for (auto& slot : mSources)
-                    if (!slot.IsPending()) { slot = source; return Core::Status::Ok(); }
+                    if (!slot.IsPending())
+                    {
+                        slot = source;
+                        return Core::Status::Ok();
+                    }
                 return Core::Status::FailWithoutMessage(Core::ErrorCode::WouldBlock);
             }
             result = mResult;
@@ -26,13 +30,15 @@ public:
         (void)source.Complete(result);
         return Core::Status::Ok();
     }
-    Core::Result<Core::CompletionSubscription> Subscribe(std::function<void(Core::Status)> callback,
-        std::stop_token cancellation)
+    Core::Result<Core::CompletionSubscription> Subscribe(
+        std::function<void(Core::Status)> callback, std::stop_token cancellation)
     {
         auto result = Core::CompletionSubscription::Create(std::move(callback));
-        if (!result.IsOk()) return result;
+        if (!result.IsOk())
+            return result;
         auto status = Observe(result.Value().GetSource());
-        if (!status.IsOk()) return Core::Result<Core::CompletionSubscription>::FromStatus(std::move(status));
+        if (!status.IsOk())
+            return Core::Result<Core::CompletionSubscription>::FromStatus(std::move(status));
         result.Value().BindCancellation(cancellation);
         return result;
     }
@@ -41,13 +47,16 @@ public:
         std::array<Core::CompletionSource, 16> sources;
         {
             const std::lock_guard guard(mMutex);
-            if (mReady) return;
+            if (mReady)
+                return;
             mReady = true;
             mResult = result;
             sources.swap(mSources);
         }
-        for (const auto& source : sources) (void)source.Complete(result);
+        for (const auto& source : sources)
+            (void)source.Complete(result);
     }
+
 private:
     std::mutex mMutex;
     std::array<Core::CompletionSource, 16> mSources;

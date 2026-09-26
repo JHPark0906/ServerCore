@@ -21,6 +21,10 @@ pub struct Options {
     pub max_event_bytes: usize,
     pub connection_send_bytes: usize,
     pub total_send_bytes: usize,
+    /// Each connection's own receive budget (native defaults 64 events and
+    /// 1 MiB; count at most 65536). Held events count until dropped.
+    pub max_connection_event_count: usize,
+    pub max_connection_event_bytes: usize,
     /// Explicitly defaults to IPv6-only on both operating systems. False permits
     /// IPv4-mapped peers on an IPv6 listener; ignored for IPv4 literals.
     pub ipv6_only: bool,
@@ -43,6 +47,8 @@ impl Default for Options {
             max_event_bytes: raw.max_event_bytes,
             connection_send_bytes: raw.connection_send_bytes,
             total_send_bytes: raw.total_send_bytes,
+            max_connection_event_count: raw.max_connection_event_count,
+            max_connection_event_bytes: raw.max_connection_event_bytes,
             ipv6_only: true,
         }
     }
@@ -61,6 +67,8 @@ impl Options {
             max_event_bytes: self.max_event_bytes,
             connection_send_bytes: self.connection_send_bytes,
             total_send_bytes: self.total_send_bytes,
+            max_connection_event_count: self.max_connection_event_count,
+            max_connection_event_bytes: self.max_connection_event_bytes,
         }
     }
 }
@@ -129,8 +137,10 @@ impl Drop for ConnectionInner {
         unsafe { sys::sc_tcp_connection_destroy(self.handle.as_ptr()) };
     }
 }
-/// Last clone closes the connection. Receive overflow closes with TooLarge;
-/// pause/resume controls native reads, with one already-posted read allowed.
+/// Last clone closes the connection. A full receive budget (this connection's
+/// or the server-wide one) pauses its reads until held events are dropped; it
+/// does not close the connection. pause/resume is a separate caller pause that
+/// cannot lift a full budget. Either way one already-posted read is allowed.
 #[derive(Clone)]
 pub struct Connection(Arc<ConnectionInner>);
 impl Connection {
@@ -240,8 +250,46 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 
+    /// Explicitly skips a test when IPv6 loopback is unavailable. The notice is
+    /// written to stderr directly so the test harness does not capture it, and
+    /// SERVERCORE_REQUIRE_IPV6 (set by CI) turns the skip into a failure.
+    fn ipv6_loopback_or_skip(test: &str) -> bool {
+        if std::net::UdpSocket::bind("[::1]:0").is_ok() {
+            return true;
+        }
+        if std::env::var_os("SERVERCORE_REQUIRE_IPV6").is_some_and(|v| !v.is_empty() && v != "0") {
+            panic!("{test}: IPv6 loopback ::1 is unavailable while SERVERCORE_REQUIRE_IPV6 requires it");
+        }
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            format!("SKIPPED {test}: IPv6 loopback ::1 is unavailable\n").as_bytes(),
+        );
+        false
+    }
+
+    #[test]
+    fn connection_event_budget_reaches_native_options() {
+        // Defaults are read back from sc_tcp_options_init (Net.h: 64, 1 MiB).
+        let defaults = Options::default();
+        assert_eq!(defaults.max_connection_event_count, 64);
+        assert_eq!(defaults.max_connection_event_bytes, 1024 * 1024);
+        for invalid in [
+            Options { max_connection_event_count: 0, ..Options::default() },
+            Options { max_connection_event_count: 65537, ..Options::default() },
+            Options { max_connection_event_bytes: 0, ..Options::default() },
+        ] {
+            assert!(matches!(TcpServer::new(&invalid), Err(Error::INVALID_ARGUMENT)));
+        }
+        let mut limits = Options::default();
+        limits.max_connection_event_count = 65536;
+        assert!(TcpServer::new(&limits).is_ok());
+    }
+
     #[test]
     fn ipv6_and_dual_stack_endpoints_survive_close() {
+        if !ipv6_loopback_or_skip("ipv6_and_dual_stack_endpoints_survive_close") {
+            return;
+        }
         for only in [true, false] {
             let reserved = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
             let port = reserved.local_addr().unwrap().port();

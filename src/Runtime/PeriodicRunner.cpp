@@ -95,6 +95,13 @@ Core::Status PeriodicRunner::Start()
         return Core::Status::Fail(
             Core::ErrorCode::InvalidArgument, "PeriodicRunner period must be positive");
     }
+    // 타이머는 steady_clock 시각에 주기를 더한다. 긴 주기는 그 덧셈을 넘치게 하므로 TickRunner와
+    // 같은 24시간 상한을 둔다.
+    if (state->period > std::chrono::hours(24))
+    {
+        return Core::Status::Fail(
+            Core::ErrorCode::InvalidArgument, "PeriodicRunner period cannot exceed 24 hours");
+    }
     if (!state->callback)
     {
         return Core::Status::Fail(

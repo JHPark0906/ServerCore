@@ -50,6 +50,11 @@ struct OutboundMetrics
 {
     std::size_t pending = 0, retainedBytes = 0;
     std::uint64_t enqueued = 0, sent = 0, replaced = 0, expired = 0, discarded = 0;
+    /// <summary>
+    /// 스케줄러가 가득 차 깨움 타이머를 곧바로 못 걸고, 실행 중인 자기 타이머가 슬롯을 돌려줄 때까지
+    /// 미룬 횟수. 그동안 만료 폐기와 연속 펌프가 그만큼 늦어진다.
+    /// </summary>
+    std::uint64_t deferredWakes = 0;
 };
 struct OutboundSink
 {
@@ -69,6 +74,12 @@ struct OutboundSink
 // TimerScheduler drives explicit expiry deadlines and bounded pump continuation,
 // not polling. It must remain usable until queue Close/drain and callbacks retire.
 // Queue destruction cancels local work; it never closes the underlying transport.
+/// <remarks>
+/// 큐는 스케줄러 슬롯을 대개 하나만 쓴다. 대기 중인 깨움 타이머는 Reschedule로 옮기고, 펌프가 실행 중인
+/// 자기 타이머 안에서 다시 걸어야 하는데 스케줄러가 가득 찼으면 그 타이머가 끝나 슬롯을 돌려줄 때 다시
+/// 건다(deferredWakes, Runtime.OutboundQueueFitsOneSchedulerSlot). 자기 타이머 없이 스케줄러가 가득
+/// 찼거나 돌려받은 슬롯을 다른 쪽이 먼저 가져가면 큐는 WouldBlock으로 끝난다.
+/// </remarks>
 class OutboundQueue
 {
 public:

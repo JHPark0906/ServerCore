@@ -1,7 +1,7 @@
 #include "Net/ConnectionInternal.h"
 
-#include "Net/WinsockInternal.h"
 #include "Net/EndpointInternal.h"
+#include "Net/WinsockInternal.h"
 #include "ServerCore/Core/Assert.h"
 
 #include <cstddef>
@@ -15,23 +15,23 @@
 
 namespace ServerCore::Net
 {
-std::shared_ptr<TcpConnection> TcpConnection::Create(
-    SOCKET socket, std::shared_ptr<WinsockScope> winsock, std::shared_ptr<SendBudget> sendBudget,
-    Core::IpEndpoint local,Core::IpEndpoint remote)
+std::shared_ptr<TcpConnection> TcpConnection::Create(SOCKET socket,
+    std::shared_ptr<WinsockScope> winsock, std::shared_ptr<SendBudget> sendBudget,
+    Core::IpEndpoint local, Core::IpEndpoint remote)
 {
     SERVERCORE_ASSERT(socket != INVALID_SOCKET, "Create() was given INVALID_SOCKET");
     SERVERCORE_ASSERT(winsock != nullptr, "Create() was given a null Winsock reference");
 
     return std::make_shared<TcpConnection>(
-        CreationKey{}, socket, std::move(winsock), std::move(sendBudget),local,remote);
+        CreationKey{}, socket, std::move(winsock), std::move(sendBudget), local, remote);
 }
 
 TcpConnection::TcpConnection(CreationKey, SOCKET socket, std::shared_ptr<WinsockScope> winsock,
-    std::shared_ptr<SendBudget> sendBudget,Core::IpEndpoint local,Core::IpEndpoint remote)
+    std::shared_ptr<SendBudget> sendBudget, Core::IpEndpoint local, Core::IpEndpoint remote)
     : mWinsock(std::move(winsock))
     , mSocket(socket)
-    , mLocalEndpoint(local.IsValid()?local:ReadSocketEndpoint(socket,false))
-    , mRemoteEndpoint(remote.IsValid()?remote:ReadSocketEndpoint(socket,true))
+    , mLocalEndpoint(local.IsValid() ? local : ReadSocketEndpoint(socket, false))
+    , mRemoteEndpoint(remote.IsValid() ? remote : ReadSocketEndpoint(socket, true))
     , mSendQueue(std::move(sendBudget))
 {
     mReceiveOperation.kind = IoOperationKind::Receive;
@@ -145,7 +145,8 @@ Core::Status TcpConnection::SendInternal(
             }
 
             result = mSendQueue.Enqueue(bytes);
-            if (!result.IsOk()) return result;
+            if (!result.IsOk())
+                return result;
 
             if (mSendInFlight)
             {
@@ -186,8 +187,9 @@ void TcpConnection::Close()
     MaybeNotifyDisconnected();
 }
 
-// 전송층 자체에는 drain 기한이 없다. ServerHost가 세션의 절대 종료 기한을 검사하고
-// 필요하면 Close로 중단하므로, 여기서는 송신 순서와 겹침 버퍼 수명만 관리한다.
+// 전송층 자체에는 drain 기한도, 보내기를 닫은 뒤 입력을 읽어 버리는 기한도 없다. ServerHost와
+// HttpServer가 종료 기한을 검사하고 필요하면 Close로 중단하므로, 여기서는 송신 순서와 겹침
+// 버퍼 수명만 관리한다.
 void TcpConnection::CloseAfterSend()
 {
     const SendNotificationScope sendNotifications(mSendQueue.Budget());
@@ -252,7 +254,8 @@ Core::Status TcpConnection::ResumeReceive()
         // Winsock overwrite the buffer still borrowed by OnBytesReceived.
         result = StartReceiveLocked();
     }
-    if (!result.IsOk()) MaybeNotifyDisconnected();
+    if (!result.IsOk())
+        MaybeNotifyDisconnected();
     return result;
 }
 
@@ -305,19 +308,33 @@ void TcpConnection::OnReceiveCompleted(
     {
         const std::lock_guard<std::mutex> guard(mMutex);
 
-        SERVERCORE_ASSERT(mReceiveInFlight,
-            "a receive completion arrived without a submitted receive");
+        SERVERCORE_ASSERT(
+            mReceiveInFlight, "a receive completion arrived without a submitted receive");
         keepAlive = std::move(operation.owner);
         mReceiveInFlight = false;
         --mPendingOperations;
 
         // Close()가 먼저 소켓을 닫았다면 이 완료는 취소 정리일 뿐이다. 그 사유를
         // WSA_OPERATION_ABORTED로 덮지 않고, 종료 중 새 오류 문자열도 만들지 않는다.
-        if (!mClosed.load(std::memory_order_relaxed))
+        if (mLingering)
+        {
+            // 보내기 쪽을 닫은 뒤 들어온 바이트는 관찰자에게 올리지 않고 버린다. 상대가 보내기를
+            // 닫았거나 오류가 나면 그때 소켓을 닫는다. 받은 것을 다 읽은 뒤이므로 RST가 아니다.
+            if (errorCode != 0 || bytesTransferred == 0)
+            {
+                CloseSocketLocked();
+            }
+            else
+            {
+                // 실패하면 StartReceiveLocked가 소켓을 닫는다. 아래 통지가 기존 사유를 전한다.
+                (void)StartReceiveLocked();
+            }
+        }
+        else if (!mClosed.load(std::memory_order_relaxed))
         {
             if (errorCode != 0)
             {
-                MarkClosedLocked(MakeSocketFailure("WSARecv", static_cast<int>(errorCode)));
+                MarkClosedLocked(MakeWin32Failure("WSARecv completion", errorCode));
                 CloseSocketLocked();
             }
             else if (bytesTransferred == 0)
@@ -356,8 +373,9 @@ void TcpConnection::OnReceiveCompleted(
         mReceiveCallbackActive = false;
 
         // 관찰자가 수신 예산 고갈 같은 이유로 Close()했으면 새 WSARecv를 만들지 않는다. 닫힌
-        // 경로의 Status조차 만들 필요가 없고, 아래 통지가 기존 종료 사유를 전달한다.
-        if (!mClosed.load(std::memory_order_relaxed))
+        // 경로의 Status조차 만들 필요가 없고, 아래 통지가 기존 종료 사유를 전달한다. 관찰자가
+        // 이 콜백 안에서 CloseAfterSend()로 보내기 쪽을 닫았다면 남은 입력을 버리는 수신을 건다.
+        if (!mClosed.load(std::memory_order_relaxed) || mLingering)
         {
             // 실패는 이미 닫힘 사유로 기록되고 소켓도 닫힌다. 그래서 여기서 값을 다시 다루지
             // 않고 일부러 버린다. 아래 MaybeNotifyDisconnected가 그 결과를 관찰자에게 전한다.
@@ -389,7 +407,7 @@ void TcpConnection::OnSendCompleted(
         }
         else if (errorCode != 0)
         {
-            MarkClosedLocked(MakeSocketFailure("WSASend", static_cast<int>(errorCode)));
+            MarkClosedLocked(MakeWin32Failure("WSASend completion", errorCode));
             CloseSocketLocked();
         }
         else if (bytesTransferred == 0)
@@ -418,7 +436,7 @@ void TcpConnection::OnSendCompleted(
 
 Core::Status TcpConnection::StartReceiveLocked()
 {
-    if (mClosed.load(std::memory_order_relaxed) || mSocket == INVALID_SOCKET)
+    if ((mClosed.load(std::memory_order_relaxed) && !mLingering) || mSocket == INVALID_SOCKET)
     {
         return Core::Status::FailWithoutMessage(Core::ErrorCode::Closed);
     }
@@ -426,8 +444,11 @@ Core::Status TcpConnection::StartReceiveLocked()
     // Resume is legal before the accept callback returns and while an observer
     // borrows the receive buffer. Only Start/callback completion can cross those
     // boundaries; an already submitted receive is allowed to finish when paused.
-    if (!mStarted || mReceivePaused.load(std::memory_order_relaxed) ||
-        mReceiveInFlight || mReceiveCallbackActive)
+    // A lingering close delivers nothing, so it drains input before Start and
+    // while paused.
+    if (!mLingering && (!mStarted || mReceivePaused.load(std::memory_order_relaxed)))
+        return Core::Status::Ok();
+    if (mReceiveInFlight || mReceiveCallbackActive)
         return Core::Status::Ok();
 
     WSABUF buffer{};
@@ -558,6 +579,7 @@ void TcpConnection::CloseSocketLocked()
     ::shutdown(mSocket, SD_BOTH);
     ::closesocket(mSocket);
     mSocket = INVALID_SOCKET;
+    mLingering = false;
 }
 
 void TcpConnection::CloseSocketAfterSendLocked()
@@ -567,12 +589,16 @@ void TcpConnection::CloseSocketAfterSendLocked()
         return;
     }
 
-    // SD_RECEIVE까지 함께 내리면 아직 읽지 않은 inbound data가 있을 때 TCP reset을 낼 수 있다.
-    // 이 경로는 마지막 송신을 먼저 보내려는 것이므로, 보낼 쪽만 내린다. 기본 linger 설정의
-    // closesocket()은 남은 TCP 송신을 background graceful close로 처리한다.
+    // 여기서 곧바로 closesocket()하면 커널 수신 버퍼에 읽지 않은 바이트가 있거나 그 뒤에 바이트가
+    // 더 올 때 TCP가 FIN 대신 RST를 보내고, 아직 전송하지 못한 송신 바이트를 버린다(NET-2). 그래서
+    // 보낼 쪽만 내려 FIN을 보내고, 상대가 보내기를 닫을 때까지 들어오는 바이트를 읽어 버린다.
+    // 이 경로를 고정하는 것은 Transport.CloseAfterSendWithUnreadInputDeliversQueuedBytes다.
     ::shutdown(mSocket, SD_SEND);
-    ::closesocket(mSocket);
-    mSocket = INVALID_SOCKET;
+    mLingering = true;
+
+    // 이미 걸린 수신이나 실행 중인 수신 콜백이 있으면 그 완료 경로가 다음 수신을 건다. 실패하면
+    // StartReceiveLocked가 소켓을 닫고 mLingering을 내린다.
+    (void)StartReceiveLocked();
 }
 
 void TcpConnection::FinishCloseAfterSendLocked()

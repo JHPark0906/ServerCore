@@ -1,4 +1,4 @@
-//! Raw ServerCore ABI v1. Every pointer/length and ownership rule in the C
+//! Raw ServerCore ABI v2. Every pointer/length and ownership rule in the C
 //! headers is the caller's responsibility; prefer the `servercore` crate.
 #![allow(non_camel_case_types)]
 
@@ -26,7 +26,7 @@ pub use observability::*;
 pub use readiness::*;
 pub use runtime::*;
 pub use web_extensions::*;
-pub const SC_ABI_VERSION: u32 = 1;
+pub const SC_ABI_VERSION: u32 = 2;
 pub type sc_status = i32;
 pub const SC_OK: sc_status = 0;
 pub const SC_INVALID_ARGUMENT: sc_status = 1;
@@ -108,7 +108,21 @@ pub struct sc_web_options {
     pub handler_timeout_ms: u32,
     pub stream_idle_timeout_ms: u32,
     pub send_stall_timeout_ms: u32,
+    pub reserved2: u32,
+    pub max_ws_connection_event_count: usize,
+    pub max_ws_connection_event_bytes: usize,
 }
+// ABI 2 layout of Web.h on 64-bit targets.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<sc_web_options>() == 168);
+    assert!(offset_of!(sc_web_options, max_chunk_bytes) == 128);
+    assert!(offset_of!(sc_web_options, send_stall_timeout_ms) == 144);
+    assert!(offset_of!(sc_web_options, reserved2) == 148);
+    assert!(offset_of!(sc_web_options, max_ws_connection_event_count) == 152);
+    assert!(offset_of!(sc_web_options, max_ws_connection_event_bytes) == 160);
+};
 pub const SC_WEB_REQUEST: u32 = 1;
 pub const SC_WEB_WEBSOCKET: u32 = 2;
 #[repr(C)]
@@ -164,7 +178,17 @@ pub struct sc_tcp_options {
     pub max_event_bytes: usize,
     pub connection_send_bytes: usize,
     pub total_send_bytes: usize,
+    pub max_connection_event_count: usize,
+    pub max_connection_event_bytes: usize,
 }
+// ABI 2 layout of Net.h on 64-bit targets.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<sc_tcp_options>() == 88);
+    assert!(offset_of!(sc_tcp_options, max_connection_event_count) == 72);
+    assert!(offset_of!(sc_tcp_options, max_connection_event_bytes) == 80);
+};
 pub const SC_TCP_BYTES: u32 = 1;
 pub const SC_TCP_CLOSED: u32 = 2;
 #[repr(C)]

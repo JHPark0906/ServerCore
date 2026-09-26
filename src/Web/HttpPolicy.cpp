@@ -2,6 +2,7 @@
 #include "ServerCore/Web/RequestData.h"
 #include "Web/PolicyInternal.h"
 #include "Web/WebProtocol.h"
+#include <algorithm>
 #include <atomic>
 #include <set>
 
@@ -356,9 +357,7 @@ Result<HttpPolicyStep> CorsPolicy(CorsOptions options)
                     return Result<HttpPolicyResult>::FromValue(std::move(result));
                 if (!Origin(*origin.Value()))
                     return Fail<HttpPolicyResult>(ErrorCode::InvalidFormat);
-                if (!wildcard &&
-                    std::find(options.allowedOrigins.begin(), options.allowedOrigins.end(),
-                        *origin.Value()) == options.allowedOrigins.end())
+                if (!wildcard && !std::ranges::contains(options.allowedOrigins, *origin.Value()))
                     return Result<HttpPolicyResult>::FromValue(Rejected(403));
                 result.responseHeaders.emplace_back(
                     "access-control-allow-origin", wildcard ? "*" : std::string(*origin.Value()));
@@ -371,8 +370,7 @@ Result<HttpPolicyStep> CorsPolicy(CorsOptions options)
                 {
                     if (!Detail::Token(*method.Value()))
                         return Fail<HttpPolicyResult>(ErrorCode::InvalidFormat);
-                    if (std::find(options.allowedMethods.begin(), options.allowedMethods.end(),
-                            *method.Value()) == options.allowedMethods.end())
+                    if (!std::ranges::contains(options.allowedMethods, *method.Value()))
                         return Result<HttpPolicyResult>::FromValue(Rejected(403));
                     auto requested = Single(request.headers, "access-control-request-headers");
                     if (!requested.IsOk())
@@ -389,11 +387,9 @@ Result<HttpPolicyStep> CorsPolicy(CorsOptions options)
                             auto name = Detail::Lower(Detail::Trim(remaining.substr(0, comma)));
                             if (!Detail::Token(name) || allowed.size() >= 128)
                                 return Fail<HttpPolicyResult>(ErrorCode::InvalidFormat);
-                            if (std::find(options.allowedHeaders.begin(),
-                                    options.allowedHeaders.end(),
-                                    name) == options.allowedHeaders.end())
+                            if (!std::ranges::contains(options.allowedHeaders, name))
                                 return Result<HttpPolicyResult>::FromValue(Rejected(403));
-                            if (std::find(allowed.begin(), allowed.end(), name) == allowed.end())
+                            if (!std::ranges::contains(allowed, name))
                                 allowed.push_back(std::move(name));
                             if (comma == std::string_view::npos)
                                 break;

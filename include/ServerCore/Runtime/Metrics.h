@@ -1,7 +1,7 @@
 #pragma once
 
-#include "ServerCore/Session/Session.h"
 #include "ServerCore/Observability/Metrics.h"
+#include "ServerCore/Session/Session.h"
 
 #include <cstddef>
 #include <cstdint>

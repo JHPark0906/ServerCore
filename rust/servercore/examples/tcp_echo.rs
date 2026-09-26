@@ -1,6 +1,6 @@
 use servercore::{
     block_on,
-    net::{EventKind, Options, TcpServer},
+    net::{Connection, EventKind, Options, TcpServer},
 };
 
 fn main() -> servercore::Result<()> {
@@ -19,13 +19,20 @@ fn main() -> servercore::Result<()> {
     block_on(async {
         loop {
             let mut connection = server.accept().await?;
-            loop {
-                let event = connection.next().await?;
-                if event.kind()? == EventKind::Closed {
-                    break;
-                }
-                connection.send_async(event.bytes()).await?;
+            // A failure on one connection ends only that connection.
+            if let Err(error) = echo(&mut connection).await {
+                eprintln!("connection failed: {error}");
             }
         }
     })
+}
+
+async fn echo(connection: &mut Connection) -> servercore::Result<()> {
+    loop {
+        let event = connection.next().await?;
+        if event.kind()? == EventKind::Closed {
+            return Ok(());
+        }
+        connection.send_async(event.bytes()).await?;
+    }
 }

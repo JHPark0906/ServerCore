@@ -1,16 +1,22 @@
 #include "Net/DatagramSocket.h"
+#include "Runtime/TransportTestAccess.h"
 #include "ServerCore/Runtime/DatagramTransport.h"
 #include "TestHarness.h"
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 namespace
 {
 using namespace ServerCore;
+namespace TA = ServerCore::Runtime::TestAccess;
 using ServerCoreTest::ExpectTrue;
 using namespace std::chrono_literals;
 namespace Codec = Protocol::DatagramCodec;
@@ -41,6 +47,36 @@ template <class F> bool Wait(F&& predicate)
         std::this_thread::sleep_for(1ms);
     }
     return true;
+}
+bool ExpectReceivedSequence(Net::DatagramSocket& peer, std::span<std::byte> buffer,
+    std::uint64_t expected, std::string_view what)
+{
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    Net::DatagramReceiveResult received;
+    do
+    {
+        received = peer.Receive(buffer);
+        if (received.status.Code() != Core::ErrorCode::WouldBlock ||
+            std::chrono::steady_clock::now() >= deadline)
+            break;
+        std::this_thread::sleep_for(1ms);
+    } while (true);
+
+    const auto decoded = received.status.IsOk() && received.bytes <= buffer.size()
+                             ? Codec::Decode(buffer.first(received.bytes))
+                             : std::nullopt;
+    if (received.status.IsOk() && decoded && decoded->sequence == expected)
+        return true;
+
+    auto details = std::string(what) +
+                   " (status_code=" + std::to_string(static_cast<int>(received.status.Code())) +
+                   ", bytes=" + std::to_string(received.bytes) +
+                   ", expected_sequence=" + std::to_string(expected) + ", received_sequence=" +
+                   (decoded ? std::to_string(decoded->sequence) : "<none>") + ")";
+    if (!received.status.Message().empty())
+        details += ": " + received.status.Message();
+    ExpectTrue(false, details);
+    return false;
 }
 void Readiness()
 {
@@ -233,6 +269,146 @@ void PumpAndPressure()
         transport.StopReceiving().IsOk(), "concurrent callback close remains externally joinable");
     ExpectTrue(executor->Stop().IsOk(), "executor stops after pump");
 }
+/// <summary>모니터 스레드를 readable 콜백 안에 세워 두고, 타이머 스레드의 재무장이 그 사이에 끝나게 한다.</summary>
+struct PumpInterleavingGate final : TA::IReceivePumpGate
+{
+    std::mutex mutex;
+    std::condition_variable wake;
+    bool armed = false, monitorWaiting = false, rearmed = false, forced = false;
+    std::thread::id monitor;
+    void AfterCompletionSubscribed() noexcept override
+    {
+        std::unique_lock guard(mutex);
+        if (!armed)
+            return;
+        armed = false;
+        monitor = std::this_thread::get_id();
+        monitorWaiting = true;
+        wake.notify_all();
+        forced = wake.wait_for(guard, 5s, [&] { return rearmed; });
+        monitorWaiting = false;
+        wake.notify_all();
+    }
+    void AfterRearmPublished() noexcept override
+    {
+        const std::lock_guard guard(mutex);
+        if (monitorWaiting && std::this_thread::get_id() != monitor)
+        {
+            rearmed = true;
+            wake.notify_all();
+        }
+    }
+    bool AwaitMonitorWaiting()
+    {
+        std::unique_lock guard(mutex);
+        return wake.wait_for(guard, 5s, [&] { return monitorWaiting; });
+    }
+    bool AwaitForced()
+    {
+        std::unique_lock guard(mutex);
+        return wake.wait_for(guard, 5s, [&] { return forced; });
+    }
+};
+/// <summary>교착은 소멸자까지 매달리게 하므로, 알린 뒤 프로세스를 끝내 제한 시간 안에 실패로 닫는다.</summary>
+[[noreturn]] void FailDeadlocked(std::string_view what)
+{
+    ExpectTrue(false, what);
+    std::fflush(stderr);
+    std::_Exit(EXIT_FAILURE);
+}
+// EXEC-2: 모니터 스레드가 readable 콜백 안에서 완료 구독을 받은 직후, 타이머 스레드의 완료 콜백이
+// 재무장을 끝내는 창. 재무장이 교체된 readable 구독의 콜백(모니터 스레드)을 기다리고, 모니터
+// 스레드는 넘기지 못한 완료 구독의 콜백(타이머 스레드)을 기다리면 수신이 영구히 멈춘다.
+void PumpRearmDoesNotWaitOnMonitor()
+{
+    auto gate = std::make_shared<PumpInterleavingGate>();
+    TA::InstallReceivePumpGate(gate);
+    auto executor = std::make_shared<Runtime::TaskExecutor>();
+    ExpectTrue(executor->Start({ 1, 4, 4096 }).IsOk(), "start pump executor");
+    Runtime::DatagramTransport transport;
+    Net::DatagramSocket peer;
+    ExpectTrue(transport.Bind("127.0.0.1", 0).IsOk() && peer.Bind("127.0.0.1", 0).IsOk(),
+        "bind interleaving sockets");
+    auto token = transport.RegisterSession(Id);
+    if (!token.IsOk())
+        return;
+    std::atomic<unsigned> calls = 0;
+    auto started = transport.StartReceiving(
+        executor, [](const auto&) { return true; },
+        [&](const auto&)
+        {
+            // 첫 배치는 모니터 스레드가 gate에 들어선 뒤에 끝나야 완료 콜백이 타이머 스레드에서 돈다.
+            if (calls.load() == 0)
+                (void)gate->AwaitMonitorWaiting();
+            ++calls;
+        });
+    ExpectTrue(started.IsOk(), "start interleaving pump");
+    {
+        const std::lock_guard guard(gate->mutex);
+        gate->armed = true;
+    }
+    ExpectTrue(
+        peer.Send(transport.LocalEndpoint(), Packet(token.Value(), 1)).IsOk(), "send first packet");
+    ExpectTrue(
+        gate->AwaitForced(), "timer-thread rearm completed while the monitor callback waited");
+    ExpectTrue(peer.Send(transport.LocalEndpoint(), Packet(token.Value(), 2)).IsOk(),
+        "send second packet");
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (calls.load() < 2)
+    {
+        if (std::chrono::steady_clock::now() >= deadline)
+            FailDeadlocked("receive pump keeps delivering after the interleaving");
+        std::this_thread::sleep_for(1ms);
+    }
+    ExpectTrue(transport.SnapshotMetrics().pumpBatches >= 2, "both batches ran on the pump");
+    ExpectTrue(transport.StopReceiving().IsOk(), "pump stops after the interleaving");
+    TA::ClearReceivePumpGate(gate);
+    transport.Close();
+    ExpectTrue(executor->Stop().IsOk(), "executor stops after interleaving pump");
+}
+// EXEC-7: 배치 타이머가 Ok가 아닌 결과로 끝나면(예: 선언한 캡처 바이트가 실행기 한도보다 커서 TooLarge)
+// 펌프는 멈추면서도 pumpFailures를 올리지 않아, StartReceiving이 Ok를 돌려준 뒤 조용히 수신이 끊겼다.
+void PumpCountsBatchFailures()
+{
+    auto executor = std::make_shared<Runtime::TaskExecutor>();
+    ExpectTrue(executor->Start({ 1, 4, 64 }).IsOk(), "start small-budget executor");
+    Runtime::DatagramTransport transport;
+    Net::DatagramSocket peer;
+    ExpectTrue(transport.Bind("127.0.0.1", 0).IsOk() && peer.Bind("127.0.0.1", 0).IsOk(),
+        "bind failure sockets");
+    auto token = transport.RegisterSession(Id);
+    if (!token.IsOk())
+        return;
+    // 정상 정지는 실패로 세지 않는다.
+    Runtime::DatagramReceiveOptions fits;
+    fits.retainedCallbackBytes = 16;
+    ExpectTrue(transport
+                   .StartReceiving(
+                       executor, [](const auto&) { return true; }, [](const auto&) {}, fits)
+                   .IsOk(),
+        "start fitting pump");
+    ExpectTrue(transport.StopReceiving().IsOk(), "stop fitting pump");
+    ExpectTrue(transport.SnapshotMetrics().pumpFailures == 0, "normal stop is not a pump failure");
+
+    Runtime::DatagramReceiveOptions oversized;
+    oversized.retainedCallbackBytes = 128;
+    std::atomic<unsigned> calls = 0;
+    ExpectTrue(transport
+                   .StartReceiving(
+                       executor, [](const auto&) { return true; }, [&](const auto&) { ++calls; },
+                       oversized)
+                   .IsOk(),
+        "pump starts although its batch cannot fit the executor");
+    ExpectTrue(peer.Send(transport.LocalEndpoint(), Packet(token.Value(), 1)).IsOk(),
+        "send packet to failing pump");
+    (void)Wait([&] { return !transport.SnapshotMetrics().receiving; });
+    const auto metrics = transport.SnapshotMetrics();
+    ExpectTrue(calls == 0 && !metrics.receiving, "rejected batch stops the pump");
+    ExpectTrue(metrics.pumpFailures == 1, "stopped pump reports its batch failure");
+    (void)transport.StopReceiving();
+    transport.Close();
+    ExpectTrue(executor->Stop().IsOk(), "small-budget executor stops");
+}
 void SendLimits()
 {
     Runtime::DatagramTransport transport;
@@ -267,16 +443,13 @@ void SendLimits()
                    metrics.sendNotReady == 1,
         "overlapping details retain unique limited count");
     std::array<std::byte, 1200> buffer{};
-    auto first = peer.Receive(buffer);
-    ExpectTrue(
-        first.status.IsOk() && Codec::Decode(std::span(buffer).first(first.bytes))->sequence == 1,
-        "accepted sequence starts at one");
+    if (!ExpectReceivedSequence(peer, buffer, 1, "accepted sequence starts at one"))
+        return;
     if (!Wait([&] { return transport.SendSerialized(Id, Bytes(maximum)).IsOk(); }))
         return;
-    auto second = peer.Receive(buffer);
-    ExpectTrue(
-        second.status.IsOk() && Codec::Decode(std::span(buffer).first(second.bytes))->sequence == 2,
-        "rejected sends consume no sequence and refill works");
+    if (!ExpectReceivedSequence(
+            peer, buffer, 2, "rejected sends consume no sequence and refill works"))
+        return;
     transport.Close();
     Runtime::DatagramTransport shared;
     options.totalSendRate = { 1, 2400, 1h };
@@ -316,4 +489,8 @@ const ServerCoreTest::CheckRegistration a{ "Runtime.DatagramReadinessAndCancella
 const ServerCoreTest::CheckRegistration b{ "Runtime.DatagramExecutorPressureAndStop",
     PumpAndPressure };
 const ServerCoreTest::CheckRegistration c{ "Runtime.DatagramSendRateLimits", SendLimits };
+const ServerCoreTest::CheckRegistration d{ "Runtime.DatagramPumpRearmDoesNotWaitOnMonitor",
+    PumpRearmDoesNotWaitOnMonitor };
+const ServerCoreTest::CheckRegistration e{ "Runtime.DatagramPumpCountsBatchFailures",
+    PumpCountsBatchFailures };
 }

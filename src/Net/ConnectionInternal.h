@@ -1,9 +1,9 @@
 #pragma once
 
-#include "ServerCore/Net/Connection.h"
-#include "ServerCore/Net/ConnectionFlowControl.h"
 #include "Net/SendBudgetInternal.h"
 #include "Net/SendQueueInternal.h"
+#include "ServerCore/Net/Connection.h"
+#include "ServerCore/Net/ConnectionFlowControl.h"
 
 #ifndef _WIN32
 #include "Net/Linux/ConnectionInternal.h"
@@ -31,7 +31,7 @@ class TcpConnection;
 /// 값의 근거: 없다. 흔한 MTU보다 크다는 것 외에 측정이 없다(미정). 작으면 완료가 잦아지고
 /// 크면 연결마다 그만큼을 든다. 연결 하나가 이 크기를 상시 차지한다는 것이 대가다.
 /// </remarks>
-inline constexpr std::size_t ReceiveBufferSize = 16 * 1024;
+inline constexpr std::size_t ReceiveBufferSize = MaximumReceiveChunkBytes;
 
 /// <summary>연결이 거는 겹침 요청의 공통 부분이다.</summary>
 /// <remarks>
@@ -137,8 +137,14 @@ public:
     void SetObserver(std::weak_ptr<IConnectionObserver> observer) override;
     [[nodiscard]] bool IsOpen() const noexcept override;
     [[nodiscard]] std::size_t QueuedSendBytes() const noexcept override;
-    [[nodiscard]] Core::IpEndpoint LocalEndpoint() const noexcept override { return mLocalEndpoint; }
-    [[nodiscard]] Core::IpEndpoint RemoteEndpoint() const noexcept override { return mRemoteEndpoint; }
+    [[nodiscard]] Core::IpEndpoint LocalEndpoint() const noexcept override
+    {
+        return mLocalEndpoint;
+    }
+    [[nodiscard]] Core::IpEndpoint RemoteEndpoint() const noexcept override
+    {
+        return mRemoteEndpoint;
+    }
     Core::Status PauseReceive() override;
     Core::Status ResumeReceive() override;
     [[nodiscard]] bool IsReceivePaused() const noexcept override;
@@ -188,7 +194,10 @@ private:
     /// <summary>소켓을 실제로 내리고 닫는다. mMutex를 쥔 채 부른다.</summary>
     void CloseSocketLocked();
 
-    /// <summary>보낼 쪽을 정상 종료한 뒤 소켓을 닫는다. mMutex를 쥔 채 부른다.</summary>
+    /// <summary>
+    /// 보낼 쪽을 정상 종료하고, 상대가 보내기를 닫을 때까지 입력을 읽어 버리기 시작한다.
+    /// mMutex를 쥔 채 부른다.
+    /// </summary>
     void CloseSocketAfterSendLocked();
 
     /// <summary>CloseAfterSend 요청이 끝날 조건이면 정상 종료한다. mMutex를 쥔 채 부른다.</summary>
@@ -224,6 +233,13 @@ private:
 
     /// <summary>새 Send를 막고 현재 송신 큐가 빈 뒤 닫으라는 요청이다. mMutex가 지킨다.</summary>
     bool mCloseAfterSendRequested = false;
+
+    /// <summary>보내기 쪽을 닫았고 소켓은 아직 열린 채 입력을 읽어 버리는 중이다.</summary>
+    /// <remarks>
+    /// 이 동안 mClosed는 참이지만 수신 요청 하나나 실행 중인 수신 콜백이 늘 남아 있어, 끊김 통지는
+    /// 소켓을 닫은 뒤로 미뤄진다. 소켓을 닫는 CloseSocketLocked가 이것을 내린다. mMutex가 지킨다.
+    /// </remarks>
+    bool mLingering = false;
 
     /// <summary>커널에 걸려 있는 요청 수. 0이 되어야 끊김을 통지할 수 있다.</summary>
     std::size_t mPendingOperations = 0;

@@ -21,16 +21,22 @@ pub struct sc_tick_options {
     pub max_catch_up: usize,
     pub retained_bytes: usize,
 }
+/// The library fills abi_version and struct_size.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct sc_tick_info {
+    pub abi_version: u32,
+    pub struct_size: u32,
     pub index: u64,
     pub lateness_ns: u64,
     pub skipped: u64,
 }
+/// Output: initialize abi_version and struct_size before the call.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct sc_tick_metrics {
+    pub abi_version: u32,
+    pub struct_size: u32,
     pub executed: u64,
     pub skipped: u64,
     pub last_lateness_ns: u64,
@@ -68,9 +74,12 @@ pub struct sc_outbound_item_options {
     pub expiry_ms: u32,
     pub latest_key: u64,
 }
+/// Output: initialize abi_version and struct_size before the call.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct sc_outbound_metrics {
+    pub abi_version: u32,
+    pub struct_size: u32,
     pub pending: usize,
     pub retained_bytes: usize,
     pub enqueued: u64,
@@ -78,7 +87,22 @@ pub struct sc_outbound_metrics {
     pub replaced: u64,
     pub expired: u64,
     pub discarded: u64,
+    pub deferred_wakes: u64,
 }
+// ABI 2 layout of GameExecution.h on 64-bit targets.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<sc_tick_info>() == 32);
+    assert!(offset_of!(sc_tick_info, index) == 8);
+    assert!(offset_of!(sc_tick_info, skipped) == 24);
+    assert!(size_of::<sc_tick_metrics>() == 40);
+    assert!(offset_of!(sc_tick_metrics, executed) == 8);
+    assert!(offset_of!(sc_tick_metrics, max_lateness_ns) == 32);
+    assert!(size_of::<sc_outbound_metrics>() == 72);
+    assert!(offset_of!(sc_outbound_metrics, pending) == 8);
+    assert!(offset_of!(sc_outbound_metrics, deferred_wakes) == 64);
+};
 extern "C" {
     pub fn sc_tick_options_init(out: *mut sc_tick_options, size: usize) -> sc_status;
     pub fn sc_tick_start(

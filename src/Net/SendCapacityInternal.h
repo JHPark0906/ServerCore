@@ -20,10 +20,11 @@ public:
     void Notify() noexcept;
     Core::Result<SendCapacitySubscription> Wait(std::size_t bytes,
         std::function<void(Core::Status)> callback, std::stop_token cancellation);
+
 private:
     std::shared_ptr<SendBudget> mBudget;
-    std::atomic<std::size_t> mRetainedBytes{0};
-    std::atomic<bool> mClosed{false};
+    std::atomic<std::size_t> mRetainedBytes{ 0 };
+    std::atomic<bool> mClosed{ false };
     std::mutex mMutex;
     Core::CompletionSource mPending;
     std::size_t mRequiredBytes = 0;

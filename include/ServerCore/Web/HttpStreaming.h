@@ -26,7 +26,8 @@ struct SseEvent
 // UTF-8 event framing only; start a chunked text/event-stream response separately.
 // data accepts CR/LF/CRLF and emits one data field per line. Metadata cannot
 // inject additional lines. The encoded event, including framing, must fit maxBytes.
-SERVERCORE_API Core::Result<std::string> EncodeSseEvent(const SseEvent& event, std::size_t maxBytes);
+SERVERCORE_API Core::Result<std::string> EncodeSseEvent(
+    const SseEvent& event, std::size_t maxBytes);
 // One bounded write, with no internal retry. On WouldBlock, wait for write
 // capacity then retry this event. Success means queued, not received by a client.
 SERVERCORE_API Core::Status WriteSseEvent(HttpResponseWriter& writer, const SseEvent& event);
@@ -50,6 +51,10 @@ SERVERCORE_API Core::Status WriteSseEvent(HttpResponseWriter& writer, const SseE
 // Cancellation interrupts capacity waits; blocking filesystem calls themselves
 // are not forcibly interrupted. The writer token is the task's parent token.
 //
+// SendFile은 루트 제한이나 심볼릭 링크 정책을 두지 않는다. 경로는 호출자가 정한 것으로 연다.
+// Windows에서는 드라이브 상대 경로, 이름 속 ':'(대체 데이터 스트림), 끝의 점·공백, 장치 이름(CON·NUL·COM1
+// 등)이 든 경로를 제출 단계에서 InvalidArgument로 거절한다. 경로 캡처를 루트에 붙인 경로가 다른 파일·
+// 스트림·장치로 바뀌지 않게 하려는 것이다(Web.SendFileRejectsWindowsPathAliases).
 // Submission failure leaves the response untouched. An admitted task sends an
 // empty 404 for a missing/nonregular file or 500 for other pre-header I/O errors.
 // If that error response cannot queue, or a failure occurs after Start, it aborts.

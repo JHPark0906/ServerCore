@@ -7,6 +7,12 @@
 //! response aborts it; dropping a connection closes it; dropping a server stops
 //! and joins its native workers. Keep immutable events alive while borrowing
 //! their bytes, and release them promptly to return the native queue budget.
+//!
+//! At most 4096 operations can wait at once in a process, and some sources cap
+//! their own waiters (64 per [`channel::LatestBytes`] value). An awaited
+//! operation that finds no free waiter still completes if its result is already
+//! available; otherwise it fails with [`Error::TOO_LARGE`], not `WOULD_BLOCK`
+//! (tests: `waiter_capacity`, `latest_observer_cap_is_not_reported_as_would_block`).
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub use servercore_sys as sys;
@@ -57,6 +63,15 @@ pub(crate) fn check(status: i32) -> Result<()> {
         Ok(())
     } else {
         Err(Error(status))
+    }
+}
+/// Native status for a Rust callback's result. `Err(Error(SC_OK))` would read
+/// as success in native code, so it is reported as INVALID_ARGUMENT.
+pub(crate) fn callback_status(result: Result<()>) -> sys::sc_status {
+    match result {
+        Ok(()) => sys::SC_OK,
+        Err(Error(sys::SC_OK)) => sys::SC_INVALID_ARGUMENT,
+        Err(error) => error.0,
     }
 }
 pub(crate) fn bytes(value: &[u8]) -> sys::sc_bytes {

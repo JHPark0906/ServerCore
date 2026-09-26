@@ -209,11 +209,20 @@ impl Drop for Subscription {
 pub(crate) struct PollFuture<F, S> {
     operation: F,
     subscribe: S,
-    slot: Arc<Slot>,
     reactor: Arc<Reactor>,
+    // None when every reactor slot was taken at creation.
+    waiter: Option<(u64, Arc<Slot>)>,
     subscription: Option<Subscription>,
-    key: u64,
     done: bool,
+}
+// A future cannot wait for waiter capacity: nothing wakes it when a slot is
+// returned. An operation that would block without a waiter therefore fails
+// with TOO_LARGE, never WOULD_BLOCK, which callers read as "retry now".
+fn without_waiter<T>(result: Result<T>) -> Result<T> {
+    match result {
+        Err(Error::WOULD_BLOCK) => Err(Error::TOO_LARGE),
+        result => result,
+    }
 }
 pub(crate) fn poll_fn<F, S, T>(operation: F, subscribe: S) -> Result<PollFuture<F, S>>
 where
@@ -233,14 +242,18 @@ where
     S: FnMut(*mut sys::sc_notifier, u64, *mut *mut sys::sc_subscription) -> sys::sc_status,
 {
     let reactor = Reactor::acquire()?;
-    let (key, slot) = reactor.register(deadline)?;
+    let waiter = match reactor.register(deadline) {
+        Ok(waiter) => Some(waiter),
+        // The first poll still tries the operation once.
+        Err(Error::WOULD_BLOCK) => None,
+        Err(error) => return Err(error),
+    };
     Ok(PollFuture {
         operation,
         subscribe,
-        slot,
         reactor,
+        waiter,
         subscription: None,
-        key,
         done: false,
     })
 }
@@ -253,8 +266,12 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         assert!(!this.done, "completed ServerCore Future polled again");
+        let Some((key, slot)) = this.waiter.as_ref() else {
+            this.done = true;
+            return Poll::Ready(without_waiter((this.operation)()));
+        };
         let waker = cx.waker().clone();
-        let previous = lock(&this.slot.0).waker.replace(waker);
+        let previous = lock(&slot.0).waker.replace(waker);
         drop(previous);
         // Re-arm before checking native state. Registration also checks state
         // after publication; neither transition window can lose a notification.
@@ -262,7 +279,7 @@ where
         let mut subscription = std::ptr::null_mut();
         let registered = check((this.subscribe)(
             this.reactor.shared.native.0.as_ptr(),
-            this.key,
+            *key,
             &mut subscription,
         ))
         .and_then(|()| pointer(subscription));
@@ -271,13 +288,16 @@ where
                 this.subscription = Some(Subscription(value));
                 (this.operation)()
             }
+            // ABI 2 native subscribe reports a full registration table as
+            // TooLarge (ABI 1 used WouldBlock); the operation still runs once.
+            Err(Error::WOULD_BLOCK | Error::TOO_LARGE) => without_waiter((this.operation)()),
             Err(error) => Err(error),
         };
         match result {
             Err(Error::WOULD_BLOCK) if this.subscription.is_some() => Poll::Pending,
             result => {
                 this.subscription.take();
-                let previous = lock(&this.slot.0).waker.take();
+                let previous = lock(&slot.0).waker.take();
                 drop(previous);
                 this.done = true;
                 Poll::Ready(result)
@@ -287,11 +307,14 @@ where
 }
 impl<F, S> Drop for PollFuture<F, S> {
     fn drop(&mut self) {
-        let previous = lock(&self.slot.0).waker.take();
+        let Some((key, slot)) = self.waiter.take() else {
+            return;
+        };
+        let previous = lock(&slot.0).waker.take();
         drop(previous);
         {
             let mut state = lock(&self.reactor.shared.state);
-            state.slots.retain(|(id, _)| *id != self.key);
+            state.slots.retain(|(id, _)| *id != key);
         }
         self.subscription.take();
         unsafe { sys::sc_notifier_interrupt(self.reactor.shared.native.0.as_ptr()) };

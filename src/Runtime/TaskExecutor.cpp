@@ -255,8 +255,10 @@ public:
         result.pendingTasks = pending;
         result.runningTasks = running;
         result.retainedBytes = retained;
-        result.lifecycle = joined ? Observability::Lifecycle::Stopped : stopping ? Observability::Lifecycle::Draining :
-            ready ? Observability::Lifecycle::Running : Observability::Lifecycle::Created;
+        result.lifecycle = joined     ? Observability::Lifecycle::Stopped
+                           : stopping ? Observability::Lifecycle::Draining
+                           : ready    ? Observability::Lifecycle::Running
+                                      : Observability::Lifecycle::Created;
         return result;
     }
 
@@ -441,7 +443,9 @@ private:
             }
             if (stopping && tasks.empty())
                 return;
-            if (nextDeadline)
+            // time_point::max()를 wait_until에 넘기면 glibc 2.30 미만의 libstdc++이 system_clock으로
+            // 바꾸다 넘쳐 곧바로 깨어나 바쁘게 돈다. 기한이 없는 대기는 wait로 한다(EXEC-8).
+            if (nextDeadline && *nextDeadline != Clock::time_point::max())
                 wake.wait_until(guard, *nextDeadline);
             else
                 wake.wait(guard);
@@ -540,7 +544,10 @@ Core::Status TaskHandle::WaitUntil(std::chrono::steady_clock::time_point deadlin
         const auto owner = mState->owner.lock();
         if (owner && Detail::ExecutorScope::Contains(owner.get()))
             return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
-        if (!mState->finished.wait_until(guard, deadline, [this] { return mState->terminal; }))
+        // 기한 없는 Wait()는 wait_until(max) 대신 wait로 기다린다(EXEC-8, 위 Coordinate 참고).
+        if (deadline == std::chrono::steady_clock::time_point::max())
+            mState->finished.wait(guard, [this] { return mState->terminal; });
+        else if (!mState->finished.wait_until(guard, deadline, [this] { return mState->terminal; }))
             return Core::Status::FailWithoutMessage(Core::ErrorCode::Timeout);
     }
     return Detail::ReadResult(mState);
@@ -552,14 +559,16 @@ TaskExecutor::TaskExecutor()
 }
 Core::Status TaskHandle::ObserveCompletion(Core::CompletionSource source) const noexcept
 {
-    if (!mState) return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
+    if (!mState)
+        return Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument);
     return mState->completionSignal.Observe(std::move(source));
 }
 Core::Result<Core::CompletionSubscription> TaskHandle::WaitForCompletion(
     std::function<void(Core::Status)> callback, std::stop_token cancellation) const
 {
-    if (!mState) return Core::Result<Core::CompletionSubscription>::FromStatus(
-        Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument));
+    if (!mState)
+        return Core::Result<Core::CompletionSubscription>::FromStatus(
+            Core::Status::FailWithoutMessage(Core::ErrorCode::InvalidArgument));
     return mState->completionSignal.Subscribe(std::move(callback), cancellation);
 }
 TaskExecutor::~TaskExecutor()

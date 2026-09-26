@@ -3,6 +3,13 @@
 #include "ServerCore/Runtime/RequestLimiter.h"
 namespace C = ServerCore::CDetail;
 namespace R = ServerCore::Runtime;
+// 네이티브 거절 사유를 C 상수로 그대로 옮긴다(static_cast). 번호가 갈리면 여기서 멈춘다.
+static_assert(
+    SC_LIMIT_NONE == static_cast<int>(R::RequestLimitReason::None) &&
+    SC_LIMIT_RATE == static_cast<int>(R::RequestLimitReason::Rate) &&
+    SC_LIMIT_KEY_CONCURRENCY == static_cast<int>(R::RequestLimitReason::KeyConcurrency) &&
+    SC_LIMIT_TOTAL_CONCURRENCY == static_cast<int>(R::RequestLimitReason::TotalConcurrency) &&
+    SC_LIMIT_KEY_CAPACITY == static_cast<int>(R::RequestLimitReason::KeyCapacity));
 struct sc_request_limiter
 {
     R::RequestLimiter value;
@@ -13,7 +20,7 @@ struct sc_request_permit
 };
 extern "C"
 {
-    sc_status sc_request_limiter_options_init(sc_request_limiter_options* o, size_t size)
+    sc_status sc_request_limiter_options_init(sc_request_limiter_options* o, size_t size) noexcept
     {
         if (!o || size < sizeof(*o))
             return SC_INVALID_ARGUMENT;
@@ -21,7 +28,7 @@ extern "C"
         return SC_OK;
     }
     sc_status sc_request_limiter_create(
-        const sc_request_limiter_options* o, sc_request_limiter** out)
+        const sc_request_limiter_options* o, sc_request_limiter** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
@@ -41,22 +48,22 @@ extern "C"
                 return SC_OK;
             });
     }
-    void sc_request_limiter_destroy(sc_request_limiter* limiter)
+    void sc_request_limiter_destroy(sc_request_limiter* limiter) noexcept
     {
         delete limiter;
     }
-    void sc_request_limiter_close(sc_request_limiter* limiter)
+    void sc_request_limiter_close(sc_request_limiter* limiter) noexcept
     {
         if (limiter)
             limiter->value.Close();
     }
     sc_status sc_request_limiter_acquire(sc_request_limiter* limiter, sc_bytes key, uint64_t cost,
-        sc_request_limit_decision* decision, sc_request_permit** out)
+        sc_request_limit_decision* decision, sc_request_permit** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
         *out = nullptr;
-        if (!limiter || !C::Valid(key) || !C::Version(decision))
+        if (!limiter || !C::Valid(key) || !C::OutputVersion(decision))
             return SC_INVALID_ARGUMENT;
         decision->reason = SC_LIMIT_NONE;
         decision->retry_after_ms = 0;
@@ -78,19 +85,19 @@ extern "C"
                 return SC_OK;
             });
     }
-    void sc_request_permit_destroy(sc_request_permit* permit)
+    void sc_request_permit_destroy(sc_request_permit* permit) noexcept
     {
         delete permit;
     }
-    size_t sc_request_limiter_prune(sc_request_limiter* limiter)
+    size_t sc_request_limiter_prune(sc_request_limiter* limiter) noexcept
     {
         return limiter ? limiter->value.PruneExpired() : 0;
     }
-    size_t sc_request_limiter_key_count(const sc_request_limiter* limiter)
+    size_t sc_request_limiter_key_count(const sc_request_limiter* limiter) noexcept
     {
         return limiter ? limiter->value.Snapshot().keys : 0;
     }
-    size_t sc_request_limiter_active_count(const sc_request_limiter* limiter)
+    size_t sc_request_limiter_active_count(const sc_request_limiter* limiter) noexcept
     {
         return limiter ? limiter->value.Snapshot().active : 0;
     }

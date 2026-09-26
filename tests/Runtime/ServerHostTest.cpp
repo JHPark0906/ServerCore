@@ -37,17 +37,12 @@
 // 달리, 여기서는 평범한 TCP 클라이언트가 프레임을 조각 내어 보내고 Host가 세션·디스패치·종료를
 // 순서대로 잇는지만 본다. 처리기와 관찰자는 특정 게임의 개념을 넣지 않은 범용 경계다.
 
-#ifndef SERVERCORE_TEST_PORT_BASE
-#error "SERVERCORE_TEST_PORT_BASE must be defined by the build"
-#endif
-
 namespace
 {
 static_assert(
     std::is_same_v<decltype(std::declval<const ServerCore::Runtime::ServerHost&>().GetSessions()),
         const ServerCore::Session::SessionRegistry&>);
 
-constexpr std::uint16_t PortBase = static_cast<std::uint16_t>(SERVERCORE_TEST_PORT_BASE);
 constexpr std::chrono::milliseconds WaitLimit{ 10000 };
 constexpr unsigned ClientReceiveTimeoutMilliseconds = 10000;
 
@@ -64,6 +59,17 @@ std::vector<std::byte> MakeFrame(const std::string_view json)
     frame[3] = static_cast<std::byte>((length >> 24u) & 0xFFu);
     std::memcpy(frame.data() + ServerCore::Protocol::HeaderSize, json.data(), json.size());
     return frame;
+}
+
+/// <summary>머리를 포함해 정확히 frameSize 바이트인 runtime.block 프레임을 만든다.</summary>
+std::vector<std::byte> MakeFrameOfSize(const std::size_t frameSize)
+{
+    const std::string_view prefix = R"({"type":"runtime.block","body":{"pad":")";
+    const std::string_view suffix = R"("}})";
+    std::string json(prefix);
+    json.append(frameSize - ServerCore::Protocol::HeaderSize - prefix.size() - suffix.size(), 'x');
+    json.append(suffix);
+    return MakeFrame(json);
 }
 
 /// <summary>우리 구현을 쓰지 않는, 검사용 블로킹 TCP 클라이언트다.</summary>
@@ -86,8 +92,8 @@ public:
 
         if (receiveBufferBytes > 0 &&
             ::setsockopt(mSocket, SOL_SOCKET, SO_RCVBUF,
-                reinterpret_cast<const char*>(&receiveBufferBytes), sizeof(receiveBufferBytes)) ==
-                ServerCoreTest::SocketError)
+                reinterpret_cast<const char*>(&receiveBufferBytes),
+                sizeof(receiveBufferBytes)) == ServerCoreTest::SocketError)
         {
             Close();
             return false;
@@ -128,8 +134,9 @@ public:
         std::size_t offset = 0;
         while (offset < bytes.size())
         {
-            const int sent = ServerCoreTest::Send(mSocket, reinterpret_cast<const char*>(bytes.data() + offset),
-                static_cast<int>(bytes.size() - offset), 0);
+            const int sent =
+                ServerCoreTest::Send(mSocket, reinterpret_cast<const char*>(bytes.data() + offset),
+                    static_cast<int>(bytes.size() - offset), 0);
             if (sent <= 0)
             {
                 return false;
@@ -467,13 +474,15 @@ private:
 
     mutable std::mutex mMutex;
     std::condition_variable mChanged;
-    std::thread mWorker;
     std::shared_ptr<ServerCore::Session::Session> mSession;
     bool mStopWorker = false;
     bool mReentryRequested = false;
     bool mReentryCompleted = false;
     bool mReenteredBeforeCloseReturned = false;
     bool mClosed = false;
+    // 생성자가 이 스레드를 띄우는 즉시 RunWorker가 위 멤버를 읽는다. 멤버는 선언 순서로 초기화되므로
+    // 스레드는 맨 뒤에 둔다(TSan: 초기화 쓰기와 작업 스레드 읽기의 레이스).
+    std::thread mWorker;
 };
 
 /// <summary>처리기가 실제 JobRunner 문맥에서 호출됐는지를 관찰한다.</summary>
@@ -1381,13 +1390,14 @@ struct MetricsCaptureState
 void ServerHostRoutesSplitFramesAndStops()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization in the test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization in the test succeeded");
     if (!sockets.IsReady())
     {
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 6);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     auto observer = std::make_shared<RecordingSessionObserver>();
     auto handler = std::make_shared<RecordingHandler>();
     ServerCore::Runtime::ServerHost host;
@@ -1407,7 +1417,8 @@ void ServerHostRoutesSplitFramesAndStops()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status registered = host.GetDispatcher().Register(
         "runtime.probe",
         [handler](const std::shared_ptr<ServerCore::Session::Session>& session,
@@ -1543,7 +1554,7 @@ void ServerHostRejectsRestartAfterStop()
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 20);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     ServerCore::Runtime::ServerHost host;
     ServerCore::Runtime::ServerHostOptions options;
     options.port = port;
@@ -1612,7 +1623,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost host;
     ServerCore::Runtime::ServerHostOptions options;
-    options.port = static_cast<std::uint16_t>(PortBase + 6);
+    options.port = ServerCoreTest::FreeLoopbackTcpPort();
     options.ioWorkerThreadCount = 0;
 
     const ServerCore::Core::Status configured = host.Configure(options);
@@ -1629,7 +1640,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost negativeIdleTimeoutHost;
     ServerCore::Runtime::ServerHostOptions negativeIdleTimeoutOptions;
-    negativeIdleTimeoutOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    negativeIdleTimeoutOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     negativeIdleTimeoutOptions.idleSessionTimeout = std::chrono::milliseconds(-1);
     const ServerCore::Core::Status negativeIdleTimeout =
         negativeIdleTimeoutHost.Configure(negativeIdleTimeoutOptions);
@@ -1641,9 +1652,11 @@ void ServerHostRejectsInvalidOptions()
     {
         ServerCore::Runtime::ServerHost invalidGracefulTimeoutHost;
         ServerCore::Runtime::ServerHostOptions invalidGracefulTimeoutOptions;
-        invalidGracefulTimeoutOptions.port = static_cast<std::uint16_t>(PortBase + 6);
-        invalidGracefulTimeoutOptions.gracefulCloseTimeout = std::chrono::milliseconds(milliseconds);
-        const auto invalidTimeout = invalidGracefulTimeoutHost.Configure(invalidGracefulTimeoutOptions);
+        invalidGracefulTimeoutOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
+        invalidGracefulTimeoutOptions.gracefulCloseTimeout =
+            std::chrono::milliseconds(milliseconds);
+        const auto invalidTimeout =
+            invalidGracefulTimeoutHost.Configure(invalidGracefulTimeoutOptions);
         ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::InvalidArgument),
             static_cast<int>(invalidTimeout.Code()),
             "ServerHost rejects disabled or negative graceful close timeouts");
@@ -1651,7 +1664,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost excessiveIoWorkerHost;
     ServerCore::Runtime::ServerHostOptions excessiveIoWorkerOptions;
-    excessiveIoWorkerOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    excessiveIoWorkerOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     excessiveIoWorkerOptions.ioWorkerThreadCount =
         ServerCore::Runtime::MaximumServerHostWorkerThreadCount + 1;
     const ServerCore::Core::Status excessiveIoWorkers =
@@ -1662,7 +1675,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost excessiveParseWorkerHost;
     ServerCore::Runtime::ServerHostOptions excessiveParseWorkerOptions;
-    excessiveParseWorkerOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    excessiveParseWorkerOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     excessiveParseWorkerOptions.parseWorkerThreadCount =
         ServerCore::Runtime::MaximumServerHostWorkerThreadCount + 1;
     const ServerCore::Core::Status excessiveParseWorkers =
@@ -1673,7 +1686,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost maximumWorkerHost;
     ServerCore::Runtime::ServerHostOptions maximumWorkerOptions;
-    maximumWorkerOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    maximumWorkerOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     maximumWorkerOptions.ioWorkerThreadCount =
         ServerCore::Runtime::MaximumServerHostWorkerThreadCount;
     maximumWorkerOptions.parseWorkerThreadCount =
@@ -1685,7 +1698,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost missingSendCapacityHost;
     ServerCore::Runtime::ServerHostOptions missingSendCapacityOptions;
-    missingSendCapacityOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    missingSendCapacityOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     missingSendCapacityOptions.maxTotalSendQueueCapacityBytes = 0;
     const ServerCore::Core::Status missingSendCapacity =
         missingSendCapacityHost.Configure(missingSendCapacityOptions);
@@ -1695,7 +1708,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost excessiveSendCapacityHost;
     ServerCore::Runtime::ServerHostOptions excessiveSendCapacityOptions;
-    excessiveSendCapacityOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    excessiveSendCapacityOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     excessiveSendCapacityOptions.maxTotalSendQueueCapacityBytes = 512u * 1024u * 1024u + 1u;
     const ServerCore::Core::Status excessiveSendCapacity =
         excessiveSendCapacityHost.Configure(excessiveSendCapacityOptions);
@@ -1705,7 +1718,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost undersizedSendCapacityHost;
     ServerCore::Runtime::ServerHostOptions undersizedSendCapacityOptions;
-    undersizedSendCapacityOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    undersizedSendCapacityOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     undersizedSendCapacityOptions.maxTotalSendQueueCapacityBytes =
         static_cast<std::uint32_t>(ServerCore::Net::SendQueueLimitBytes - 1);
     const ServerCore::Core::Status undersizedSendCapacity =
@@ -1716,7 +1729,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost minimumSendCapacityHost;
     ServerCore::Runtime::ServerHostOptions minimumSendCapacityOptions;
-    minimumSendCapacityOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    minimumSendCapacityOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     minimumSendCapacityOptions.maxConcurrentSessions = 2;
     minimumSendCapacityOptions.maxTotalSendQueueCapacityBytes =
         static_cast<std::uint32_t>(ServerCore::Net::SendQueueLimitBytes);
@@ -1727,7 +1740,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost legacySessionCountHost;
     ServerCore::Runtime::ServerHostOptions legacySessionCountOptions;
-    legacySessionCountOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    legacySessionCountOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     legacySessionCountOptions.maxConcurrentSessions = 300;
     const ServerCore::Core::Status legacySessionCount =
         legacySessionCountHost.Configure(legacySessionCountOptions);
@@ -1736,7 +1749,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost maximumSessionCountHost;
     ServerCore::Runtime::ServerHostOptions maximumSessionCountOptions;
-    maximumSessionCountOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    maximumSessionCountOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     maximumSessionCountOptions.maxConcurrentSessions = 65536;
     maximumSessionCountOptions.maxBodySize = 8192;
     const ServerCore::Core::Status maximumSessionCount =
@@ -1745,7 +1758,8 @@ void ServerHostRejectsInvalidOptions()
         "ServerHost accepts 65,536 sessions with 8 KiB bodies and the default shared send budget");
 
     ServerCore::Runtime::ServerHost excessiveSessionCountHost;
-    ServerCore::Runtime::ServerHostOptions excessiveSessionCountOptions = maximumSessionCountOptions;
+    ServerCore::Runtime::ServerHostOptions excessiveSessionCountOptions =
+        maximumSessionCountOptions;
     excessiveSessionCountOptions.maxConcurrentSessions = 65537;
     const ServerCore::Core::Status excessiveSessionCount =
         excessiveSessionCountHost.Configure(excessiveSessionCountOptions);
@@ -1772,7 +1786,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost maximumSendCapacityHost;
     ServerCore::Runtime::ServerHostOptions maximumSendCapacityOptions;
-    maximumSendCapacityOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    maximumSendCapacityOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     maximumSendCapacityOptions.maxTotalSendQueueCapacityBytes = 512u * 1024u * 1024u;
     const ServerCore::Core::Status maximumSendCapacity =
         maximumSendCapacityHost.Configure(maximumSendCapacityOptions);
@@ -1781,7 +1795,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost oversizedFrameHost;
     ServerCore::Runtime::ServerHostOptions oversizedFrameOptions;
-    oversizedFrameOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    oversizedFrameOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     oversizedFrameOptions.maxBodySize = static_cast<std::uint32_t>(
         ServerCore::Net::SendQueueLimitBytes - ServerCore::Protocol::HeaderSize + 1);
     const ServerCore::Core::Status oversizedFrame =
@@ -1792,7 +1806,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost oversizedReaderHost;
     ServerCore::Runtime::ServerHostOptions oversizedReaderOptions;
-    oversizedReaderOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    oversizedReaderOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     oversizedReaderOptions.maxBodySize = static_cast<std::uint32_t>(
         ServerCore::Net::SendQueueLimitBytes - ServerCore::Protocol::HeaderSize);
     oversizedReaderOptions.maxConcurrentSessions = 1025;
@@ -1805,7 +1819,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost negativeParseWorkerHost;
     ServerCore::Runtime::ServerHostOptions negativeParseWorkerOptions;
-    negativeParseWorkerOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    negativeParseWorkerOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     negativeParseWorkerOptions.parseWorkerThreadCount = -1;
     const ServerCore::Core::Status negativeParseWorker =
         negativeParseWorkerHost.Configure(negativeParseWorkerOptions);
@@ -1815,7 +1829,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost undersizedParseBudgetHost;
     ServerCore::Runtime::ServerHostOptions undersizedParseBudgetOptions;
-    undersizedParseBudgetOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    undersizedParseBudgetOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     undersizedParseBudgetOptions.parseWorkerThreadCount = 1;
     undersizedParseBudgetOptions.maxPendingParseBytes =
         undersizedParseBudgetOptions.maxBodySize - 1;
@@ -1827,7 +1841,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost invertedParseByteBudgetHost;
     ServerCore::Runtime::ServerHostOptions invertedParseByteBudgetOptions;
-    invertedParseByteBudgetOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    invertedParseByteBudgetOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     invertedParseByteBudgetOptions.parseWorkerThreadCount = 1;
     invertedParseByteBudgetOptions.maxPendingParseBytes =
         invertedParseByteBudgetOptions.maxBodySize + 1;
@@ -1841,7 +1855,7 @@ void ServerHostRejectsInvalidOptions()
 
     ServerCore::Runtime::ServerHost invertedParseTaskBudgetHost;
     ServerCore::Runtime::ServerHostOptions invertedParseTaskBudgetOptions;
-    invertedParseTaskBudgetOptions.port = static_cast<std::uint16_t>(PortBase + 6);
+    invertedParseTaskBudgetOptions.port = ServerCoreTest::FreeLoopbackTcpPort();
     invertedParseTaskBudgetOptions.parseWorkerThreadCount = 1;
     invertedParseTaskBudgetOptions.maxPendingParseTasks = 2;
     invertedParseTaskBudgetOptions.maxTotalPendingParseTasks = 1;
@@ -1855,15 +1869,15 @@ void ServerHostRejectsInvalidOptions()
 void ServerHostSharesConfiguredSendBudgetAcrossSessions()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the Host shared-send-budget test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the Host shared-send-budget test succeeded");
     if (!sockets.IsReady())
     {
         return;
     }
 
     constexpr std::size_t PayloadBytes = 600u * 1024u;
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 33);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     auto observer = std::make_shared<RetainingSessionObserver>();
     ServerCore::Runtime::ServerHost host;
 
@@ -1884,7 +1898,8 @@ void ServerHostSharesConfiguredSendBudgetAcrossSessions()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status started = host.Start();
     ServerCoreTest::ExpectTrue(started.IsOk(), "ServerHost started with a shared send budget");
     if (!started.IsOk())
@@ -1937,8 +1952,10 @@ void ServerHostSharesConfiguredSendBudgetAcrossSessions()
     ServerCore::Protocol::JsonValue::Object fields;
     fields.emplace("payload", ServerCore::Protocol::JsonValue(std::string(PayloadBytes, 'x')));
     const ServerCore::Protocol::JsonValue body(std::move(fields));
-    const auto prepared = ServerCore::Protocol::PrepareMessage({ "runtime.send-budget", &body, nullptr, nullptr });
-    ServerCoreTest::ExpectTrue(prepared.IsOk(), "a reusable message is prepared before competing for the shared budget");
+    const auto prepared =
+        ServerCore::Protocol::PrepareMessage({ "runtime.send-budget", &body, nullptr, nullptr });
+    ServerCoreTest::ExpectTrue(
+        prepared.IsOk(), "a reusable message is prepared before competing for the shared budget");
     if (!prepared.IsOk())
     {
         receiveGateScope.Release();
@@ -1949,20 +1966,24 @@ void ServerHostSharesConfiguredSendBudgetAcrossSessions()
     }
     const ServerCore::Core::Status firstSend = firstSession->Send("runtime.send-budget", body);
     const ServerCore::Core::Status secondSend = secondSession->SendPrepared(prepared.Value());
-    const ServerCore::Core::Status sameSessionOverflow = firstSession->SendPrepared(prepared.Value());
+    const ServerCore::Core::Status sameSessionOverflow =
+        firstSession->SendPrepared(prepared.Value());
     ServerCoreTest::ExpectTrue(firstSend.IsOk(),
         "the first session reserves more than half of the configured Host send budget");
     ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::WouldBlock),
         static_cast<int>(secondSend.Code()),
         "prepared sends compete with ordinary sends for the same Host send budget");
-    ServerCoreTest::ExpectTrue(sameSessionOverflow.Code() == ServerCore::Core::ErrorCode::WouldBlock,
+    ServerCoreTest::ExpectTrue(
+        sameSessionOverflow.Code() == ServerCore::Core::ErrorCode::WouldBlock,
         "prepared sends cannot bypass the per-session queue limit either");
     ServerCoreTest::ExpectEqual(prepared.Value().Size() + ServerCore::Protocol::HeaderSize,
-        firstSession->QueuedSendBytes(), "queue bytes include one complete framed message, not rejected prepared sends");
+        firstSession->QueuedSendBytes(),
+        "queue bytes include one complete framed message, not rejected prepared sends");
     ServerCoreTest::ExpectEqual(std::size_t{ 0 }, secondSession->QueuedSendBytes(),
         "a rejected prepared frame reserves no bytes on another session");
     const auto metrics = CaptureMetrics(host);
-    ServerCoreTest::ExpectTrue(metrics.IsOk(), "shared prepared-send metrics are observable with completions blocked");
+    ServerCoreTest::ExpectTrue(
+        metrics.IsOk(), "shared prepared-send metrics are observable with completions blocked");
     if (metrics.IsOk())
     {
         ServerCoreTest::ExpectEqual(std::uint64_t{ 1 }, metrics.Value().queuedSendFrameCount,
@@ -1986,61 +2007,88 @@ void ServerHostPreparedSendsPreserveFramingLimitsAndMetrics()
     using ServerCore::Core::ErrorCode;
     namespace Protocol = ServerCore::Protocol;
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "Winsock is ready for the prepared-send integration test");
-    if (!sockets.IsReady()) return;
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "Winsock is ready for the prepared-send integration test");
+    if (!sockets.IsReady())
+        return;
     Protocol::JsonValue body(Protocol::JsonValue::Object{
         { "payload", Protocol::JsonValue(std::string(512, 'x') + "한글\"\\\n") } });
     const Protocol::JsonValue sequence(std::uint64_t{ 18446744073709551615ULL });
     auto prepared = Protocol::PrepareMessage({ "runtime.prepared", &body, &sequence, nullptr });
     ServerCoreTest::ExpectTrue(prepared.IsOk(), "the prepared TCP envelope is valid");
-    if (!prepared.IsOk()) return;
-    const std::vector<std::byte> expected(prepared.Value().Bytes().begin(), prepared.Value().Bytes().end());
+    if (!prepared.IsOk())
+        return;
+    const std::vector<std::byte> expected(
+        prepared.Value().Bytes().begin(), prepared.Value().Bytes().end());
     const std::size_t frameBytes = expected.size() + Protocol::HeaderSize;
 
     auto observer = std::make_shared<RetainingSessionObserver>();
     ServerCore::Runtime::ServerHost host;
     ServerCore::Runtime::ServerHostOptions options;
-    options.port = static_cast<std::uint16_t>(PortBase + 39);
+    options.port = ServerCoreTest::FreeLoopbackTcpPort();
     options.maxConcurrentSessions = 1;
     options.ioWorkerThreadCount = 1;
     options.maxBodySize = static_cast<std::uint32_t>(prepared.Value().Size());
     const auto configured = host.Configure(options);
-    ServerCoreTest::ExpectTrue(configured.IsOk(), "the host accepts an exact prepared-body frame limit");
-    if (!configured.IsOk()) return;
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        configured.IsOk(), "the host accepts an exact prepared-body frame limit");
+    if (!configured.IsOk())
+        return;
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const auto started = host.Start();
     ServerCoreTest::ExpectTrue(started.IsOk(), "the prepared-send host starts");
-    if (!started.IsOk()) return;
+    if (!started.IsOk())
+        return;
     TestClient client;
     const bool connected = client.Connect(options.port);
     ServerCoreTest::ExpectTrue(connected, "the prepared-send client connects");
     const bool opened = connected && observer->WaitForOpenedCount(1, WaitLimit);
     ServerCoreTest::ExpectTrue(opened, "the host exposes the prepared-send session");
-    if (!opened) { client.Close(); host.Stop(); return; }
+    if (!opened)
+    {
+        client.Close();
+        host.Stop();
+        return;
+    }
     const auto session = observer->SessionAt(0);
     auto receiveGate = std::make_shared<BlockingSessionReceiveGate>();
     const ScopedBeforeSessionReceiveGate receiveGateScope(receiveGate);
     const std::vector<std::byte> trigger{ std::byte{ 0 } };
     const bool workerBlocked = client.SendAll(trigger) && receiveGate->WaitUntilEntered(WaitLimit);
-    ServerCoreTest::ExpectTrue(workerBlocked, "I/O completions are blocked while queue ownership is inspected");
-    if (!workerBlocked) { receiveGateScope.Release(); client.Close(); host.Stop(); return; }
+    ServerCoreTest::ExpectTrue(
+        workerBlocked, "I/O completions are blocked while queue ownership is inspected");
+    if (!workerBlocked)
+    {
+        receiveGateScope.Release();
+        client.Close();
+        host.Stop();
+        return;
+    }
 
-    ServerCoreTest::ExpectEqual(std::size_t{ 0 }, session->QueuedSendBytes(), "a new session has no queued outbound bytes");
+    ServerCoreTest::ExpectEqual(
+        std::size_t{ 0 }, session->QueuedSendBytes(), "a new session has no queued outbound bytes");
     const auto first = session->SendPrepared(prepared.Value());
     auto owner = std::move(prepared.Value());
     body = Protocol::JsonValue(nullptr);
     const auto second = session->SendPrepared(owner);
-    ServerCoreTest::ExpectTrue(first.IsOk() && second.IsOk(), "the same prepared envelope is reusable at the exact body limit");
+    ServerCoreTest::ExpectTrue(first.IsOk() && second.IsOk(),
+        "the same prepared envelope is reusable at the exact body limit");
     const auto empty = session->SendPrepared(prepared.Value());
-    ServerCoreTest::ExpectTrue(!empty.IsOk(), "a moved-from prepared message must not emit an empty TCP frame");
+    ServerCoreTest::ExpectTrue(
+        !empty.IsOk(), "a moved-from prepared message must not emit an empty TCP frame");
     Protocol::JsonValue largerBody(Protocol::JsonValue::Object{
         { "payload", Protocol::JsonValue(std::string(513, 'x') + "한글\"\\\n") } });
-    const auto larger = Protocol::PrepareMessage({ "runtime.prepared", &largerBody, &sequence, nullptr });
-    ServerCoreTest::ExpectTrue(larger.IsOk(), "a message may be prepared independently of a host's frame limit");
+    const auto larger =
+        Protocol::PrepareMessage({ "runtime.prepared", &largerBody, &sequence, nullptr });
+    ServerCoreTest::ExpectTrue(
+        larger.IsOk(), "a message may be prepared independently of a host's frame limit");
     if (larger.IsOk())
     {
-        ServerCoreTest::ExpectEqual(expected.size() + 1, larger.Value().Size(), "the oversized fixture crosses the frame body limit by exactly one byte");
-        ServerCoreTest::ExpectTrue(session->SendPrepared(larger.Value()).Code() == ErrorCode::TooLarge,
+        ServerCoreTest::ExpectEqual(expected.size() + 1, larger.Value().Size(),
+            "the oversized fixture crosses the frame body limit by exactly one byte");
+        ServerCoreTest::ExpectTrue(
+            session->SendPrepared(larger.Value()).Code() == ErrorCode::TooLarge,
             "prepared sends enforce the same per-host body limit as ordinary sends");
     }
     ServerCoreTest::ExpectEqual(frameBytes * 2, session->QueuedSendBytes(),
@@ -2055,9 +2103,11 @@ void ServerHostPreparedSendsPreserveFramingLimitsAndMetrics()
             "empty and oversized prepared sends each record one validation error");
         ServerCoreTest::ExpectEqual(std::uint64_t{ 0 }, queued.Value().receivedFrameCount,
             "outbound prepared frames are not counted as received input");
-        ServerCoreTest::ExpectTrue(queued.Value().sessionSendQueues.size() == 1 &&
-            queued.Value().sessionSendQueues.front().queuedBytes == session->QueuedSendBytes(),
-            "the session queue observation agrees with the host snapshot while completions are blocked");
+        ServerCoreTest::ExpectTrue(
+            queued.Value().sessionSendQueues.size() == 1 &&
+                queued.Value().sessionSendQueues.front().queuedBytes == session->QueuedSendBytes(),
+            "the session queue observation agrees with the host snapshot while completions are "
+            "blocked");
     }
     receiveGateScope.Release();
     if (first.IsOk() && second.IsOk())
@@ -2067,20 +2117,25 @@ void ServerHostPreparedSendsPreserveFramingLimitsAndMetrics()
             std::vector<std::byte> received;
             const bool complete = client.ReceiveFrame(received);
             ServerCoreTest::ExpectTrue(complete && received == expected,
-                "real TCP preserves complete prepared-envelope bytes after the source is changed and preparation is moved");
-            if (!complete) break;
+                "real TCP preserves complete prepared-envelope bytes after the source is changed "
+                "and preparation is moved");
+            if (!complete)
+                break;
         }
     }
     const auto deadline = std::chrono::steady_clock::now() + WaitLimit;
     while (session->QueuedSendBytes() != 0 && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    ServerCoreTest::ExpectEqual(std::size_t{ 0 }, session->QueuedSendBytes(), "completed prepared writes release all queued-byte reservations");
+    ServerCoreTest::ExpectEqual(std::size_t{ 0 }, session->QueuedSendBytes(),
+        "completed prepared writes release all queued-byte reservations");
     session->Disconnect(ServerCore::Core::Status::FailWithoutMessage(ErrorCode::Closed));
-    ServerCoreTest::ExpectTrue(observer->WaitForClosed(WaitLimit), "the retained prepared-send session closes");
+    ServerCoreTest::ExpectTrue(
+        observer->WaitForClosed(WaitLimit), "the retained prepared-send session closes");
     ServerCoreTest::ExpectTrue(session->SendPrepared(owner).Code() == ErrorCode::Closed,
         "prepared sends on a retained closed session are rejected");
     const auto closed = CaptureMetrics(host);
-    ServerCoreTest::ExpectTrue(closed.IsOk(), "metrics remain available after the prepared-send session closes");
+    ServerCoreTest::ExpectTrue(
+        closed.IsOk(), "metrics remain available after the prepared-send session closes");
     if (closed.IsOk())
     {
         ServerCoreTest::ExpectEqual(std::uint64_t{ 2 }, closed.Value().queuedSendFrameCount,
@@ -2095,14 +2150,14 @@ void ServerHostPreparedSendsPreserveFramingLimitsAndMetrics()
 void ServerHostEnforcesConcurrentSessionLimit()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the concurrent-session-limit test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the concurrent-session-limit test succeeded");
     if (!sockets.IsReady())
     {
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 17);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     auto observer = std::make_shared<RecordingSessionObserver>();
     ServerCore::Runtime::ServerHost host;
 
@@ -2122,7 +2177,8 @@ void ServerHostEnforcesConcurrentSessionLimit()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status started = host.Start();
     ServerCoreTest::ExpectTrue(started.IsOk(),
         started.IsOk()
@@ -2269,7 +2325,7 @@ void ServerHostConfiguresFromConfig()
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 30);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     const ServerCore::Core::Result<ServerCore::Core::Config> config =
         LoadConfigSnapshotForHost("servercore.host.port = " + std::to_string(port) +
                                   "\n"
@@ -2282,8 +2338,8 @@ void ServerHostConfiguresFromConfig()
                                   "servercore.host.max-body-size = 128\n"
                                   "servercore.host.max-concurrent-sessions = 2\n"
                                   "servercore.host.max-total-send-queue-capacity-bytes = 2097152\n"
-                                  "servercore.host.max-pending-receive-bytes = 512\n"
-                                  "servercore.host.max-total-pending-receive-bytes = 1024\n"
+                                  "servercore.host.max-pending-receive-bytes = 16384\n"
+                                  "servercore.host.max-total-pending-receive-bytes = 32768\n"
                                   "servercore.host.max-pending-parse-bytes = 256\n"
                                   "servercore.host.max-total-pending-parse-bytes = 512\n"
                                   "servercore.host.max-pending-parse-tasks = 2\n"
@@ -2355,8 +2411,7 @@ void ServerHostRejectsInvalidConfig()
             static_cast<int>(expected), static_cast<int>(configured.Code()), what);
     };
     const std::string validHostPort =
-        "servercore.host.port = " + std::to_string(static_cast<std::uint16_t>(PortBase + 29)) +
-        "\n";
+        "servercore.host.port = " + std::to_string(ServerCoreTest::FreeLoopbackTcpPort()) + "\n";
     const auto expectOptionValidationFailure =
         [&expectConfigurationFailure, &validHostPort](
             const std::string_view setting, const std::string_view what)
@@ -2473,9 +2528,8 @@ void ServerHostRejectsInvalidConfig()
         ServerCoreTest::ExpectTrue(
             configured.IsOk(), "Config accepts 65,536 sessions with 8 KiB bodies");
     }
-    expectConfigurationFailure(validHostPort +
-            "servercore.host.max-concurrent-sessions = 65537\n"
-            "servercore.host.max-body-size = 8192\n",
+    expectConfigurationFailure(validHostPort + "servercore.host.max-concurrent-sessions = 65537\n"
+                                               "servercore.host.max-body-size = 8192\n",
         ServerCore::Core::ErrorCode::TooLarge,
         "Config preserves the concurrent-session safety boundary above 65,536");
 
@@ -2520,14 +2574,21 @@ void ServerHostRejectsInvalidConfig()
         invalidAddressHost.Stop();
     }
 
-    const std::uint16_t retainedPort = static_cast<std::uint16_t>(PortBase + 31);
+    // 거절된 Config의 포트가 남은 포트와 달라야 "이전 포트가 남았다"는 단언이 뜻을 가진다. 한 번에 받은
+    // 두 번호는 서로 다르다(FreeLoopbackTcpPorts).
+    const std::vector<std::uint16_t> configPorts = ServerCoreTest::FreeLoopbackTcpPorts(2);
+    ServerCoreTest::ExpectEqual(std::size_t{ 2 }, configPorts.size(), "two distinct free ports");
+    if (configPorts.size() != 2)
+    {
+        return;
+    }
+    const std::uint16_t retainedPort = configPorts[0];
     const ServerCore::Core::Result<ServerCore::Core::Config> validConfig =
         LoadConfigSnapshotForHost("servercore.host.port = " + std::to_string(retainedPort) + "\n");
     const ServerCore::Core::Result<ServerCore::Core::Config> rejectedConfig =
-        LoadConfigSnapshotForHost(
-            "servercore.host.port = " + std::to_string(static_cast<std::uint16_t>(PortBase + 32)) +
-            "\n"
-            "servercore.host.io-worker-thread-count = invalid\n");
+        LoadConfigSnapshotForHost("servercore.host.port = " + std::to_string(configPorts[1]) +
+                                  "\n"
+                                  "servercore.host.io-worker-thread-count = invalid\n");
     ServerCoreTest::ExpectTrue(validConfig.IsOk(), "the retained-setting Config fixture loads");
     ServerCoreTest::ExpectTrue(rejectedConfig.IsOk(), "the rejected-setting Config fixture loads");
     if (validConfig.IsOk() && rejectedConfig.IsOk())
@@ -2561,7 +2622,7 @@ void ServerHostBindsRegistryBeforePrepostedWork()
 {
     ServerCore::Runtime::ServerHost host;
     ServerCore::Runtime::ServerHostOptions options;
-    options.port = static_cast<std::uint16_t>(PortBase + 9);
+    options.port = ServerCoreTest::FreeLoopbackTcpPort();
 
     const ServerCore::Core::Status configured = host.Configure(options);
     ServerCoreTest::ExpectTrue(
@@ -2623,7 +2684,7 @@ void ServerHostSendsFinalFrameBeforeDisconnect()
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 14);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     auto observer = std::make_shared<RecordingSessionObserver>();
     auto handler = std::make_shared<FinalResponseHandler>();
     ServerCore::Runtime::ServerHost host;
@@ -2640,7 +2701,8 @@ void ServerHostSendsFinalFrameBeforeDisconnect()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status registered = host.GetDispatcher().Register(
         "runtime.final",
         [handler](const std::shared_ptr<ServerCore::Session::Session>& session,
@@ -2789,7 +2851,7 @@ void ServerHostDisconnectsIdleSessions()
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 15);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     auto observer = std::make_shared<RecordingSessionObserver>();
     ServerCore::Runtime::ServerHost host;
 
@@ -2806,7 +2868,8 @@ void ServerHostDisconnectsIdleSessions()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status started = host.Start();
     ServerCoreTest::ExpectTrue(started.IsOk(), "ServerHost started for the idle-session test");
     if (!started.IsOk())
@@ -2881,18 +2944,20 @@ void ServerHostDisconnectsIdleSessions()
 void ServerHostBoundsGracefulCloseWithoutIdleTimeout()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization for graceful timeout succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization for graceful timeout succeeded");
     if (!sockets.IsReady())
     {
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 35);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     auto observer = std::make_shared<RetainingSessionObserver>();
     ServerCore::Runtime::ServerHost host;
     // 실제 Config 경로로 짧은 기한을 넣는다. 기본 5초가 남아 있거나 idle=0이 타이머를 끄면
     // 아래 2초 관찰 안에 닫힐 수 없으므로 설정 전달과 독립 실행을 함께 검증한다.
-    const auto config = LoadConfigSnapshotForHost("servercore.host.port = " + std::to_string(port) +
+    const auto config = LoadConfigSnapshotForHost(
+        "servercore.host.port = " + std::to_string(port) +
         "\nservercore.host.listen-address = 127.0.0.1\n"
         "servercore.host.idle-session-timeout-ms = 0\n"
         "servercore.host.graceful-close-timeout-ms = 300\n"
@@ -2904,12 +2969,14 @@ void ServerHostBoundsGracefulCloseWithoutIdleTimeout()
         return;
     }
     const auto configured = host.Configure(config.Value());
-    ServerCoreTest::ExpectTrue(configured.IsOk(), "graceful timeout is independent from idle timeout");
+    ServerCoreTest::ExpectTrue(
+        configured.IsOk(), "graceful timeout is independent from idle timeout");
     if (!configured.IsOk())
     {
         return;
     }
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const auto started = host.Start();
     ServerCoreTest::ExpectTrue(started.IsOk(), "the graceful timeout Host starts");
     if (!started.IsOk())
@@ -2952,7 +3019,7 @@ void ServerHostBoundsGracefulCloseWithoutIdleTimeout()
     }
     const auto stalled = CaptureMetrics(host);
     const bool hasStalledQueue = stalled.IsOk() && stalled.Value().activeSessionCount == 1 &&
-                                stalled.Value().sessionSendQueues[0].queuedBytes > 900000;
+                                 stalled.Value().sessionSendQueues[0].queuedBytes > 900000;
     ServerCoreTest::ExpectTrue(backpressureObserved && !unexpectedSendFailure && hasStalledQueue,
         "the non-reading peer retains a blocked send queue before graceful close");
     ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Session::SessionState::Connected),
@@ -2993,8 +3060,8 @@ void ServerHostBoundsGracefulCloseWithoutIdleTimeout()
     }
     ServerCoreTest::ExpectTrue(acceptedActivity >= 2,
         "the peer continues sending activity while its graceful drain is blocked");
-    ServerCoreTest::ExpectTrue(closed,
-        "graceful close expires with idle disabled even while inbound activity continues");
+    ServerCoreTest::ExpectTrue(
+        closed, "graceful close expires with idle disabled even while inbound activity continues");
     const auto afterClose = CaptureMetrics(host);
     ServerCoreTest::ExpectTrue(afterClose.IsOk() && afterClose.Value().activeSessionCount == 0,
         "expired graceful close releases the only active session slot");
@@ -3010,7 +3077,8 @@ void ServerHostBoundsGracefulCloseWithoutIdleTimeout()
     ServerCoreTest::ExpectTrue(replaced, "a replacement client uses the reclaimed session slot");
     if (replaced)
     {
-        const auto replacementSend = observer->SessionAt(1)->Send("runtime.graceful.recovered", body);
+        const auto replacementSend =
+            observer->SessionAt(1)->Send("runtime.graceful.recovered", body);
         ServerCoreTest::ExpectTrue(replacementSend.IsOk(),
             "a replacement session can reserve the shared send budget reclaimed from the drain");
     }
@@ -3022,10 +3090,11 @@ void ServerHostBoundsGracefulCloseWithoutIdleTimeout()
 /// <summary>부팅 실패 중 소유자 파기가 다른 Stop의 실행 문맥 검사와 직렬화되는지 본다.</summary>
 void ServerHostFailedStartSerializesOwnerResetWithStop()
 {
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 36);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     ServerCore::Net::Acceptor occupiedPort;
     const auto listening = occupiedPort.Listen("127.0.0.1", port, 8);
-    ServerCoreTest::ExpectTrue(listening.IsOk(), "a listener reserves the startup-failure test port");
+    ServerCoreTest::ExpectTrue(
+        listening.IsOk(), "a listener reserves the startup-failure test port");
     if (!listening.IsOk())
     {
         return;
@@ -3048,8 +3117,8 @@ void ServerHostFailedStartSerializesOwnerResetWithStop()
     ServerCore::Core::Status startResult = ServerCore::Core::Status::Ok();
     std::thread starter([&host, &startResult] { startResult = host.Start(); });
     const bool resetEntered = gate->WaitForReset(WaitLimit);
-    ServerCoreTest::ExpectTrue(resetEntered,
-        "bind failure reaches cleanup after I/O and parse workers have been created");
+    ServerCoreTest::ExpectTrue(
+        resetEntered, "bind failure reaches cleanup after I/O and parse workers have been created");
     if (!resetEntered)
     {
         gate->Release();
@@ -3078,8 +3147,10 @@ void ServerHostFailedStartSerializesOwnerResetWithStop()
         "Stop inspects the completed cleanup only after the owner reset boundary releases");
     ServerCore::Runtime::TestAccess::ClearFailedStartOwnerGate(gate);
     ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::PlatformError),
-        static_cast<int>(startResult.Code()), "the occupied port preserves the original Start failure");
-    ServerCoreTest::ExpectTrue(!host.IsRunning(), "failed Start and concurrent Stop leave the Host stopped");
+        static_cast<int>(startResult.Code()),
+        "the occupied port preserves the original Start failure");
+    ServerCoreTest::ExpectTrue(
+        !host.IsRunning(), "failed Start and concurrent Stop leave the Host stopped");
     ServerCoreTest::ExpectEqual(std::uint16_t{ 0 }, host.Port(), "failed startup exposes no port");
     occupiedPort.Stop();
     host.Stop();
@@ -3095,7 +3166,7 @@ void ServerHostConcurrentStopsWaitForBlockedHandler()
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 16);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     auto observer = std::make_shared<RecordingSessionObserver>();
     auto handler = std::make_shared<BlockingReceiveHandler>();
     ServerCore::Runtime::ServerHost host;
@@ -3114,7 +3185,8 @@ void ServerHostConcurrentStopsWaitForBlockedHandler()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status registered = host.GetDispatcher().Register("runtime.stop.block",
         [handler](const std::shared_ptr<ServerCore::Session::Session>& session,
             const ServerCore::Protocol::Message& message)
@@ -3258,13 +3330,14 @@ void ServerHostConcurrentStopsWaitForBlockedHandler()
 void ServerHostReportsMetrics()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(sockets.IsReady(), "socket runtime initialization for the metrics test succeeded");
+    ServerCoreTest::ExpectTrue(
+        sockets.IsReady(), "socket runtime initialization for the metrics test succeeded");
     if (!sockets.IsReady())
     {
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 12);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     auto observer = std::make_shared<RecordingSessionObserver>();
     auto handler = std::make_shared<MetricsResponseHandler>();
     ServerCore::Runtime::ServerHost host;
@@ -3281,7 +3354,8 @@ void ServerHostReportsMetrics()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status registered = host.GetDispatcher().Register(
         "runtime.metrics",
         [handler](const std::shared_ptr<ServerCore::Session::Session>& session,
@@ -3455,7 +3529,7 @@ void ServerHostParseWorkersPreserveSessionHandlerOrder()
     }
 
     constexpr std::size_t FrameCount = 8;
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 13);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     auto observer = std::make_shared<RecordingSessionObserver>();
     ServerCore::Runtime::ServerHost host;
     auto handler = std::make_shared<BlockingOrderedParseHandler>(host);
@@ -3473,7 +3547,8 @@ void ServerHostParseWorkersPreserveSessionHandlerOrder()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status registered = host.GetDispatcher().Register(
         "runtime.parse.order",
         [handler](const std::shared_ptr<ServerCore::Session::Session>& session,
@@ -3608,8 +3683,8 @@ void ServerHostParseWorkersPreserveSessionHandlerOrder()
 void ServerHostFallbackFinalizerReleasesQueuedParseWork()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the parse-finalizer fallback test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the parse-finalizer fallback test succeeded");
     if (!sockets.IsReady())
     {
         return;
@@ -3625,7 +3700,7 @@ void ServerHostFallbackFinalizerReleasesQueuedParseWork()
         frames.insert(frames.end(), frame.begin(), frame.end());
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 34);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     ServerCore::Runtime::ServerHost host;
     auto observer = std::make_shared<RetainingSessionObserver>();
     auto parseGate = std::make_shared<BlockingParseWorkerGate>();
@@ -3650,7 +3725,8 @@ void ServerHostFallbackFinalizerReleasesQueuedParseWork()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status started = host.Start();
     ServerCoreTest::ExpectTrue(started.IsOk(), "ServerHost started for parse-finalizer fallback");
     if (!started.IsOk())
@@ -3751,14 +3827,14 @@ void ServerHostFallbackFinalizerReleasesQueuedParseWork()
 void ServerHostFallbackFinalizerAllowsReentrantDisconnect()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the reentrant finalizer test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the reentrant finalizer test succeeded");
     if (!sockets.IsReady())
     {
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 35);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     ServerCore::Runtime::ServerHost host;
     auto observer = std::make_shared<ReentrantCloseObserver>();
     auto connectionStartGate = std::make_shared<BlockingConnectionStartGate>();
@@ -3777,7 +3853,8 @@ void ServerHostFallbackFinalizerAllowsReentrantDisconnect()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status started = host.Start();
     ServerCoreTest::ExpectTrue(
         started.IsOk(), "ServerHost started for the reentrant finalizer test");
@@ -3831,14 +3908,14 @@ void ServerHostFallbackFinalizerAllowsReentrantDisconnect()
 void ServerHostFallbackCloseNotificationCanStopHost()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the fallback close-stop test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the fallback close-stop test succeeded");
     if (!sockets.IsReady())
     {
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 36);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     ServerCore::Runtime::ServerHost host;
     auto connectionStartGate = std::make_shared<BlockingConnectionStartGate>();
     const ScopedBeforeConnectionStartGate gateScope(connectionStartGate);
@@ -3857,7 +3934,8 @@ void ServerHostFallbackCloseNotificationCanStopHost()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status started = host.Start();
     ServerCoreTest::ExpectTrue(
         started.IsOk(), "ServerHost started for the fallback close-stop test");
@@ -3900,14 +3978,14 @@ void ServerHostFallbackCloseNotificationCanStopHost()
 void ServerHostFallbackCloseNotificationStopsStartingHost()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the Starting close-stop test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the Starting close-stop test succeeded");
     if (!sockets.IsReady())
     {
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 38);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     ServerCore::Runtime::ServerHost host;
     auto connectionStartGate = std::make_shared<BlockingConnectionStartGate>();
     const ScopedBeforeConnectionStartGate connectionStartGateScope(connectionStartGate);
@@ -3928,7 +4006,8 @@ void ServerHostFallbackCloseNotificationStopsStartingHost()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
 
     ServerCore::Core::Status startResult = ServerCore::Core::Status::Ok();
     std::mutex startResultMutex;
@@ -4009,14 +4088,14 @@ void ServerHostFallbackCloseNotificationStopsStartingHost()
 void ServerHostStopWaitsForCloseNotification()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the close-notification drain test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the close-notification drain test succeeded");
     if (!sockets.IsReady())
     {
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 37);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     ServerCore::Runtime::ServerHost host;
     auto observer = std::make_shared<BlockingCloseObserver>();
 
@@ -4033,7 +4112,8 @@ void ServerHostStopWaitsForCloseNotification()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status started = host.Start();
     ServerCoreTest::ExpectTrue(
         started.IsOk(), "ServerHost started for the close-notification drain test");
@@ -4096,8 +4176,8 @@ void VerifyGlobalParseBudget(const std::uint16_t port, const std::uint32_t total
     const std::uint32_t totalTaskLimit)
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the aggregate parse budget test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the aggregate parse budget test succeeded");
     if (!sockets.IsReady())
     {
         return;
@@ -4131,7 +4211,8 @@ void VerifyGlobalParseBudget(const std::uint16_t port, const std::uint32_t total
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status registered = host.GetDispatcher().Register(
         "runtime.parse.budget",
         [handler](const std::shared_ptr<ServerCore::Session::Session>& session,
@@ -4312,14 +4393,14 @@ void VerifyGlobalParseBudget(const std::uint16_t port, const std::uint32_t total
 void ServerHostBoundsTotalPendingParseBytes()
 {
     // 첫 reservation 하나가 전체 byte 예산을 모두 채우고, task 예산은 둘째 frame을 막지 않는다.
-    VerifyGlobalParseBudget(static_cast<std::uint16_t>(PortBase + 18), 1, 2);
+    VerifyGlobalParseBudget(ServerCoreTest::FreeLoopbackTcpPort(), 1, 2);
 }
 
 void ServerHostRollsBackParseBytesWhenTotalTaskLimitRejects()
 {
     // 둘째 frame은 byte를 먼저 잡을 수 있지만 task reservation에서 거절된다. 그 byte가 즉시
     // 반납되지 않으면 VerifyGlobalParseBudget의 afterRejected 지표가 두 frame 크기로 남는다.
-    VerifyGlobalParseBudget(static_cast<std::uint16_t>(PortBase + 19), 2, 1);
+    VerifyGlobalParseBudget(ServerCoreTest::FreeLoopbackTcpPort(), 2, 1);
 }
 
 void ServerHostBoundsPendingReceiveBytes()
@@ -4332,8 +4413,9 @@ void ServerHostBoundsPendingReceiveBytes()
         return;
     }
 
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 7);
-    const std::vector<std::byte> frame = MakeFrame("{\"type\":\"runtime.block\",\"body\":{}}");
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
+    // 예산의 하한은 수신 한 번이므로, 그 크기와 정확히 같은 frame 하나를 만든다.
+    const std::vector<std::byte> frame = MakeFrameOfSize(ServerCore::Net::MaximumReceiveChunkBytes);
     auto observer = std::make_shared<RecordingSessionObserver>();
     auto handler = std::make_shared<BlockingReceiveHandler>();
     ServerCore::Runtime::ServerHost host;
@@ -4355,13 +4437,14 @@ void ServerHostBoundsPendingReceiveBytes()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status registered = host.GetDispatcher().Register(
         "runtime.block",
         [handler](const std::shared_ptr<ServerCore::Session::Session>& session,
             const ServerCore::Protocol::Message& message)
         { return handler->Handle(session, *message.Body()); },
-        1024);
+        2 * ServerCore::Net::MaximumReceiveChunkBytes);
     ServerCoreTest::ExpectTrue(registered.IsOk(), "the blocking receive handler registered");
     if (!registered.IsOk())
     {
@@ -4527,15 +4610,16 @@ void ServerHostBoundsPendingReceiveBytes()
 void ServerHostBoundsTotalPendingReceiveBytes()
 {
     const SocketRuntime sockets;
-    ServerCoreTest::ExpectTrue(
-        sockets.IsReady(), "socket runtime initialization for the aggregate receive budget test succeeded");
+    ServerCoreTest::ExpectTrue(sockets.IsReady(),
+        "socket runtime initialization for the aggregate receive budget test succeeded");
     if (!sockets.IsReady())
     {
         return;
     }
 
-    const std::vector<std::byte> frame = MakeFrame("{\"type\":\"runtime.block\",\"body\":{}}");
-    const std::uint16_t port = static_cast<std::uint16_t>(PortBase + 8);
+    // 예산의 하한은 수신 한 번이므로, 그 크기와 정확히 같은 frame 하나를 만든다.
+    const std::vector<std::byte> frame = MakeFrameOfSize(ServerCore::Net::MaximumReceiveChunkBytes);
+    const std::uint16_t port = ServerCoreTest::FreeLoopbackTcpPort();
     auto observer = std::make_shared<RecordingSessionObserver>();
     auto handler = std::make_shared<BlockingReceiveHandler>();
     ServerCore::Runtime::ServerHost host;
@@ -4544,9 +4628,9 @@ void ServerHostBoundsTotalPendingReceiveBytes()
     options.port = port;
     options.ioWorkerThreadCount = 1;
     options.acceptBacklog = 8;
-    options.maxPendingReceiveBytes = 64;
-    // 첫 번째 프레임이 처리기 안에 머무는 동안 이 전체 예산을 모두 점유한다. 두 번째 연결의
-    // 첫 수신 바이트는 세션별 여유가 있어도 Host 전체 예산에서 거절되어야 한다.
+    options.maxPendingReceiveBytes = static_cast<std::uint32_t>(2 * frame.size());
+    // 첫 번째 프레임이 처리기 안에 머무는 동안 그 batch의 적어도 한 바이트가 이 전체 예산을 점유한다.
+    // 같은 크기인 두 번째 연결의 frame은 세션별 여유가 있어도 합이 Host 전체 예산을 넘어 거절된다.
     options.maxTotalPendingReceiveBytes = static_cast<std::uint32_t>(frame.size());
 
     ServerCoreTest::ExpectTrue(
@@ -4561,13 +4645,14 @@ void ServerHostBoundsTotalPendingReceiveBytes()
         return;
     }
 
-    host.SetSessionObserver(observer);
+    ServerCoreTest::ExpectTrue(
+        host.SetSessionObserver(observer).IsOk(), "the observer is set before Start");
     const ServerCore::Core::Status registered = host.GetDispatcher().Register(
         "runtime.block",
         [handler](const std::shared_ptr<ServerCore::Session::Session>& session,
             const ServerCore::Protocol::Message& message)
         { return handler->Handle(session, *message.Body()); },
-        1024);
+        2 * ServerCore::Net::MaximumReceiveChunkBytes);
     ServerCoreTest::ExpectTrue(registered.IsOk(), "the aggregate-budget handler registered");
     if (!registered.IsOk())
     {
@@ -4787,10 +4872,12 @@ const ServerCoreTest::CheckRegistration gServerHostPreparedSendsPreserveFramingL
     &ServerHostPreparedSendsPreserveFramingLimitsAndMetrics
 };
 const ServerCoreTest::CheckRegistration gServerHostBoundsGracefulCloseWithoutIdleTimeout{
-    "Runtime.ServerHostBoundsGracefulCloseWithoutIdleTimeout", &ServerHostBoundsGracefulCloseWithoutIdleTimeout
+    "Runtime.ServerHostBoundsGracefulCloseWithoutIdleTimeout",
+    &ServerHostBoundsGracefulCloseWithoutIdleTimeout
 };
 const ServerCoreTest::CheckRegistration gServerHostFailedStartSerializesOwnerResetWithStop{
-    "Runtime.ServerHostFailedStartSerializesOwnerResetWithStop", &ServerHostFailedStartSerializesOwnerResetWithStop
+    "Runtime.ServerHostFailedStartSerializesOwnerResetWithStop",
+    &ServerHostFailedStartSerializesOwnerResetWithStop
 };
 const ServerCoreTest::CheckRegistration gServerHostConcurrentStopsWaitForBlockedHandler{
     "Runtime.ServerHostConcurrentStopsWaitForBlockedHandler",

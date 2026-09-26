@@ -34,30 +34,56 @@ struct RequestLimitState
                                static_cast<long double>(options.refillInterval.count()));
         entry.refill = now;
     }
-    std::size_t Prune(Clock::time_point now) noexcept
+    // 비활성 항목의 버킷이 가득 차는 가장 이른 시각의 하한. 반올림은 이르게, 먼 값은 24시간으로
+    // 잘라 오버플로 없이 보수적으로 둔다.
+    Clock::time_point FullAt(const RequestLimitEntry& entry) const noexcept
+    {
+        const auto missing = static_cast<long double>(options.burstTokens) - entry.tokens;
+        const auto milliseconds = missing *
+                                  static_cast<long double>(options.refillInterval.count()) /
+                                  static_cast<long double>(options.refillTokens);
+        constexpr long double cap = 24.0L * 60 * 60 * 1000;
+        return entry.refill + std::chrono::duration_cast<Clock::duration>(
+                                  std::chrono::duration<long double, std::milli>(
+                                      (std::min)(cap, (std::max)(0.0L, milliseconds))));
+    }
+    // pressure가 참이면 키 표가 가득 찬 상태다. 활성 permit이 없고 버킷이 가득 찬 항목은 새로 만든
+    // 항목과 구별되지 않으므로 idleExpiry와 무관하게 비운다(EXEC-4).
+    std::size_t Prune(Clock::time_point now, bool pressure = false) noexcept
     {
         std::size_t removed = 0;
+        auto retry = Clock::time_point::max();
         for (auto it = entries.begin(); it != entries.end();)
         {
             auto& entry = it->second;
             Refill(entry, now);
+            const bool full = entry.tokens >= static_cast<long double>(options.burstTokens);
             if (!entry.active &&
-                (closed || (now - entry.seen >= options.idleExpiry &&
-                               entry.tokens >= static_cast<long double>(options.burstTokens))))
+                (closed || (full && (pressure || now - entry.seen >= options.idleExpiry))))
             {
                 keyBytes -= it->first.size();
                 it = entries.erase(it);
                 ++removed;
             }
             else
+            {
+                if (!entry.active)
+                    retry = (std::min)(retry, FullAt(entry));
                 ++it;
+            }
         }
+        if (pressure)
+            pressureRetry = retry;
         return removed;
     }
     RequestLimiterOptions options;
     std::mutex mutex;
     std::map<std::string, RequestLimitEntry, std::less<>> entries;
     std::size_t keyBytes = 0, active = 0;
+    // 이 시각 전에는 압박 스캔이 비울 항목이 없다. 비활성 항목은 토큰이 줄 뿐 더 일찍 차지 않고,
+    // 활성 항목이 비활성이 되는 permit 반환은 이 값을 지운다. 그래서 가득 찬 동안 새 키마다 전체를
+    // 다시 훑지 않는다.
+    Clock::time_point pressureRetry{};
     bool closed = false;
 };
 }
@@ -99,6 +125,7 @@ void RequestPermit::Reset() noexcept
     --entry->active;
     --state->active;
     entry->seen = Detail::Clock::now();
+    state->pressureRetry = {};
     if (state->closed)
         (void)state->Prune(entry->seen);
 }
@@ -153,9 +180,10 @@ Result<RequestAdmission> RequestLimiter::TryAcquire(std::string_view key, std::u
         auto found = mState->entries.find(key);
         if (found == mState->entries.end())
         {
-            if (mState->entries.size() >= options.maxKeys ||
-                key.size() > options.maxRetainedKeyBytes - mState->keyBytes)
-                (void)mState->Prune(now);
+            if ((mState->entries.size() >= options.maxKeys ||
+                    key.size() > options.maxRetainedKeyBytes - mState->keyBytes) &&
+                now >= mState->pressureRetry)
+                (void)mState->Prune(now, true);
             if (mState->entries.size() >= options.maxKeys ||
                 key.size() > options.maxRetainedKeyBytes - mState->keyBytes)
             {

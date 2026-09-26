@@ -1,5 +1,7 @@
 #include "ServerCore/Protocol/Json.h"
 
+#include "ServerCore/Core/Assert.h"
+
 #include "Core/Utf8Internal.h"
 #include "Protocol/JsonInternal.h"
 
@@ -29,6 +31,11 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+/// <summary>입력이 JsonParseLimits::maxValues보다 많은 값을 만들려 했다.</summary>
+class JsonValueLimitExceeded final : public std::exception
+{
+};
+
 struct TopLevelMembers
 {
     bool hasBody = false;
@@ -42,52 +49,124 @@ struct TopLevelMembers
 /// </remarks>
 constexpr std::size_t MaximumJsonNestingDepth = 256;
 
+/// <summary>문법 검사를 마친 JSON 숫자 토큰의 절댓값이 1보다 작은지 본다.</summary>
+/// <remarks>
+/// from_chars가 범위 밖이라고 한 수가 0 쪽으로 넘쳤는지 무한대 쪽으로 넘쳤는지 가르는 데 쓴다.
+/// 범위 밖인 double은 1e-300보다 작거나 1e300보다 크므로, 가장 높은 0이 아닌 자리의 십진 지수
+/// 부호만 알면 된다. 지수 표기는 포화시켜 읽으므로 자릿수가 아무리 길어도 넘치지 않는다.
+/// </remarks>
+[[nodiscard]] bool MagnitudeBelowOne(const std::string_view token) noexcept
+{
+    constexpr std::int64_t ExponentLimit = 100'000'000'000'000'000;
+    const auto isDigit = [](const char character) { return character >= '0' && character <= '9'; };
+    std::size_t position = !token.empty() && token.front() == '-' ? 1 : 0;
+    const std::size_t integerStart = position;
+    while (position < token.size() && isDigit(token[position]))
+    {
+        ++position;
+    }
+
+    // 가장 높은 0이 아닌 자리가 10의 leading제곱 자리다. 그런 자리가 없으면 값이 0이다.
+    const auto integerDigits = static_cast<std::int64_t>(position - integerStart);
+    bool nonZero = false;
+    std::int64_t leading = 0;
+    for (std::size_t index = integerStart; index < position && !nonZero; ++index)
+    {
+        if (token[index] != '0')
+        {
+            nonZero = true;
+            leading = integerDigits - 1 - static_cast<std::int64_t>(index - integerStart);
+        }
+    }
+    if (position < token.size() && token[position] == '.')
+    {
+        const std::size_t fractionStart = ++position;
+        for (; position < token.size() && isDigit(token[position]); ++position)
+        {
+            if (!nonZero && token[position] != '0')
+            {
+                nonZero = true;
+                leading = -1 - static_cast<std::int64_t>(position - fractionStart);
+            }
+        }
+    }
+    if (!nonZero)
+    {
+        return true;
+    }
+
+    std::int64_t exponent = 0;
+    if (position < token.size() && (token[position] == 'e' || token[position] == 'E'))
+    {
+        ++position;
+        const bool negative = position < token.size() && token[position] == '-';
+        if (position < token.size() && (token[position] == '+' || token[position] == '-'))
+        {
+            ++position;
+        }
+        for (; position < token.size() && isDigit(token[position]); ++position)
+        {
+            exponent = (std::min)(exponent * 10 + (token[position] - '0'), ExponentLimit);
+        }
+        if (negative)
+        {
+            exponent = -exponent;
+        }
+    }
+    return leading + exponent < 0;
+}
+
 class Parser final
 {
 public:
-    explicit Parser(const std::string_view text)
+    Parser(const std::string_view text, const std::size_t maxValues)
         : mText(text)
+        , mRemainingValues(maxValues)
     {
     }
 
     [[nodiscard]] JsonValue ParseDocument()
     {
-        return ParseRoot(nullptr);
+        BeginDocument();
+        JsonValue result = ParseValue(0);
+        EndDocument();
+        return result;
     }
 
     [[nodiscard]] Detail::ParsedEnvelopeDocument ParseEnvelopeDocument()
     {
-        TopLevelMembers members;
+        BeginDocument();
         Detail::ParsedEnvelopeDocument document;
-        document.value = ParseRoot(&members);
-        document.hasBody = members.hasBody;
-        document.rawBodySize = members.rawBodySize;
+        if (mPosition < mText.size() && mText[mPosition] == '{')
+        {
+            TopLevelMembers members;
+            document.members = ParseObjectMembers(1, &members);
+            document.isObject = true;
+            document.hasBody = members.hasBody;
+            document.rawBodySize = members.rawBodySize;
+        }
+        else
+        {
+            (void)ParseValue(0);
+        }
+        EndDocument();
         return document;
     }
 
 private:
-    [[nodiscard]] JsonValue ParseRoot(TopLevelMembers* const members)
+    void BeginDocument()
     {
         SkipByteOrderMark();
         SkipWhitespace();
+    }
 
-        JsonValue result;
-        if (members != nullptr && mPosition < mText.size() && mText[mPosition] == '{')
-        {
-            result = ParseObject(1, members);
-        }
-        else
-        {
-            result = ParseValue(0);
-        }
-
+    void EndDocument()
+    {
         SkipWhitespace();
         if (mPosition != mText.size())
         {
             Fail("unexpected trailing data");
         }
-
-        return result;
     }
 
     [[noreturn]] void Fail(const char* message) const
@@ -155,6 +234,12 @@ private:
         {
             Fail("expected a value");
         }
+        // 값 하나가 DOM 노드 하나다. 할당 전에 세어, 상한을 넘는 입력이 메모리를 먼저 키우지 못하게 한다.
+        if (mRemainingValues == 0)
+        {
+            throw JsonValueLimitExceeded();
+        }
+        --mRemainingValues;
 
         switch (mText[mPosition])
         {
@@ -428,6 +513,13 @@ private:
 
         double result = 0.0;
         const auto conversion = std::from_chars(first, last, result, std::chars_format::general);
+        if (conversion.ptr == last && conversion.ec == std::errc::result_out_of_range &&
+            MagnitudeBelowOne(text))
+        {
+            // 0에 너무 가까워 double로 나타낼 수 없는 수는 문법상 유효한 JSON이므로 거절하지 않고
+            // 부호를 지킨 0으로 보관한다. 범위 밖 결과의 값은 구현마다 다르게 남으므로 쓰지 않는다.
+            return JsonValue(text.front() == '-' ? -0.0 : 0.0);
+        }
         if (conversion.ec != std::errc{} || conversion.ptr != last || !std::isfinite(result))
         {
             Fail("number is out of range");
@@ -462,12 +554,18 @@ private:
 
     [[nodiscard]] JsonValue ParseObject(const std::size_t depth, TopLevelMembers* topLevelMembers)
     {
+        return JsonValue(ParseObjectMembers(depth, topLevelMembers));
+    }
+
+    [[nodiscard]] JsonValue::Object ParseObjectMembers(
+        const std::size_t depth, TopLevelMembers* topLevelMembers)
+    {
         (void)Consume('{');
         SkipWhitespace();
         JsonValue::Object result;
         if (Consume('}'))
         {
-            return JsonValue(std::move(result));
+            return result;
         }
         while (true)
         {
@@ -502,7 +600,7 @@ private:
             SkipWhitespace();
             if (Consume('}'))
             {
-                return JsonValue(std::move(result));
+                return result;
             }
             if (!Consume(','))
             {
@@ -514,6 +612,7 @@ private:
 
     std::string_view mText;
     std::size_t mPosition = 0;
+    std::size_t mRemainingValues;
 };
 
 void DumpEscapedString(const std::string& value, std::string& output)
@@ -620,8 +719,7 @@ void DumpEscapedString(const std::string& value, std::string& output)
             output.append(buffer, result.ptr);
             // 최단 표기가 정수 토큰이면 64-bit 정수 범위를 넘는 유한 double도 생긴다.
             // 파서가 그 토큰을 범위 밖 정수로 거절하지 않도록 double 표기를 보존한다.
-            const std::string_view formatted(buffer,
-                static_cast<std::size_t>(result.ptr - buffer));
+            const std::string_view formatted(buffer, static_cast<std::size_t>(result.ptr - buffer));
             if (formatted.find_first_of(".eE") == std::string_view::npos)
             {
                 output += ".0";
@@ -737,7 +835,7 @@ void DumpEscapedString(const std::string& value, std::string& output)
 // Both public JSON entry points share text validation and exception conversion.
 template <typename Value>
 [[nodiscard]] Core::Result<Value> ParseText(
-    const std::string_view text, Value (Parser::*parse)())
+    const std::string_view text, Value (Parser::*parse)(), const std::size_t maxValues)
 {
     if (!Core::Detail::IsValidUtf8(text))
     {
@@ -747,12 +845,17 @@ template <typename Value>
 
     try
     {
-        Parser parser(text);
+        Parser parser(text, maxValues);
         return Core::Result<Value>::FromValue((parser.*parse)());
     }
     catch (const JsonParseFailure& failure)
     {
         return Core::Result<Value>::FromStatus(InvalidFormatFrom(failure));
+    }
+    catch (const JsonValueLimitExceeded&)
+    {
+        return Core::Result<Value>::FromStatus(
+            Core::Status::FailWithoutMessage(Core::ErrorCode::TooLarge));
     }
     catch (const std::bad_alloc&)
     {
@@ -807,6 +910,12 @@ JsonValue::JsonValue(const bool value)
 JsonValue::JsonValue(const double value)
     : mValue(Number(value))
 {
+}
+
+JsonValue::JsonValue(const char* const value)
+{
+    SERVERCORE_ASSERT(value != nullptr, "JsonValue was constructed from a null C string");
+    mValue = std::string(value);
 }
 
 JsonValue::JsonValue(std::string value)
@@ -934,12 +1043,23 @@ const std::uint64_t* JsonValue::TryUInt64() const noexcept
 
 Core::Result<JsonValue> JsonValue::Parse(const std::string_view text)
 {
-    return ParseText(text, &Parser::ParseDocument);
+    return Parse(text, JsonParseLimits{});
+}
+
+Core::Result<JsonValue> JsonValue::Parse(const std::string_view text, const JsonParseLimits& limits)
+{
+    return ParseText(text, &Parser::ParseDocument, limits.maxValues);
 }
 
 Core::Result<JsonValue> JsonValue::ParseBytes(const std::span<const std::byte> bytes)
 {
-    return ParseText(AsText(bytes), &Parser::ParseDocument);
+    return ParseBytes(bytes, JsonParseLimits{});
+}
+
+Core::Result<JsonValue> JsonValue::ParseBytes(
+    const std::span<const std::byte> bytes, const JsonParseLimits& limits)
+{
+    return ParseText(AsText(bytes), &Parser::ParseDocument, limits.maxValues);
 }
 
 Core::Result<std::string> JsonValue::Dump() const
@@ -972,9 +1092,10 @@ Core::Result<std::string> Detail::DumpJsonAtDepth(const JsonValue& value, const 
 
 namespace Detail
 {
-Core::Result<ParsedEnvelopeDocument> ParseEnvelopeDocument(const std::span<const std::byte> bytes)
+Core::Result<ParsedEnvelopeDocument> ParseEnvelopeDocument(
+    const std::span<const std::byte> bytes, const std::size_t maxValues)
 {
-    return ParseText(AsText(bytes), &Parser::ParseEnvelopeDocument);
+    return ParseText(AsText(bytes), &Parser::ParseEnvelopeDocument, maxValues);
 }
 }
 }

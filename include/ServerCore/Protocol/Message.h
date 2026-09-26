@@ -62,6 +62,8 @@ public:
 
 private:
     friend SERVERCORE_API Core::Result<Message> ParseMessage(std::span<const std::byte> jsonBody);
+    friend SERVERCORE_API Core::Result<Message> ParseMessage(
+        std::span<const std::byte> jsonBody, const JsonParseLimits& limits);
 
     std::string mType;
     std::optional<JsonValue> mBody;
@@ -90,6 +92,7 @@ class PreparedJsonValue
 public:
     [[nodiscard]] std::span<const std::byte> Bytes() const noexcept { return mBytes; }
     [[nodiscard]] std::size_t Size() const noexcept { return mBytes.size(); }
+
 private:
     PreparedJsonValue() = default;
     friend class Core::Result<PreparedJsonValue>;
@@ -104,6 +107,7 @@ class PreparedMessage
 public:
     [[nodiscard]] std::span<const std::byte> Bytes() const noexcept { return mBytes; }
     [[nodiscard]] std::size_t Size() const noexcept { return mBytes.size(); }
+
 private:
     PreparedMessage() = default;
     friend class Core::Result<PreparedMessage>;
@@ -138,6 +142,14 @@ SERVERCORE_API Core::Result<PreparedMessage> PrepareArrayMessage(std::string_vie
 /// </remarks>
 SERVERCORE_API Core::Result<Message> ParseMessage(std::span<const std::byte> jsonBody);
 
+/// <summary>limits 안에서 프레임 본문을 해석한다.</summary>
+/// <returns>
+/// 본문이 limits.maxValues보다 많은 JSON 값을 만들려 하면 ErrorCode::TooLarge다. 나머지 실패는
+/// 위 ParseMessage와 같다. 위 overload는 제한 없는 limits로 이것을 부른다.
+/// </returns>
+SERVERCORE_API Core::Result<Message> ParseMessage(
+    std::span<const std::byte> jsonBody, const JsonParseLimits& limits);
+
 /// <summary>선택 필드까지 포함해 봉투 하나를 직렬화한다.</summary>
 /// <remarks>
 /// body가 없으면 error가 반드시 있어야 한다. error는 객체이고 그 안의 code는 문자열이어야
@@ -149,5 +161,6 @@ SERVERCORE_API Core::Result<std::vector<std::byte>> SerializeMessage(const Messa
 /// 타입과 본문으로 봉투를 만들어 UTF-8 JSON 바이트로 만든다.
 /// </summary>
 /// <remarks>머리는 붙이지 않는다. 그것은 EncodeFrame의 일이다.</remarks>
-SERVERCORE_API Core::Result<std::vector<std::byte>> SerializeMessage(std::string_view type, const JsonValue& body);
+SERVERCORE_API Core::Result<std::vector<std::byte>> SerializeMessage(
+    std::string_view type, const JsonValue& body);
 }

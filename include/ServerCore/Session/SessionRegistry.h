@@ -103,8 +103,14 @@ public:
     /// 각 세션에 대해 부른다. 이 안에서 Register나 Unregister를 불러도 된다. visitor는
     /// 직렬 실행 문맥을 오래 점유해서는 안 된다.
     /// </param>
+    /// <returns>
+    /// 순회를 마치면 Ok다. 호출 시점의 snapshot을 할당하지 못하면 한 세션도 방문하지 않고
+    /// AllocationFailure를 돌려주며 예외를 던지지 않는다(SessionRegistry.ForEachReportsSnapshotAllocationFailure).
+    /// visitor가 던진 예외는 그대로 전파된다.
+    /// </returns>
     /// <remarks>BindToCurrentThread()로 묶은 직렬 문맥에서만 부를 수 있다.</remarks>
-    SERVERCORE_API void ForEach(const std::function<void(const std::shared_ptr<Session>&)>& visitor) const;
+    [[nodiscard]] SERVERCORE_API Core::Status ForEach(
+        const std::function<void(const std::shared_ptr<Session>&)>& visitor) const;
 
     /// <summary>현재 등록된 세션 수를 준다.</summary>
     /// <remarks>BindToCurrentThread()로 묶은 직렬 문맥에서만 부를 수 있다.</remarks>

@@ -1,6 +1,6 @@
 use servercore::{
     block_on,
-    web::{Body, BodyOptions, EventKind, HttpServer, Options, ResponseHead},
+    web::{Body, BodyOptions, Event, EventKind, HttpServer, Options, ResponseHead},
     web_data::{Multipart, MultipartOptions, PartKind},
     Error, Result,
 };
@@ -54,29 +54,35 @@ fn main() -> Result<()> {
     println!("Listening on 127.0.0.1:{}; POST multipart/form-data to /upload", server.port());
     block_on(async {
         loop {
-            let mut event = server.next().await?;
-            if event.kind()? != EventKind::Request { continue; }
-            let content_type = event.request()?.headers.get("content-type")
-                .and_then(|value| std::str::from_utf8(value).ok()).unwrap_or("").to_owned();
-            let mut body = event.body()?;
-            let response = event.response()?;
-            drop(event);
-            match consume(&mut body, &content_type).await {
-                Ok(total) => {
-                    let reply = format!("validated {total} payload bytes\n");
-                    response.start_async(&ResponseHead { content_length: Some(reply.len() as u64),
-                        ..Default::default() }).await?;
-                    response.write_all(reply.as_bytes()).await?;
-                    response.finish_async().await?;
-                }
-                Err(error) => {
-                    // Cancel stops the underlying upload and aborts its response.
-                    // A production application can choose a bounded error-response
-                    // policy instead; no partially parsed upload is committed here.
-                    body.cancel();
-                    eprintln!("upload rejected: {error}");
-                }
-            }
+            let event = server.next().await?;
+            // A client that fails mid-response ends only its own request.
+            if let Err(error) = handle(event).await { eprintln!("request failed: {error}"); }
         }
     })
+}
+
+async fn handle(mut event: Event) -> Result<()> {
+    if event.kind()? != EventKind::Request { return Ok(()); }
+    let content_type = event.request()?.headers.get("content-type")
+        .and_then(|value| std::str::from_utf8(value).ok()).unwrap_or("").to_owned();
+    let mut body = event.body()?;
+    let response = event.response()?;
+    drop(event);
+    match consume(&mut body, &content_type).await {
+        Ok(total) => {
+            let reply = format!("validated {total} payload bytes\n");
+            response.start_async(&ResponseHead { content_length: Some(reply.len() as u64),
+                ..Default::default() }).await?;
+            response.write_all(reply.as_bytes()).await?;
+            response.finish_async().await
+        }
+        Err(error) => {
+            // Cancel stops the underlying upload and aborts its response.
+            // A production application can choose a bounded error-response
+            // policy instead; no partially parsed upload is committed here.
+            body.cancel();
+            eprintln!("upload rejected: {error}");
+            Ok(())
+        }
+    }
 }

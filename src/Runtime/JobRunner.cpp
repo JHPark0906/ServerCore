@@ -309,11 +309,6 @@ Core::Status JobRunner::Lease::Post(Job job, std::size_t bytes) const
     return mState ? mState->Post(std::move(job), bytes, mControl)
                   : Status::FailWithoutMessage(ErrorCode::Closed);
 }
-Core::Status JobRunner::Lease::PostControl(Job job, std::size_t bytes) const
-{
-    return mState ? mState->Post(std::move(job), bytes, true)
-                  : Status::FailWithoutMessage(ErrorCode::Closed);
-}
 Core::Result<JobRunner::Reservation> JobRunner::Lease::Reserve(std::size_t bytes) const
 {
     return mState ? mState->Reserve(bytes)

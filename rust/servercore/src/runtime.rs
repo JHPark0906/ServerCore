@@ -7,7 +7,9 @@
 //! Last-owner Drop requests shutdown through a bounded native cleanup worker;
 //! use `stop` outside callbacks when a completed join is required. Task handles
 //! only observe work: dropping a task handle does not cancel its job.
-use crate::{check, pointer, reactor, sys, timeout_ms, verify_abi, Error, Result};
+use crate::{
+    callback_status, check, pointer, reactor, sys, timeout_ms, verify_abi, Error, Result,
+};
 use std::{
     ffi::c_void,
     marker::PhantomData,
@@ -75,8 +77,7 @@ where
             _borrow: PhantomData,
         })
     }) {
-        Ok(Ok(())) => sys::SC_OK,
-        Ok(Err(error)) => error.0,
+        Ok(result) => callback_status(result),
         Err(()) => sys::SC_PLATFORM_ERROR,
     }
 }
@@ -95,8 +96,7 @@ where
             _borrow: PhantomData,
         })
     }) {
-        Ok(Ok(())) => sys::SC_OK,
-        Ok(Err(error)) => error.0,
+        Ok(result) => callback_status(result),
         Err(()) => sys::SC_PLATFORM_ERROR,
     }
 }
@@ -682,6 +682,15 @@ mod tests {
             .unwrap();
         assert_eq!(await_ready(terminal.wait()), Err(Error::WOULD_BLOCK));
         assert!(terminal.is_finished());
+        executor.stop().unwrap();
+    }
+    #[test]
+    fn callback_error_carrying_the_ok_status_is_not_success() {
+        let executor = executor();
+        let task = executor
+            .submit(&TaskOptions::default(), |_| Err(Error(sys::SC_OK)))
+            .unwrap();
+        assert_eq!(await_ready(task.wait()), Err(Error::INVALID_ARGUMENT));
         executor.stop().unwrap();
     }
     #[test]

@@ -131,9 +131,14 @@ fn streamed_upload_chunks_retain_capacity_and_outlive_server() {
         ..Default::default()
     })
     .unwrap();
+    // Each held chunk is also charged a fixed bookkeeping cost against
+    // max_buffered_bytes (WEB-4): 160 bytes at 0.3.0, the native
+    // RequestBodyState::PieceOverheadBytes, which the C ABI does not expose.
+    // 8 + 2 * 160 admits two held 4-byte chunks and holds back the third.
+    const PIECE_OVERHEAD_BYTES: usize = 160;
     server
         .set_body_limits(&web::BodyOptions {
-            max_buffered_bytes: 8,
+            max_buffered_bytes: 8 + 2 * PIECE_OVERHEAD_BYTES,
             max_body_bytes: 64,
         })
         .unwrap();
@@ -248,6 +253,9 @@ fn graceful_drain_metrics_and_instance_logger() {
     let mut wire = Vec::new();
     socket.read_to_end(&mut wire).unwrap();
     assert!(wire.ends_with(b"done"));
+    // After closing its send side the server reads until the peer closes
+    // (NET-2 lingering close); the connection, and the drain, end only then.
+    drop(socket);
     block_on(assert_send(server.drain(Duration::from_secs(5)))).unwrap();
     let metrics = server.metrics().unwrap();
     assert_eq!(metrics.accepted_requests, 1);

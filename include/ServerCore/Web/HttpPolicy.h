@@ -37,7 +37,8 @@ class HttpPolicyPipeline
 public:
     SERVERCORE_API static Core::Result<HttpPolicyPipeline> Create(
         std::vector<HttpPolicyRule> rules, HttpPolicyLimits limits = {});
-    SERVERCORE_API Core::Result<HttpPolicyResult> Evaluate(const HttpRequest& request, bool upgrade = false) const;
+    SERVERCORE_API Core::Result<HttpPolicyResult> Evaluate(
+        const HttpRequest& request, bool upgrade = false) const;
     // Suitable for HttpServer::SetRequestPolicy and WebSocketCallbacks::authorize.
     SERVERCORE_API RequestPolicy AsRequestPolicy() const;
 
@@ -70,9 +71,12 @@ SERVERCORE_API Core::Result<HttpPolicyStep> CorsPolicy(CorsOptions options);
 SERVERCORE_API Core::Result<HttpPolicyStep> CommonHeadersPolicy(HttpHeaders headers);
 SERVERCORE_API Core::Result<HttpPolicyStep> RequestIdPolicy(RequestIdOptions options = {});
 SERVERCORE_API HttpPolicyStep ProxyMetadataPolicy(TrustedProxyPolicy policy);
-// Register OPTIONS explicitly so existing path/method resolution still precedes
-// policy admission. Register the pipeline on the server before Start.
-SERVERCORE_API Core::Status RegisterCorsPreflight(HttpServer& server, std::string_view path, bool pattern = false);
+// Register the pipeline on the server before Start.
+// 요청 정책이 설정된 서버에서는 OPTIONS 경로가 없어도 CORS preflight(Origin과 Access-Control-Request-Method가
+// 있는 OPTIONS)가 405보다 먼저 정책에 닿는다. 이 함수는 정책이 preflight를 응답 없이 허용할 때 405 대신
+// 204를 돌려줄 OPTIONS 경로가 필요한 경우에만 쓴다(Web.CorsPreflightReachesPolicyBeforeMethodCheck).
+SERVERCORE_API Core::Status RegisterCorsPreflight(
+    HttpServer& server, std::string_view path, bool pattern = false);
 SERVERCORE_API Core::Result<Protocol::JsonValue> ParseJsonBody(
     const HttpRequest& request, std::size_t maxBytes = 65536);
 SERVERCORE_API Core::Result<HttpResponse> JsonResponse(

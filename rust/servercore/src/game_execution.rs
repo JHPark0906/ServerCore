@@ -1,6 +1,6 @@
 //! Logical ticks and bounded outbound staging. Native scheduler/capacity events
 //! drive progress; these wrappers add no polling worker or simulation ownership.
-use crate::{bytes, check, pointer, reactor, sys, Error, Result};
+use crate::{bytes, callback_status, check, pointer, reactor, sys, Error, Result};
 use std::{
     ffi::c_void,
     marker::PhantomData,
@@ -88,8 +88,7 @@ where
         )
     }));
     match result {
-        Ok(Ok(())) => sys::SC_OK,
-        Ok(Err(error)) => error.0,
+        Ok(result) => callback_status(result),
         Err(payload) => {
             contain(|| drop(payload));
             sys::SC_PLATFORM_ERROR
@@ -188,7 +187,11 @@ impl Ticks {
         .await?
     }
     pub fn metrics(&self) -> Result<TickMetrics> {
-        let mut m = sys::sc_tick_metrics::default();
+        let mut m = sys::sc_tick_metrics {
+            abi_version: sys::SC_ABI_VERSION,
+            struct_size: size_of::<sys::sc_tick_metrics>() as u32,
+            ..Default::default()
+        };
         check(unsafe { sys::sc_tick_get_metrics(self.native_handle(), &mut m) })?;
         Ok(TickMetrics {
             executed: m.executed,
@@ -242,6 +245,8 @@ pub struct OutboundMetrics {
     pub replaced: u64,
     pub expired: u64,
     pub discarded: u64,
+    /// Wake timers postponed because the scheduler was full.
+    pub deferred_wakes: u64,
 }
 struct QueueOwner {
     handle: NonNull<sys::sc_outbound_queue>,
@@ -348,7 +353,11 @@ impl OutboundQueue {
         .await?
     }
     pub fn metrics(&self) -> Result<OutboundMetrics> {
-        let mut m = sys::sc_outbound_metrics::default();
+        let mut m = sys::sc_outbound_metrics {
+            abi_version: sys::SC_ABI_VERSION,
+            struct_size: size_of::<sys::sc_outbound_metrics>() as u32,
+            ..Default::default()
+        };
         check(unsafe { sys::sc_outbound_get_metrics(self.native_handle(), &mut m) })?;
         Ok(OutboundMetrics {
             pending: m.pending,
@@ -358,6 +367,7 @@ impl OutboundQueue {
             replaced: m.replaced,
             expired: m.expired,
             discarded: m.discarded,
+            deferred_wakes: m.deferred_wakes,
         })
     }
 }

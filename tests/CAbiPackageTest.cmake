@@ -44,6 +44,30 @@ if (NOT runtimeBinaryCount EQUAL 1)
     message(FATAL_ERROR "The C ABI component must contain exactly one shared implementation binary; found ${runtimeBinaryCount}.")
 endif ()
 
+# Types.h의 "No C++ exception crosses this ABI"는 모든 SC_API 선언이 SC_NOEXCEPT로 끝나는
+# 것에 기댄다. 설치된 헤더에서 주석과 전처리 줄을 걷어 낸 뒤 선언을 하나씩 확인한다. CMake는
+# ';'를 목록 구분자로 쓰므로 먼저 다른 표지로 바꾼다. 선언을 하나도 찾지 못하면 이 검사가 헛돈
+# 것이므로 그것도 실패로 본다.
+file(GLOB_RECURSE installedCHeaders LIST_DIRECTORIES FALSE "${packagePrefix}/*/ServerCore/C/*.h")
+set(declarationCount 0)
+foreach (header IN LISTS installedCHeaders)
+    file(READ "${header}" text)
+    string(REPLACE ";" "@SEMICOLON@" text "${text}")
+    string(REGEX REPLACE "/\\*([^*]|\\*+[^*/])*\\*+/" "" text "${text}")
+    string(REGEX REPLACE "#[^\n]*" "" text "${text}")
+    string(REGEX MATCHALL "SC_API[^@]*@SEMICOLON@" declarations "${text}")
+    foreach (declaration IN LISTS declarations)
+        math(EXPR declarationCount "${declarationCount} + 1")
+        if (NOT declaration MATCHES "\\)[ \t\r\n]*SC_NOEXCEPT[ \t\r\n]*@SEMICOLON@$")
+            string(REPLACE "@SEMICOLON@" ";" declaration "${declaration}")
+            message(FATAL_ERROR "An installed C ABI declaration lacks SC_NOEXCEPT in ${header}:\n${declaration}")
+        endif ()
+    endforeach ()
+endforeach ()
+if (declarationCount EQUAL 0)
+    message(FATAL_ERROR "No SC_API declaration was found in the installed C ABI headers.")
+endif ()
+
 set(command "${CMAKE_COMMAND}" -S "${SERVERCORE_PACKAGE_SOURCE_DIR}/tests/CAbiConsumer"
     -B "${testRoot}/consumer" -G "${SERVERCORE_PACKAGE_GENERATOR}"
     "-DSERVERCORE_PACKAGE_PREFIX=${testRoot}/relocated")

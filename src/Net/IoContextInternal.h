@@ -4,6 +4,10 @@
 
 #include "Net/WinsockInternal.h"
 
+#include <atomic>
+#include <functional>
+#include <memory>
+
 namespace ServerCore::Net
 {
 /// <summary>
@@ -35,5 +39,20 @@ public:
     /// <param name="socket">이어 붙일 소켓. 겹침 소켓이어야 한다.</param>
     /// <returns>돌고 있지 않으면 Closed. 붙이지 못하면 PlatformError.</returns>
     [[nodiscard]] static Core::Status AssociateSocket(IoContext& context, SOCKET socket);
+
+    /// <summary>IoContext가 돌고 있는지를 담은 공유 표시를 준다.</summary>
+    /// <remarks>
+    /// IoContext가 먼저 소멸해도 이 표시는 남아 거짓을 읽힌다. Acceptor::Stop()이 IoContext 객체에
+    /// 닿지 않고 완료를 처리할 스레드가 있는지 확인하는 데 쓴다. Stop()이 시작되면 거짓이 된다.
+    /// </remarks>
+    [[nodiscard]] static std::shared_ptr<const std::atomic<bool>> RunningFlag(
+        IoContext& context) noexcept;
+
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+    /// <summary>Stop()이 종료 신호를 다 보낸 직후, worker를 기다리기 전에 부를 함수를 건다. 시험 전용이다.</summary>
+    /// <remarks>Stop()을 부른 스레드에서 불린다. 빈 함수를 넘기면 지운다.</remarks>
+    SERVERCORE_TEST_API static void SetAfterStopSignalHook(
+        IoContext& context, std::function<void()> hook);
+#endif
 };
 }

@@ -6,7 +6,10 @@
 
 namespace ServerCore::Runtime
 {
-namespace Detail { class TaskGroupState; }
+namespace Detail
+{
+class TaskGroupState;
+}
 struct TaskGroupOptions
 {
     // Counts active children AND completions not yet taken, avoiding an
@@ -40,7 +43,8 @@ public:
     TaskGroup(const TaskGroup&) = delete;
     TaskGroup& operator=(const TaskGroup&) = delete;
     SERVERCORE_API Core::Status Start(TaskExecutor& executor, const TaskGroupOptions& options = {});
-    SERVERCORE_API Core::Result<TaskGroupTask> Submit(TaskExecutor::Task task, const TaskOptions& options = {});
+    SERVERCORE_API Core::Result<TaskGroupTask> Submit(
+        TaskExecutor::Task task, const TaskOptions& options = {});
     SERVERCORE_API void CloseAdmission() noexcept;
     SERVERCORE_API void RequestCancel() noexcept;
     // Wait closes admission. It returns Ok when all children are terminal;
@@ -58,6 +62,7 @@ public:
     SERVERCORE_API Core::Result<std::vector<TaskGroupCompletion>> TakeCompletions();
     [[nodiscard]] SERVERCORE_API std::size_t OutstandingCount() const noexcept;
     [[nodiscard]] SERVERCORE_API std::size_t RetainedBytes() const noexcept;
+
 private:
     std::shared_ptr<Detail::TaskGroupState> mState;
 };

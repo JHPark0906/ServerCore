@@ -2,8 +2,8 @@
 
 #include "ServerCore/Export.h"
 
-#include "ServerCore/Core/Error.h"
 #include "ServerCore/Core/CompletionSubscription.h"
+#include "ServerCore/Core/Error.h"
 
 #include <cstddef>
 #include <functional>
@@ -26,6 +26,8 @@ public:
     virtual ~ConnectionFlowControl() = default;
     // Stops new receive operations. One already submitted/in progress receive
     // (at most 16 KiB) may still reach the observer. Resume never duplicates I/O.
+    // Once CloseAfterSend shuts down the send side, the transport drains and
+    // discards input regardless of pause; nothing more reaches the observer.
     virtual Core::Status PauseReceive() = 0;
     virtual Core::Status ResumeReceive() = 0;
     [[nodiscard]] virtual bool IsReceivePaused() const noexcept = 0;

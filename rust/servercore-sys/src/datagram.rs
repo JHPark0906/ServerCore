@@ -37,6 +37,9 @@ pub struct sc_udp_options {
     pub max_bytes_per_batch: usize,
     pub total_send_rate: sc_udp_rate,
     pub peer_send_rate: sc_udp_rate,
+    pub max_sequence_jump: u64,
+    pub allow_endpoint_migration: u32,
+    pub reserved2: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -86,14 +89,37 @@ pub struct sc_udp_metrics {
     pub retained_event_bytes: usize,
     pub bound: u32,
     pub receiving: u32,
+    pub endpoint_mismatch_datagrams: u64,
+    pub sequence_jump_datagrams: u64,
 }
+/// Output: initialize abi_version and struct_size before the call.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct sc_udp_packet_view {
+    pub abi_version: u32,
+    pub struct_size: u32,
     pub token: sc_udp_token,
     pub sequence: u64,
     pub payload: sc_bytes,
 }
+// ABI 2 layout of Datagram.h on 64-bit targets.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<sc_udp_options>() == 144);
+    assert!(offset_of!(sc_udp_options, peer_send_rate) == 104);
+    assert!(offset_of!(sc_udp_options, max_sequence_jump) == 128);
+    assert!(offset_of!(sc_udp_options, allow_endpoint_migration) == 136);
+    assert!(offset_of!(sc_udp_options, reserved2) == 140);
+    assert!(size_of::<sc_udp_metrics>() == 248);
+    assert!(offset_of!(sc_udp_metrics, receiving) == 228);
+    assert!(offset_of!(sc_udp_metrics, endpoint_mismatch_datagrams) == 232);
+    assert!(offset_of!(sc_udp_metrics, sequence_jump_datagrams) == 240);
+    assert!(size_of::<sc_udp_packet_view>() == 48);
+    assert!(offset_of!(sc_udp_packet_view, token) == 8);
+    assert!(offset_of!(sc_udp_packet_view, sequence) == 24);
+    assert!(offset_of!(sc_udp_packet_view, payload) == 32);
+};
 extern "C" {
     pub fn sc_udp_options_init(options: *mut sc_udp_options, size: usize) -> sc_status;
     pub fn sc_udp_transport_create(

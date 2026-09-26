@@ -55,6 +55,15 @@ pub struct Options {
     pub max_bytes_per_batch: usize,
     pub total_send_rate: SendRate,
     pub peer_send_rate: SendRate,
+    /// How far one packet may advance a session's receive sequence (native
+    /// default 1024; 0 is rejected). Larger jumps are dropped and counted in
+    /// `sequence_jump_datagrams`.
+    pub max_sequence_jump: u64,
+    /// Lets a valid packet from a new source move the session's return
+    /// endpoint (native default false). There is no path validation, so this
+    /// permits reflection; enable it only for NAT rebinding, with
+    /// `peer_send_rate`. Refused moves count in `endpoint_mismatch_datagrams`.
+    pub allow_endpoint_migration: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -70,6 +79,8 @@ impl Default for Options {
             max_bytes_per_batch: 256 * 1024,
             total_send_rate: SendRate::default(),
             peer_send_rate: SendRate::default(),
+            max_sequence_jump: 1024,
+            allow_endpoint_migration: false,
         }
     }
 }
@@ -94,6 +105,9 @@ impl Options {
             max_bytes_per_batch: self.max_bytes_per_batch,
             total_send_rate: self.total_send_rate.raw()?,
             peer_send_rate: self.peer_send_rate.raw()?,
+            max_sequence_jump: self.max_sequence_jump,
+            allow_endpoint_migration: u32::from(self.allow_endpoint_migration),
+            reserved2: 0,
         })
     }
 }
@@ -269,7 +283,11 @@ pub struct Packet<'a> {
     pub payload: &'a [u8],
 }
 pub fn decode_packet(packet: &[u8]) -> Result<Packet<'_>> {
-    let mut out = MaybeUninit::<ffi::sc_udp_packet_view>::uninit();
+    let mut out = MaybeUninit::<ffi::sc_udp_packet_view>::zeroed();
+    unsafe {
+        (*out.as_mut_ptr()).abi_version = sys::SC_ABI_VERSION;
+        (*out.as_mut_ptr()).struct_size = size_of::<ffi::sc_udp_packet_view>() as u32;
+    }
     check(unsafe { ffi::sc_udp_packet_decode(bytes(packet), out.as_mut_ptr()) })?;
     let out = unsafe { out.assume_init() };
     Ok(Packet {
@@ -315,6 +333,96 @@ mod tests {
         ));
         drop(server);
         assert_eq!(event.payload(), payload);
+    }
+    #[test]
+    fn option_defaults_match_the_native_initializer() {
+        let mut raw = MaybeUninit::<ffi::sc_udp_options>::uninit();
+        assert_eq!(
+            unsafe { ffi::sc_udp_options_init(raw.as_mut_ptr(), size_of::<ffi::sc_udp_options>()) },
+            sys::SC_OK
+        );
+        let raw = unsafe { raw.assume_init() };
+        let defaults = Options::default();
+        assert_eq!(defaults.max_sequence_jump, raw.max_sequence_jump);
+        assert_eq!(
+            u32::from(defaults.allow_endpoint_migration),
+            raw.allow_endpoint_migration
+        );
+        assert!(matches!(
+            Transport::new(&Options {
+                max_sequence_jump: 0,
+                ..Default::default()
+            }),
+            Err(Error::INVALID_ARGUMENT)
+        ));
+    }
+    #[test]
+    fn sequence_jumps_and_source_changes_follow_the_options() {
+        let payload = br#"{"type":"Ping","body":{}}"#;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut server = Transport::new(&Options {
+            max_sequence_jump: 4,
+            ..Default::default()
+        })
+        .unwrap();
+        server.start().unwrap();
+        let token = server.register(9).unwrap();
+        let endpoint = server.local_endpoint().unwrap().socket_addr();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let send = |socket: &UdpSocket, sequence| {
+            socket
+                .send_to(&encode_packet(token, sequence, payload).unwrap(), endpoint)
+                .unwrap();
+        };
+        send(&peer, 1);
+        assert_eq!(server.next_timeout(Duration::from_secs(5)).unwrap().sequence(), 1);
+        // Each is refused whichever of them arrives first: 10 is more than 4
+        // past both 1 and 2, and 3 is new from an unbound source.
+        send(&peer, 10);
+        send(&other, 3);
+        send(&peer, 2);
+        assert_eq!(server.next_timeout(Duration::from_secs(5)).unwrap().sequence(), 2);
+        loop {
+            let metrics = server.metrics().unwrap();
+            if metrics.sequence_jump_datagrams == 1 && metrics.endpoint_mismatch_datagrams == 1 {
+                assert!(metrics.rejected_datagrams >= 2);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "jump {} mismatch {}",
+                metrics.sequence_jump_datagrams,
+                metrics.endpoint_mismatch_datagrams
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        server.stop().unwrap();
+
+        let mut server = Transport::new(&Options {
+            allow_endpoint_migration: true,
+            ..Default::default()
+        })
+        .unwrap();
+        server.start().unwrap();
+        let token = server.register(9).unwrap();
+        let endpoint = server.local_endpoint().unwrap().socket_addr();
+        let send = |socket: &UdpSocket, sequence| {
+            socket
+                .send_to(&encode_packet(token, sequence, payload).unwrap(), endpoint)
+                .unwrap();
+        };
+        send(&peer, 1);
+        assert_eq!(server.next_timeout(Duration::from_secs(5)).unwrap().sequence(), 1);
+        send(&other, 2);
+        let moved = server.next_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(moved.sequence(), 2);
+        assert_eq!(
+            moved.remote_endpoint().unwrap().socket_addr(),
+            other.local_addr().unwrap()
+        );
+        assert_eq!(server.metrics().unwrap().endpoint_mismatch_datagrams, 0);
+        server.stop().unwrap();
     }
     #[test]
     fn held_udp_event_limits_admission_and_future_is_send() {

@@ -19,7 +19,8 @@ public:
         : mOwner(owner)
     {
     }
-    SERVERCORE_TEST_API Core::Status Configure(Observability::RequestTraceHandler callback, std::size_t maximum);
+    SERVERCORE_TEST_API Core::Status Configure(
+        Observability::RequestTraceHandler callback, std::size_t maximum);
     SERVERCORE_TEST_API Core::Status Start();
     SERVERCORE_TEST_API void Stop();
     SERVERCORE_TEST_API void Terminal(Observability::RequestTrace trace) noexcept;

@@ -1,5 +1,6 @@
 #include "ServerCore/Core/AtomicFile.h"
 #include "ConfigTestSupport.h"
+#include "Core/AtomicFileTestAccess.h"
 #include <iterator>
 #ifndef _WIN32
 #include <sys/stat.h>
@@ -117,7 +118,31 @@ void AtomicFileFailureAndCleanup()
         "generated short-name alias targets are rejected before file creation");
 #endif
 }
+void AtomicFileSyncFailureIsTerminal()
+{
+    ServerCoreTest::ScopedConfigFile target("old");
+    const auto count = Temporaries();
+    auto created = AtomicFile::Create(target.Path(), { 16, FileSync::File });
+    ExpectTrue(created.IsOk(), "a synchronizing writer is created");
+    if (!created.IsOk())
+        return;
+    auto& file = *created.Value();
+    ExpectTrue(file.Write(Bytes("new")).IsOk(), "replacement bytes are written");
+    TestAccess::FailNextAtomicFileSync();
+    ExpectTrue(!file.Commit().IsOk() && !file.Committed() && Read(target.Path()) == "old",
+        "a failed file synchronization fails Commit without publishing");
+    // 동기화가 실패한 뒤의 동기화는 성공을 보고할 수 있다. 그 성공으로 게시하면 안 된다.
+    const auto retried = file.Commit();
+    ExpectTrue(!retried.IsOk() && !file.Committed() && Read(target.Path()) == "old",
+        "a retried Commit after a failed synchronization does not publish");
+    ExpectTrue(file.Write(Bytes("more")).Code() == retried.Code(),
+        "a writer whose synchronization failed refuses later writes with the same error");
+    ExpectTrue(file.Cancel().IsOk() && Temporaries() == count && Read(target.Path()) == "old",
+        "cleanup after a failed synchronization removes the temporary and keeps the target");
+}
 ServerCoreTest::CheckRegistration a("Core.AtomicFilePublication", AtomicFilePublication);
 ServerCoreTest::CheckRegistration b(
     "Core.AtomicFileFailureAndCleanup", AtomicFileFailureAndCleanup);
+ServerCoreTest::CheckRegistration c(
+    "Core.AtomicFileSyncFailureIsTerminal", AtomicFileSyncFailureIsTerminal);
 }

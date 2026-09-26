@@ -1,8 +1,8 @@
 #pragma once
+#include "ServerCore/Observability/Observation.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include "ServerCore/Observability/Observation.h"
 
 namespace ServerCore::Observability
 {

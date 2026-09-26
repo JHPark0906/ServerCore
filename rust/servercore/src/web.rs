@@ -32,6 +32,12 @@ pub struct Options {
     pub handler_timeout: Duration,
     pub stream_idle_timeout: Duration,
     pub send_stall_timeout: Duration,
+    /// Each WebSocket's own receive budget (native defaults 64 messages and
+    /// 1 MiB; count at most 65536), charged together with `max_ws_event_*`.
+    /// Held messages count until dropped. When either is full only that socket
+    /// stops receiving (and answering ping); no socket is closed for it.
+    pub max_ws_connection_event_count: usize,
+    pub max_ws_connection_event_bytes: usize,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -63,6 +69,8 @@ impl Default for Options {
             handler_timeout: Duration::from_millis(raw.handler_timeout_ms.into()),
             stream_idle_timeout: Duration::from_millis(raw.stream_idle_timeout_ms.into()),
             send_stall_timeout: Duration::from_millis(raw.send_stall_timeout_ms.into()),
+            max_ws_connection_event_count: raw.max_ws_connection_event_count,
+            max_ws_connection_event_bytes: raw.max_ws_connection_event_bytes,
         }
     }
 }
@@ -91,6 +99,9 @@ impl Options {
             handler_timeout_ms: timeout_ms(self.handler_timeout)?,
             stream_idle_timeout_ms: timeout_ms(self.stream_idle_timeout)?,
             send_stall_timeout_ms: timeout_ms(self.send_stall_timeout)?,
+            reserved2: 0,
+            max_ws_connection_event_count: self.max_ws_connection_event_count,
+            max_ws_connection_event_bytes: self.max_ws_connection_event_bytes,
         })
     }
 }

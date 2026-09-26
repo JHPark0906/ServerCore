@@ -31,21 +31,21 @@ extern "C"
         uint64_t retry_after_ms;
     } sc_request_limit_decision;
     SC_API sc_status sc_request_limiter_options_init(
-        sc_request_limiter_options* options, size_t size);
+        sc_request_limiter_options* options, size_t size) SC_NOEXCEPT;
     SC_API sc_status sc_request_limiter_create(
-        const sc_request_limiter_options* options, sc_request_limiter** out);
-    SC_API void sc_request_limiter_destroy(sc_request_limiter* limiter);
-    SC_API void sc_request_limiter_close(sc_request_limiter* limiter);
+        const sc_request_limiter_options* options, sc_request_limiter** out) SC_NOEXCEPT;
+    SC_API void sc_request_limiter_destroy(sc_request_limiter* limiter) SC_NOEXCEPT;
+    SC_API void sc_request_limiter_close(sc_request_limiter* limiter) SC_NOEXCEPT;
     /* Success includes a policy denial. A non-NULL permit means admission; otherwise
  * reason describes pressure. Keys are copied only on first admission to the
  * bounded registry. Permit lifetime accounts for real work, even after limiter
  * destruction. Destroying a permit returns concurrency but never rate tokens. */
     SC_API sc_status sc_request_limiter_acquire(sc_request_limiter* limiter, sc_bytes key,
-        uint64_t cost, sc_request_limit_decision* decision, sc_request_permit** permit);
-    SC_API void sc_request_permit_destroy(sc_request_permit* permit);
-    SC_API size_t sc_request_limiter_prune(sc_request_limiter* limiter);
-    SC_API size_t sc_request_limiter_key_count(const sc_request_limiter* limiter);
-    SC_API size_t sc_request_limiter_active_count(const sc_request_limiter* limiter);
+        uint64_t cost, sc_request_limit_decision* decision, sc_request_permit** permit) SC_NOEXCEPT;
+    SC_API void sc_request_permit_destroy(sc_request_permit* permit) SC_NOEXCEPT;
+    SC_API size_t sc_request_limiter_prune(sc_request_limiter* limiter) SC_NOEXCEPT;
+    SC_API size_t sc_request_limiter_key_count(const sc_request_limiter* limiter) SC_NOEXCEPT;
+    SC_API size_t sc_request_limiter_active_count(const sc_request_limiter* limiter) SC_NOEXCEPT;
 #ifdef __cplusplus
 }
 #endif

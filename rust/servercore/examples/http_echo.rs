@@ -1,6 +1,6 @@
 use servercore::{
     block_on,
-    web::{EventKind, HttpServer, Options, ResponseHead},
+    web::{Event, EventKind, HttpServer, Options, ResponseHead},
 };
 
 fn main() -> servercore::Result<()> {
@@ -21,25 +21,32 @@ fn main() -> servercore::Result<()> {
     );
     block_on(async {
         loop {
-            let mut event = server.next().await?;
-            if event.kind()? != EventKind::Request {
-                continue;
+            let event = server.next().await?;
+            // A client that fails mid-response ends only its own request.
+            if let Err(error) = respond(event).await {
+                eprintln!("request failed: {error}");
             }
-            let response = event.response()?;
-            let request = event.request()?;
-            let body = if request.target == "/health" {
-                b"ready".as_slice()
-            } else {
-                request.body
-            };
-            response
-                .start_async(&ResponseHead {
-                    content_length: Some(body.len() as u64),
-                    ..Default::default()
-                })
-                .await?;
-            response.write_all(body).await?;
-            response.finish_async().await?;
         }
     })
+}
+
+async fn respond(mut event: Event) -> servercore::Result<()> {
+    if event.kind()? != EventKind::Request {
+        return Ok(());
+    }
+    let response = event.response()?;
+    let request = event.request()?;
+    let body = if request.target == "/health" {
+        b"ready".as_slice()
+    } else {
+        request.body
+    };
+    response
+        .start_async(&ResponseHead {
+            content_length: Some(body.len() as u64),
+            ..Default::default()
+        })
+        .await?;
+    response.write_all(body).await?;
+    response.finish_async().await
 }

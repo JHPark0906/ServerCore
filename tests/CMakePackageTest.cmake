@@ -383,7 +383,7 @@ if (SERVERCORE_PACKAGE_IS_MSVC)
 
     file(RENAME "${runtimeOverrideInstallStage}" "${runtimeOverridePackagePrefix}")
 
-    set(matchingConsumerBuildDirectory "${packageTestRoot}/matching-runtime-consumer-build")
+    set(matchingConsumerBuildDirectory "${packageTestRoot}/matching-consumer")
     CreatePackageConsumerConfigureCommand(
             matchingConsumerConfigureCommand
             "${matchingConsumerBuildDirectory}"
@@ -404,7 +404,7 @@ if (SERVERCORE_PACKAGE_IS_MSVC)
             -C "${SERVERCORE_PACKAGE_CONFIGURATION}"
             --output-on-failure)
 
-    set(mismatchedConsumerBuildDirectory "${packageTestRoot}/mismatched-runtime-consumer-build")
+    set(mismatchedConsumerBuildDirectory "${packageTestRoot}/mismatched-consumer")
     CreatePackageConsumerConfigureCommand(
             mismatchedConsumerConfigureCommand
             "${mismatchedConsumerBuildDirectory}"

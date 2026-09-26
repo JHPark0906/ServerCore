@@ -8,6 +8,9 @@ namespace R = ServerCore::Runtime;
 namespace C = ServerCore::CDetail;
 namespace Core = ServerCore::Core;
 using Clock = std::chrono::steady_clock;
+// C 지연 정책 상수를 TickLagPolicy로 그대로 옮긴다(static_cast). 번호가 갈리면 여기서 멈춘다.
+static_assert(SC_TICK_SKIP == static_cast<int>(R::TickLagPolicy::Skip) &&
+              SC_TICK_CATCH_UP == static_cast<int>(R::TickLagPolicy::CatchUp));
 struct sc_tick_token
 {
     std::stop_token value;
@@ -64,7 +67,8 @@ struct Work
     Core::Status Run(const R::TickInfo& tick, std::stop_token token)
     {
         const CallbackScope scope;
-        const sc_tick_info info{ tick.index,
+        const sc_tick_info info{ SC_ABI_VERSION, static_cast<std::uint32_t>(sizeof(sc_tick_info)),
+            tick.index,
             static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(tick.lateness).count()),
             tick.skipped };
@@ -110,12 +114,12 @@ R::OutboundEnqueueOptions Options(const sc_outbound_item_options& value)
 }
 extern "C"
 {
-    sc_status sc_tick_options_init(sc_tick_options* out, size_t size)
+    sc_status sc_tick_options_init(sc_tick_options* out, size_t size) noexcept
     {
         return Init(out, size, { 0, 0, 16, SC_TICK_SKIP, 4, 0 });
     }
     sc_status sc_tick_start(sc_timer_scheduler* scheduler, const sc_tick_options* options,
-        sc_tick_work callback, sc_tick** out)
+        sc_tick_work callback, sc_tick** out) noexcept
     {
         Work owned(callback);
         if (!out)
@@ -155,24 +159,24 @@ extern "C"
                 return SC_OK;
             });
     }
-    int sc_tick_token_requested(const sc_tick_token* value)
+    int sc_tick_token_requested(const sc_tick_token* value) noexcept
     {
         return value && value->value.stop_requested();
     }
-    void sc_tick_cancel(sc_tick* value)
+    void sc_tick_cancel(sc_tick* value) noexcept
     {
         if (value)
             (void)value->value->RequestCancel();
     }
-    sc_status sc_tick_result(const sc_tick* value)
+    sc_status sc_tick_result(const sc_tick* value) noexcept
     {
         return value ? C::Code(value->value->GetStatus()) : SC_INVALID_ARGUMENT;
     }
-    int sc_tick_finished(const sc_tick* value)
+    int sc_tick_finished(const sc_tick* value) noexcept
     {
         return value && value->value->IsFinished();
     }
-    sc_status sc_tick_wait(const sc_tick* value, uint32_t timeout)
+    sc_status sc_tick_wait(const sc_tick* value, uint32_t timeout) noexcept
     {
         if (!value)
             return SC_INVALID_ARGUMENT;
@@ -187,22 +191,21 @@ extern "C"
                                          Clock::now() + std::chrono::milliseconds(timeout)));
             });
     }
-    sc_status sc_tick_get_metrics(const sc_tick* value, sc_tick_metrics* out)
+    sc_status sc_tick_get_metrics(const sc_tick* value, sc_tick_metrics* out) noexcept
     {
-        if (!value || !out)
+        if (!value || !C::OutputVersion(out))
             return SC_INVALID_ARGUMENT;
         const auto metrics = value->value->Metrics();
-        *out = {
-            metrics.executed, metrics.skipped,
-            static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(metrics.lastLateness).count()),
-            static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(metrics.maxLateness).count())
-        };
+        out->executed = metrics.executed;
+        out->skipped = metrics.skipped;
+        out->last_lateness_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(metrics.lastLateness).count());
+        out->max_lateness_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(metrics.maxLateness).count());
         return SC_OK;
     }
     sc_status sc_tick_subscribe(
-        const sc_tick* value, sc_notifier* notifier, uint64_t key, sc_subscription** out)
+        const sc_tick* value, sc_notifier* notifier, uint64_t key, sc_subscription** out) noexcept
     {
         if (!value)
         {
@@ -210,23 +213,28 @@ extern "C"
                 *out = nullptr;
             return SC_INVALID_ARGUMENT;
         }
-        return C::SubscribeCompletion([&](auto callback)
-            { return value->value->WaitForCompletion(std::move(callback)); }, notifier, key, out);
+        return C::Protect(
+            [&]
+            {
+                return C::SubscribeCompletion([&](auto callback)
+                    { return value->value->WaitForCompletion(std::move(callback)); }, notifier, key,
+                    out);
+            });
     }
-    void sc_tick_destroy(sc_tick* value)
+    void sc_tick_destroy(sc_tick* value) noexcept
     {
         delete value;
     }
-    sc_status sc_outbound_options_init(sc_outbound_options* out, size_t size)
+    sc_status sc_outbound_options_init(sc_outbound_options* out, size_t size) noexcept
     {
         return Init(out, size, { 0, 0, 128, 4 * 1024 * 1024, 64 });
     }
-    sc_status sc_outbound_item_options_init(sc_outbound_item_options* out, size_t size)
+    sc_status sc_outbound_item_options_init(sc_outbound_item_options* out, size_t size) noexcept
     {
         return Init(out, size, { 0, 0, 0, UINT32_MAX, 0 });
     }
     sc_status sc_outbound_create(sc_timer_scheduler* scheduler, sc_tcp_connection* connection,
-        const sc_outbound_options* options, sc_outbound_queue** out)
+        const sc_outbound_options* options, sc_outbound_queue** out) noexcept
     {
         if (!out)
             return SC_INVALID_ARGUMENT;
@@ -251,7 +259,7 @@ extern "C"
             });
     }
     sc_status sc_outbound_enqueue(
-        sc_outbound_queue* value, sc_bytes bytes, const sc_outbound_item_options* options)
+        sc_outbound_queue* value, sc_bytes bytes, const sc_outbound_item_options* options) noexcept
     {
         if (!value || !C::Valid(bytes) || !Valid(options))
             return SC_INVALID_ARGUMENT;
@@ -266,7 +274,7 @@ extern "C"
             });
     }
     sc_status sc_outbound_batch(sc_outbound_queue* const* recipients, size_t count, sc_bytes bytes,
-        const sc_outbound_item_options* options, sc_status* results, size_t resultCount)
+        const sc_outbound_item_options* options, sc_status* results, size_t resultCount) noexcept
     {
         if ((count && (!recipients || !results)) || resultCount < count || !C::Valid(bytes) ||
             !Valid(options))
@@ -305,35 +313,42 @@ extern "C"
                 return SC_OK;
             });
     }
-    void sc_outbound_begin_drain(sc_outbound_queue* value)
+    void sc_outbound_begin_drain(sc_outbound_queue* value) noexcept
     {
         if (value)
             value->value->BeginDrain();
     }
-    void sc_outbound_close(sc_outbound_queue* value)
+    void sc_outbound_close(sc_outbound_queue* value) noexcept
     {
         if (value)
             value->value->Close();
     }
-    int sc_outbound_finished(const sc_outbound_queue* value)
+    int sc_outbound_finished(const sc_outbound_queue* value) noexcept
     {
         return value && value->value->IsFinished();
     }
-    sc_status sc_outbound_result(const sc_outbound_queue* value)
+    sc_status sc_outbound_result(const sc_outbound_queue* value) noexcept
     {
         return value ? C::Code(value->value->GetStatus()) : SC_INVALID_ARGUMENT;
     }
-    sc_status sc_outbound_get_metrics(const sc_outbound_queue* value, sc_outbound_metrics* out)
+    sc_status sc_outbound_get_metrics(
+        const sc_outbound_queue* value, sc_outbound_metrics* out) noexcept
     {
-        if (!value || !out)
+        if (!value || !C::OutputVersion(out))
             return SC_INVALID_ARGUMENT;
         const auto m = value->value->Metrics();
-        *out = { m.pending, m.retainedBytes, m.enqueued, m.sent, m.replaced, m.expired,
-            m.discarded };
+        out->pending = m.pending;
+        out->retained_bytes = m.retainedBytes;
+        out->enqueued = m.enqueued;
+        out->sent = m.sent;
+        out->replaced = m.replaced;
+        out->expired = m.expired;
+        out->discarded = m.discarded;
+        out->deferred_wakes = m.deferredWakes;
         return SC_OK;
     }
-    sc_status sc_outbound_subscribe(
-        const sc_outbound_queue* value, sc_notifier* notifier, uint64_t key, sc_subscription** out)
+    sc_status sc_outbound_subscribe(const sc_outbound_queue* value, sc_notifier* notifier,
+        uint64_t key, sc_subscription** out) noexcept
     {
         if (!value)
         {
@@ -341,10 +356,15 @@ extern "C"
                 *out = nullptr;
             return SC_INVALID_ARGUMENT;
         }
-        return C::SubscribeCompletion([&](auto callback)
-            { return value->value->WaitForCompletion(std::move(callback)); }, notifier, key, out);
+        return C::Protect(
+            [&]
+            {
+                return C::SubscribeCompletion([&](auto callback)
+                    { return value->value->WaitForCompletion(std::move(callback)); }, notifier, key,
+                    out);
+            });
     }
-    void sc_outbound_destroy(sc_outbound_queue* value)
+    void sc_outbound_destroy(sc_outbound_queue* value) noexcept
     {
         delete value;
     }

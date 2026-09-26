@@ -174,7 +174,8 @@ Core::Status Dispatcher::Dispatch(
                 logger = mLogger;
             }
             if (logger)
-                logger->Write(Core::LogLevel::Warn, "unregistered message type: " + std::string(message.Type()));
+                logger->Write(Core::LogLevel::Warn,
+                    "unregistered message type: " + std::string(message.Type()));
             if (policy == UnknownTypePolicy::LogAndIgnore)
             {
                 return Core::Status::Ok();

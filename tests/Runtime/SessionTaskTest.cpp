@@ -46,7 +46,10 @@ private:
 class TestSession final : public ServerCore::Session::Session
 {
 public:
-    ServerCore::Session::SessionId Id() const noexcept override { return static_cast<ServerCore::Session::SessionId>(1); }
+    ServerCore::Session::SessionId Id() const noexcept override
+    {
+        return static_cast<ServerCore::Session::SessionId>(1);
+    }
     ServerCore::Session::SessionState State() const noexcept override { return state.load(); }
     std::stop_token GetCancellationToken() const noexcept override { return stop.get_token(); }
     Status MarkAuthenticated() override
@@ -67,7 +70,9 @@ public:
     }
 
 private:
-    std::atomic<ServerCore::Session::SessionState> state{ ServerCore::Session::SessionState::Connected };
+    std::atomic<ServerCore::Session::SessionState> state{
+        ServerCore::Session::SessionState::Connected
+    };
     std::stop_source stop;
 };
 void BoundedRunnerReservations()
@@ -272,10 +277,12 @@ void SessionTaskRejectsEmptyLegacyWork()
     auto result = Runtime::SubmitSessionTask(executor, runner.AcquireLease(), session, work, apply);
     ExpectTrue(!result.IsOk() && result.GetStatus().Code() == ErrorCode::InvalidArgument,
         "empty legacy session work is rejected before execution or reservation");
-    result = Runtime::SubmitSessionTask(executor, runner.AcquireLease(), session, std::move(work), apply);
+    result = Runtime::SubmitSessionTask(
+        executor, runner.AcquireLease(), session, std::move(work), apply);
     ExpectTrue(!result.IsOk() && result.GetStatus().Code() == ErrorCode::InvalidArgument,
         "moved empty legacy session work keeps the same rejection");
-    ExpectEqual(std::size_t{ 0 }, runner.OutstandingCount(), "rejection retains no completion slot");
+    ExpectEqual(
+        std::size_t{ 0 }, runner.OutstandingCount(), "rejection retains no completion slot");
 }
 const ServerCoreTest::CheckRegistration emptyLegacyWork(
     "Runtime.SessionTaskRejectsEmptyLegacyWork", SessionTaskRejectsEmptyLegacyWork);

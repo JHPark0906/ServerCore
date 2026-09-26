@@ -1,12 +1,14 @@
 #include "TestHarness.h"
 
 #include "ServerCore/Core/Error.h"
-#include "ServerCore/Protocol/FrameCodec.h"
 #include "ServerCore/Protocol/DatagramCodec.h"
+#include "ServerCore/Protocol/FrameCodec.h"
 #include "ServerCore/Protocol/Framing.h"
 #include "ServerCore/Protocol/Json.h"
 #include "ServerCore/Protocol/Message.h"
 #include "ServerCore/Session/Session.h"
+
+#include "Protocol/MessageTestAccess.h"
 
 #include <algorithm>
 #include <array>
@@ -15,11 +17,13 @@
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <random>
 #include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -335,7 +339,8 @@ void FramingConformanceVectors()
     while (std::getline(file, line))
     {
         // getline removes LF; retain the same vectors for a CRLF checkout on Linux.
-        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
         if (line.empty() || line[0] == '#')
         {
             continue;
@@ -877,6 +882,79 @@ void JsonRejectsUnrepresentableNumbers()
     }
 }
 
+/// <summary>값 수 상한이 스칼라·컨테이너·객체 멤버 값을 모두 세고, 넘으면 TooLarge인지 본다.</summary>
+void JsonParseLimitsValueCount()
+{
+    using ServerCore::Protocol::JsonParseLimits;
+    const auto code = [](std::string_view text, std::size_t maxValues)
+    {
+        return static_cast<int>(
+            JsonValue::Parse(text, JsonParseLimits{ maxValues }).GetStatus().Code());
+    };
+    const int ok = static_cast<int>(ServerCore::Core::ErrorCode::Ok);
+    const int tooLarge = static_cast<int>(ServerCore::Core::ErrorCode::TooLarge);
+    // [0,0,0]은 배열 하나와 숫자 셋, {"a":1,"b":[2]}는 객체·1·배열·2의 넷이다.
+    ServerCoreTest::ExpectEqual(
+        ok, code("[0,0,0]", 4), "an array and its three items fit four values");
+    ServerCoreTest::ExpectEqual(
+        tooLarge, code("[0,0,0]", 3), "an array and its three items exceed three values");
+    ServerCoreTest::ExpectEqual(
+        ok, code(R"({"a":1,"b":[2]})", 4), "object member values count, keys do not");
+    ServerCoreTest::ExpectEqual(
+        tooLarge, code(R"({"a":1,"b":[2]})", 3), "nested member values count toward the limit");
+    ServerCoreTest::ExpectEqual(ok, code("[0,0,0]", (std::numeric_limits<std::size_t>::max)()),
+        "the default limit is unlimited");
+    ServerCoreTest::ExpectEqual(static_cast<int>(ServerCore::Core::ErrorCode::InvalidFormat),
+        code("[0,", 1000), "malformed input under the limit keeps InvalidFormat");
+
+    const std::string envelope = R"({"type":"t","body":{"a":[1,2,3]}})";
+    const auto bytes = std::as_bytes(std::span(envelope.data(), envelope.size()));
+    // 최상위 봉투 객체는 세지 않는다. type 값, body 객체, 배열, 숫자 셋으로 여섯이다.
+    ServerCoreTest::ExpectTrue(
+        ServerCore::Protocol::ParseMessage(bytes, JsonParseLimits{ 6 }).IsOk(),
+        "a message within its value limit parses");
+    ServerCoreTest::ExpectEqual(tooLarge,
+        static_cast<int>(
+            ServerCore::Protocol::ParseMessage(bytes, JsonParseLimits{ 5 }).GetStatus().Code()),
+        "a message over its value limit is TooLarge");
+}
+
+void JsonNumbersUnderflowToSignedZero()
+{
+    struct Underflow
+    {
+        std::string_view text;
+        bool negative;
+    };
+    constexpr std::array<Underflow, 6> underflows{ { { "1e-400", false }, { "-1e-400", true },
+        { "123e-400", false }, { "0.000001e-320", false }, { "1000000000000000000000e-500", false },
+        { "-1e-99999999999999999999", true } } };
+    for (const Underflow& underflow : underflows)
+    {
+        const auto parsed = JsonValue::Parse(underflow.text);
+        const double* const number = parsed.IsOk() ? parsed.Value().TryNumber() : nullptr;
+        ServerCoreTest::ExpectTrue(
+            number != nullptr && *number == 0.0 && std::signbit(*number) == underflow.negative,
+            "a number too small for a double parses as zero with its sign");
+    }
+
+    const auto subnormal = JsonValue::Parse("4.9e-324");
+    ServerCoreTest::ExpectTrue(
+        subnormal.IsOk() && subnormal.Value().TryNumber() != nullptr &&
+            *subnormal.Value().TryNumber() == std::numeric_limits<double>::denorm_min(),
+        "the smallest subnormal double keeps its value");
+
+    constexpr std::array<std::string_view, 4> overflows{ "1e400", "-1e400", "0.00001e320",
+        "1e99999999999999999999" };
+    for (const std::string_view text : overflows)
+    {
+        const auto parsed = JsonValue::Parse(text);
+        ServerCoreTest::ExpectTrue(
+            !parsed.IsOk() && parsed.GetStatus().Code() == ErrorCode::InvalidFormat,
+            "a number too large for a finite double is still rejected");
+    }
+}
+
 void MessageRejectsInvalidUtf8()
 {
     const std::vector<std::byte> invalidUtf8{ static_cast<std::byte>('{'),
@@ -893,17 +971,13 @@ void MessageRejectsInvalidUtf8()
 
 void JsonEntryPointsShareValidation()
 {
-    const std::array<std::string, 8> invalidDocuments{
-        R"({"type":"Probe","body":{})",
-        R"({"type":"Probe","body":{}} false)",
-        R"({"type":"Probe","body":{},"body":{}})",
-        R"({"type":"Probe","body":{"value":1,}})",
-        R"({"type":"Probe","body":{"value":"\uD800"}})",
+    const std::array<std::string, 8> invalidDocuments{ R"({"type":"Probe","body":{})",
+        R"({"type":"Probe","body":{}} false)", R"({"type":"Probe","body":{},"body":{}})",
+        R"({"type":"Probe","body":{"value":1,}})", R"({"type":"Probe","body":{"value":"\uD800"}})",
         R"({"type":"Probe","body":{"value":18446744073709551616}})",
         std::string(R"({"type":"Probe","body":{"value":")") + "\xC3\"}}",
-        std::string(R"({"type":"Probe","body":{"value":)") +
-            std::string(256, '[') + "0" + std::string(256, ']') + "}}"
-    };
+        std::string(R"({"type":"Probe","body":{"value":)") + std::string(256, '[') + "0" +
+            std::string(256, ']') + "}}" };
     for (const auto& text : invalidDocuments)
     {
         const auto json = JsonValue::Parse(text);
@@ -911,9 +985,9 @@ void JsonEntryPointsShareValidation()
         const auto byteJson = JsonValue::ParseBytes(bytes);
         const auto envelope = ServerCore::Protocol::ParseMessage(bytes);
         ServerCoreTest::ExpectTrue(!json.IsOk() && !byteJson.IsOk() && !envelope.IsOk() &&
-            json.GetStatus().Code() == ErrorCode::InvalidFormat &&
-            byteJson.GetStatus().Code() == ErrorCode::InvalidFormat &&
-            envelope.GetStatus().Code() == ErrorCode::InvalidFormat,
+                                       json.GetStatus().Code() == ErrorCode::InvalidFormat &&
+                                       byteJson.GetStatus().Code() == ErrorCode::InvalidFormat &&
+                                       envelope.GetStatus().Code() == ErrorCode::InvalidFormat,
             "JSON and message entry points reject the same malformed document");
         ServerCoreTest::ExpectEqual(json.GetStatus().Message(), envelope.GetStatus().Message(),
             "both entry points preserve the same JSON error location and cause");
@@ -927,7 +1001,7 @@ void JsonEntryPointsShareValidation()
     ServerCoreTest::ExpectTrue(json.IsOk() && envelope.IsOk(),
         "both entry points accept BOM and surrounding JSON whitespace");
     if (envelope.IsOk())
-        ServerCoreTest::ExpectEqual(std::size_t{11}, envelope.Value().RawBodySize(),
+        ServerCoreTest::ExpectEqual(std::size_t{ 11 }, envelope.Value().RawBodySize(),
             "shared document parsing retains original body bytes including whitespace");
 }
 
@@ -936,35 +1010,43 @@ void MessageEnvelopeValidationIsSymmetric()
     const JsonValue object(JsonValue::Object{});
     const JsonValue scalar(1.0);
     const JsonValue nullValue(nullptr);
-    const JsonValue error(JsonValue::Object{{"code", JsonValue(std::string("test"))}});
-    struct Example { MessageFields fields; bool valid; };
-    const std::array<Example, 8> examples{{
-        {{"Probe", &object, nullptr, nullptr}, true},
-        {{"Probe", nullptr, &scalar, &error}, true},
-        {{"Probe", &object, &nullValue, &error}, true},
-        {{"", &object, nullptr, nullptr}, false},
-        {{"Probe", nullptr, nullptr, nullptr}, false},
-        {{"Probe", &scalar, nullptr, &error}, false},
-        {{"Probe", &object, nullptr, &object}, false},
-        {{"Probe", &object, nullptr, &nullValue}, false}
-    }};
+    const JsonValue error(JsonValue::Object{ { "code", JsonValue(std::string("test")) } });
+    struct Example
+    {
+        MessageFields fields;
+        bool valid;
+    };
+    const std::array<Example, 8> examples{ { { { "Probe", &object, nullptr, nullptr }, true },
+        { { "Probe", nullptr, &scalar, &error }, true },
+        { { "Probe", &object, &nullValue, &error }, true },
+        { { "", &object, nullptr, nullptr }, false },
+        { { "Probe", nullptr, nullptr, nullptr }, false },
+        { { "Probe", &scalar, nullptr, &error }, false },
+        { { "Probe", &object, nullptr, &object }, false },
+        { { "Probe", &object, nullptr, &nullValue }, false } } };
     for (const auto& example : examples)
     {
         const auto& fields = example.fields;
-        JsonValue::Object raw{{"type", JsonValue(std::string(fields.type))}};
-        if (fields.body) raw.emplace("body", *fields.body);
-        if (fields.sequence) raw.emplace("seq", *fields.sequence);
-        if (fields.error) raw.emplace("error", *fields.error);
+        JsonValue::Object raw{ { "type", JsonValue(std::string(fields.type)) } };
+        if (fields.body)
+            raw.emplace("body", *fields.body);
+        if (fields.sequence)
+            raw.emplace("seq", *fields.sequence);
+        if (fields.error)
+            raw.emplace("error", *fields.error);
         const auto wire = JsonValue(std::move(raw)).Dump();
         ServerCoreTest::ExpectTrue(wire.IsOk(), "envelope examples contain valid JSON values");
-        if (!wire.IsOk()) continue;
+        if (!wire.IsOk())
+            continue;
         const auto incoming = ServerCore::Protocol::ParseMessage(ToBytes(wire.Value()));
         const auto outgoing = ServerCore::Protocol::SerializeMessage(fields);
-        ServerCoreTest::ExpectTrue(incoming.IsOk() == example.valid && outgoing.IsOk() == example.valid,
+        ServerCoreTest::ExpectTrue(
+            incoming.IsOk() == example.valid && outgoing.IsOk() == example.valid,
             "incoming and outgoing envelopes enforce the same field rules");
         if (!example.valid)
-            ServerCoreTest::ExpectTrue(incoming.GetStatus().Code() == ErrorCode::InvalidFormat &&
-                outgoing.GetStatus().Code() == ErrorCode::InvalidArgument,
+            ServerCoreTest::ExpectTrue(
+                incoming.GetStatus().Code() == ErrorCode::InvalidFormat &&
+                    outgoing.GetStatus().Code() == ErrorCode::InvalidArgument,
                 "wire format errors remain distinct from invalid caller arguments");
     }
 }
@@ -986,8 +1068,8 @@ void JsonDumpRejectsUnsafeValues()
 
     const double unsignedBoundary = std::ldexp(1.0, 64);
     const double signedBoundary = -std::ldexp(1.0, 63);
-    const std::array<double, 18> finiteNumbers{ 0.0, -0.0, 42.0, -42.0, 12.5, -12.5,
-        1.0 / 3.0, std::nextafter(unsignedBoundary, 0.0), unsignedBoundary,
+    const std::array<double, 18> finiteNumbers{ 0.0, -0.0, 42.0, -42.0, 12.5, -12.5, 1.0 / 3.0,
+        std::nextafter(unsignedBoundary, 0.0), unsignedBoundary,
         std::nextafter(unsignedBoundary, std::numeric_limits<double>::infinity()),
         std::nextafter(signedBoundary, 0.0), signedBoundary,
         std::nextafter(signedBoundary, -std::numeric_limits<double>::infinity()),
@@ -1023,7 +1105,8 @@ void JsonDumpRejectsUnsafeValues()
     if (incoming.IsOk())
     {
         const ServerCore::Core::Result<std::vector<std::byte>> reply =
-            ServerCore::Protocol::SerializeMessage(incoming.Value().Type(), *incoming.Value().Body());
+            ServerCore::Protocol::SerializeMessage(
+                incoming.Value().Type(), *incoming.Value().Body());
         ServerCoreTest::ExpectTrue(reply.IsOk(), "received out-of-integer-range doubles serialize");
         if (reply.IsOk())
         {
@@ -1123,6 +1206,171 @@ void MessageRejectsNonObjectBodies()
     }
 }
 
+void JsonTextConstructorsKeepTheirType()
+{
+    // 문자 하나와 문자열이 아닌 포인터는 숫자나 bool로 조용히 바뀌지 않고 구성 자체가 막힌다.
+    // 막힘이 풀리면 이 단언들이 이 파일의 컴파일을 멈춘다.
+    static_assert(!std::is_constructible_v<JsonValue, char>);
+    static_assert(!std::is_constructible_v<JsonValue, wchar_t>);
+    static_assert(!std::is_constructible_v<JsonValue, char8_t>);
+    static_assert(!std::is_constructible_v<JsonValue, char16_t>);
+    static_assert(!std::is_constructible_v<JsonValue, char32_t>);
+    static_assert(!std::is_constructible_v<JsonValue, const int*>);
+    static_assert(!std::is_constructible_v<JsonValue, void*>);
+    static_assert(!std::is_constructible_v<JsonValue, const char8_t*>);
+    static_assert(!std::is_constructible_v<JsonValue, volatile char*>);
+    // std::int8_t와 std::uint8_t는 문자가 아니라 정수로 남는다.
+    static_assert(std::is_constructible_v<JsonValue, signed char>);
+    static_assert(std::is_constructible_v<JsonValue, unsigned char>);
+    static_assert(std::is_constructible_v<JsonValue, std::nullptr_t>);
+
+    const JsonValue literal("ok");
+    ServerCoreTest::ExpectTrue(literal.TryString() != nullptr && *literal.TryString() == "ok",
+        "a string literal constructs a JSON string");
+
+    char mutableText[] = "mutable";
+    const JsonValue fromMutable(mutableText);
+    ServerCoreTest::ExpectTrue(
+        fromMutable.TryString() != nullptr && *fromMutable.TryString() == "mutable",
+        "a mutable character array constructs a JSON string");
+
+    const char* const pointer = "pointer";
+    const JsonValue fromPointer(pointer);
+    ServerCoreTest::ExpectTrue(
+        fromPointer.TryString() != nullptr && *fromPointer.TryString() == "pointer",
+        "a C string pointer constructs a JSON string");
+
+    const auto dumped = JsonValue(JsonValue::Object{ { "status", JsonValue("ok") } }).Dump();
+    ServerCoreTest::ExpectTrue(dumped.IsOk(), "a body built from a string literal dumps");
+    if (dumped.IsOk())
+        ServerCoreTest::ExpectEqual(std::string(R"({"status": "ok"})"), dumped.Value(),
+            "a string literal reaches the wire as a JSON string");
+}
+
+/// <summary>
+/// MSVC std::hash&lt;std::string&gt;(FNV-1a 64)의 하위 24비트가 모두 같은 키 2^stages개를 만든다.
+/// </summary>
+/// <remarks>
+/// FNV-1a의 하위 k비트는 앞 상태의 하위 k비트에만 의존한다. 단계마다 하위 비트가 같아지는 서로 다른
+/// 네 글자 블록 두 개를 찾아 이어 붙이면, 선택의 모든 조합이 같은 하위 비트를 갖는다. 난수 생성기의
+/// 출력은 표준이 정하므로 어느 플랫폼에서나 같은 키가 나온다. 다른 해시를 쓰는 구현에서는 이 키들이
+/// 충돌하지 않을 뿐이다.
+/// </remarks>
+std::vector<std::string> LowBitCollidingKeys(const unsigned stages)
+{
+    constexpr std::uint64_t OffsetBasis = 14695981039346656037ULL;
+    constexpr std::uint64_t Prime = 1099511628211ULL;
+    constexpr std::uint64_t LowBits = (std::uint64_t{ 1 } << 24) - 1;
+    constexpr std::string_view Alphabet =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const auto step = [](std::uint64_t state, const std::string_view block)
+    {
+        for (const unsigned char character : block)
+        {
+            state ^= character;
+            state *= Prime;
+        }
+        return state;
+    };
+    std::mt19937_64 random(12345);
+    std::uint64_t state = OffsetBasis;
+    std::vector<std::pair<std::string, std::string>> choices;
+    for (unsigned stage = 0; stage < stages; ++stage)
+    {
+        std::unordered_map<std::uint64_t, std::string> seen;
+        for (;;)
+        {
+            std::string block(4, 'a');
+            for (char& character : block)
+                character = Alphabet[random() % Alphabet.size()];
+            const auto [found, inserted] = seen.emplace(step(state, block) & LowBits, block);
+            if (!inserted && found->second != block)
+            {
+                choices.emplace_back(found->second, block);
+                state = step(state, block);
+                break;
+            }
+        }
+    }
+    std::vector<std::string> keys;
+    for (std::uint64_t mask = 0; mask < (std::uint64_t{ 1 } << stages); ++mask)
+    {
+        std::string key;
+        for (unsigned stage = 0; stage < stages; ++stage)
+            key += ((mask >> stage) & 1U) != 0 ? choices[stage].second : choices[stage].first;
+        keys.push_back(std::move(key));
+    }
+    return keys;
+}
+
+/// <summary>해시 컨테이너이면 가장 긴 버킷의 원소 수를, 아니면 0을 준다.</summary>
+template <typename Map> std::size_t LargestHashBucket(const Map& map)
+{
+    if constexpr (requires { map.bucket_count(); })
+    {
+        std::size_t largest = 0;
+        for (std::size_t bucket = 0; bucket < map.bucket_count(); ++bucket)
+            largest = (std::max)(largest, map.bucket_size(bucket));
+        return largest;
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+void JsonObjectKeysResistHashFlooding()
+{
+    const std::vector<std::string> keys = LowBitCollidingKeys(10);
+    std::string text = "{";
+    for (const std::string& key : keys)
+    {
+        if (text.size() > 1)
+            text += ',';
+        text += '"' + key + "\":0";
+    }
+    text += '}';
+    const auto parsed = JsonValue::Parse(text);
+    ServerCoreTest::ExpectTrue(parsed.IsOk(), "an object with crafted keys parses");
+    if (!parsed.IsOk())
+        return;
+    const JsonValue::Object* const object = parsed.Value().TryObject();
+    ServerCoreTest::ExpectTrue(object != nullptr && object->size() == keys.size(),
+        "every crafted key is kept as a distinct member");
+    // 무작위 키 1024개면 가장 긴 버킷이 10개 안팎이다. 64를 넘으면 키가 한 버킷으로 몰린 것이다.
+    ServerCoreTest::ExpectTrue(object != nullptr && LargestHashBucket(*object) < 64,
+        "crafted keys cannot pile into one bucket of the object's lookup structure");
+    ServerCoreTest::ExpectTrue(parsed.Value().Find(keys.front()) != nullptr &&
+                                   parsed.Value().Find(keys[keys.size() / 2]) != nullptr &&
+                                   parsed.Value().Find(keys.back()) != nullptr,
+        "crafted keys stay reachable by lookup");
+}
+
+const JsonValue* gObservedFirstElement = nullptr;
+
+void RecordFirstListElement(const JsonValue& body) noexcept
+{
+    const JsonValue* const list = body.Find("list");
+    gObservedFirstElement = list != nullptr ? list->At(0) : nullptr;
+}
+
+void ParseMessageMovesTheParsedBody()
+{
+    namespace TestAccess = ServerCore::Protocol::TestAccess;
+    TestAccess::SetParsedBodyObserver(&RecordFirstListElement);
+    const auto parsed = ServerCore::Protocol::ParseMessage(
+        ToBytes(R"({"type":"Probe","body":{"list":[1,2,3]},"seq":7})"));
+    TestAccess::SetParsedBodyObserver(nullptr);
+    ServerCoreTest::ExpectTrue(parsed.IsOk() && gObservedFirstElement != nullptr,
+        "the parsed body is observed before it reaches the message");
+    if (!parsed.IsOk() || parsed.Value().Body() == nullptr)
+        return;
+    // 같은 원소 주소는 body의 저장소가 복사되지 않고 Message로 옮겨졌다는 뜻이다.
+    const JsonValue* const list = parsed.Value().Body()->Find("list");
+    ServerCoreTest::ExpectTrue(list != nullptr && list->At(0) == gObservedFirstElement,
+        "the message owns the parsed body storage instead of a deep copy");
+}
+
 void PreparedMessagesOwnImmutableJsonAndEnvelope()
 {
     namespace Protocol = ServerCore::Protocol;
@@ -1130,52 +1378,70 @@ void PreparedMessagesOwnImmutableJsonAndEnvelope()
     JsonValue::Object fields;
     fields.emplace("unsigned", JsonValue(maximum));
     fields.emplace("signed", JsonValue((std::numeric_limits<std::int64_t>::min)()));
-    fields.emplace("text", JsonValue(std::string("한글 \"quoted\" \\ newline\n nul") + std::string("\0tail", 5)));
+    fields.emplace("text",
+        JsonValue(std::string("한글 \"quoted\" \\ newline\n nul") + std::string("\0tail", 5)));
     JsonValue source(std::move(fields));
     const JsonValue frozen = source;
     auto item = Protocol::PrepareJsonValue(source);
     auto nullItem = Protocol::PrepareJsonValue(JsonValue(nullptr));
-    ServerCoreTest::ExpectTrue(item.IsOk() && nullItem.IsOk(), "object and JSON null can be prepared as reusable array values");
-    if (!item.IsOk() || !nullItem.IsOk()) return;
+    ServerCoreTest::ExpectTrue(item.IsOk() && nullItem.IsOk(),
+        "object and JSON null can be prepared as reusable array values");
+    if (!item.IsOk() || !nullItem.IsOk())
+        return;
     const auto itemBytes = ToText(item.Value().Bytes());
     source = JsonValue(std::string("the original object no longer exists"));
-    ServerCoreTest::ExpectEqual(itemBytes, ToText(item.Value().Bytes()), "prepared JSON owns its immutable source snapshot");
-    ServerCoreTest::ExpectEqual(itemBytes.size(), item.Value().Size(), "prepared value size counts serialized UTF-8 bytes");
+    ServerCoreTest::ExpectEqual(itemBytes, ToText(item.Value().Bytes()),
+        "prepared JSON owns its immutable source snapshot");
+    ServerCoreTest::ExpectEqual(
+        itemBytes.size(), item.Value().Size(), "prepared value size counts serialized UTF-8 bytes");
 
     const std::string type = "Batch\"\\\n한글";
     const std::string key = "states\"\\\n목록";
-    const std::array<const Protocol::PreparedJsonValue*, 3> items{ &item.Value(), &nullItem.Value(), &item.Value() };
+    const std::array<const Protocol::PreparedJsonValue*, 3> items{ &item.Value(), &nullItem.Value(),
+        &item.Value() };
     auto prepared = Protocol::PrepareArrayMessage(type, key, items);
     JsonValue::Object expectedBody;
     expectedBody.emplace(key, JsonValue(JsonValue::Array{ frozen, JsonValue(nullptr), frozen }));
     const auto expected = Protocol::SerializeMessage(type, JsonValue(std::move(expectedBody)));
-    ServerCoreTest::ExpectTrue(prepared.IsOk() && expected.IsOk(), "prepared array with escaped names and repeated items is valid");
-    if (!prepared.IsOk() || !expected.IsOk()) return;
-    ServerCoreTest::ExpectEqual(prepared.Value().Bytes().size(), prepared.Value().Size(), "prepared envelope size counts actual bytes without the four-byte frame header");
+    ServerCoreTest::ExpectTrue(prepared.IsOk() && expected.IsOk(),
+        "prepared array with escaped names and repeated items is valid");
+    if (!prepared.IsOk() || !expected.IsOk())
+        return;
+    ServerCoreTest::ExpectEqual(prepared.Value().Bytes().size(), prepared.Value().Size(),
+        "prepared envelope size counts actual bytes without the four-byte frame header");
     const auto parsed = Protocol::ParseMessage(prepared.Value().Bytes());
-    ServerCoreTest::ExpectTrue(parsed.IsOk(), "a prepared array is an independently parseable message");
-    if (!parsed.IsOk()) return;
+    ServerCoreTest::ExpectTrue(
+        parsed.IsOk(), "a prepared array is an independently parseable message");
+    if (!parsed.IsOk())
+        return;
     const auto* parsedBody = parsed.Value().Body();
     const auto canonical = Protocol::SerializeMessage(parsed.Value().Type(), *parsedBody);
-    ServerCoreTest::ExpectTrue(canonical.IsOk() && ToText(expected.Value()) == ToText(canonical.Value()),
-        "compact prepared assembly preserves envelope values, escaping and item order independently of optional whitespace");
+    ServerCoreTest::ExpectTrue(
+        canonical.IsOk() && ToText(expected.Value()) == ToText(canonical.Value()),
+        "compact prepared assembly preserves envelope values, escaping and item order "
+        "independently of optional whitespace");
     const auto* arrayValue = parsedBody ? parsedBody->Find(key) : nullptr;
     const auto* array = arrayValue ? arrayValue->TryArray() : nullptr;
-    ServerCoreTest::ExpectTrue(array && array->size() == 3 && (*array)[1].IsNull(), "JSON null is distinct from a null prepared-item pointer");
+    ServerCoreTest::ExpectTrue(array && array->size() == 3 && (*array)[1].IsNull(),
+        "JSON null is distinct from a null prepared-item pointer");
     if (array && array->size() == 3)
     {
         const auto* integer = (*array)[0].Find("unsigned");
-        ServerCoreTest::ExpectTrue(integer && integer->TryUInt64() && *integer->TryUInt64() == maximum,
+        ServerCoreTest::ExpectTrue(
+            integer && integer->TryUInt64() && *integer->TryUInt64() == maximum,
             "prepared array concatenation preserves uint64 maximum without double conversion");
         const auto* signedInteger = (*array)[2].Find("signed");
-        ServerCoreTest::ExpectTrue(signedInteger && signedInteger->TryInt64() &&
-            *signedInteger->TryInt64() == (std::numeric_limits<std::int64_t>::min)(),
+        ServerCoreTest::ExpectTrue(
+            signedInteger && signedInteger->TryInt64() &&
+                *signedInteger->TryInt64() == (std::numeric_limits<std::int64_t>::min)(),
             "prepared array concatenation preserves int64 minimum");
     }
     const auto empty = Protocol::PrepareArrayMessage("StateBatch", "states", {});
     ServerCoreTest::ExpectTrue(empty.IsOk(), "an empty prepared array is a valid envelope");
-    if (empty.IsOk()) ServerCoreTest::ExpectEqual(std::string(R"({"body":{"states":[]},"type":"StateBatch"})"),
-        ToText(empty.Value().Bytes()), "empty arrays contain no trailing comma or extra envelope field");
+    if (empty.IsOk())
+        ServerCoreTest::ExpectEqual(std::string(R"({"body":{"states":[]},"type":"StateBatch"})"),
+            ToText(empty.Value().Bytes()),
+            "empty arrays contain no trailing comma or extra envelope field");
 
     std::string mutableType = "PreparedReply";
     JsonValue body = frozen;
@@ -1183,8 +1449,10 @@ void PreparedMessagesOwnImmutableJsonAndEnvelope()
     JsonValue error(JsonValue::Object{ { "code", JsonValue(std::string("retry")) } });
     const auto before = Protocol::SerializeMessage({ mutableType, &body, &sequence, &error });
     auto envelope = Protocol::PrepareMessage({ mutableType, &body, &sequence, &error });
-    ServerCoreTest::ExpectTrue(before.IsOk() && envelope.IsOk(), "body, seq and error can be prepared together");
-    if (!before.IsOk() || !envelope.IsOk()) return;
+    ServerCoreTest::ExpectTrue(
+        before.IsOk() && envelope.IsOk(), "body, seq and error can be prepared together");
+    if (!before.IsOk() || !envelope.IsOk())
+        return;
     mutableType.assign("changed");
     body = JsonValue(nullptr);
     sequence = JsonValue(nullptr);
@@ -1205,7 +1473,8 @@ void PreparedMessagesRejectInvalidInputs()
     for (const JsonValue* value : { &invalidString, &nonFinite, &nestedNan, &nestedInvalid })
     {
         const auto result = Protocol::PrepareJsonValue(*value);
-        ServerCoreTest::ExpectTrue(!result.IsOk() && result.GetStatus().Code() == ErrorCode::InvalidArgument,
+        ServerCoreTest::ExpectTrue(
+            !result.IsOk() && result.GetStatus().Code() == ErrorCode::InvalidArgument,
             "prepared values reject non-finite numbers and invalid UTF-8 recursively");
     }
     for (const MessageFields fields : { MessageFields{ "", &validBody, nullptr, nullptr },
@@ -1214,25 +1483,34 @@ void PreparedMessagesRejectInvalidInputs()
              MessageFields{ "Missing", nullptr, nullptr, nullptr } })
     {
         const auto result = Protocol::PrepareMessage(fields);
-        ServerCoreTest::ExpectTrue(!result.IsOk() && result.GetStatus().Code() == ErrorCode::InvalidArgument,
+        ServerCoreTest::ExpectTrue(
+            !result.IsOk() && result.GetStatus().Code() == ErrorCode::InvalidArgument,
             "PrepareMessage preserves the existing outbound validation contract");
     }
     auto item = Protocol::PrepareJsonValue(validBody);
-    if (!item.IsOk()) { ServerCoreTest::ExpectTrue(false, "valid prepared test item exists"); return; }
+    if (!item.IsOk())
+    {
+        ServerCoreTest::ExpectTrue(false, "valid prepared test item exists");
+        return;
+    }
     const std::array<const Protocol::PreparedJsonValue*, 1> nullPointer{ nullptr };
     const auto missing = Protocol::PrepareArrayMessage("Batch", "states", nullPointer);
-    ServerCoreTest::ExpectTrue(!missing.IsOk() && missing.GetStatus().Code() == ErrorCode::InvalidArgument,
+    ServerCoreTest::ExpectTrue(
+        !missing.IsOk() && missing.GetStatus().Code() == ErrorCode::InvalidArgument,
         "a null prepared-item pointer cannot become a silent JSON null element");
     auto owner = std::move(item.Value());
     const std::array<const Protocol::PreparedJsonValue*, 1> movedFrom{ &item.Value() };
     const auto emptyItem = Protocol::PrepareArrayMessage("Batch", "states", movedFrom);
     ServerCoreTest::ExpectTrue(owner.Size() != 0 && !emptyItem.IsOk() &&
-        emptyItem.GetStatus().Code() == ErrorCode::InvalidArgument, "a moved-from prepared value is rejected rather than corrupting the array");
+                                   emptyItem.GetStatus().Code() == ErrorCode::InvalidArgument,
+        "a moved-from prepared value is rejected rather than corrupting the array");
     for (const auto& names : std::array<std::pair<std::string, std::string>, 3>{
-             std::pair{ std::string{}, std::string("states") }, { invalidUtf8, "states" }, { "Batch", invalidUtf8 } })
+             std::pair{ std::string{}, std::string("states") }, { invalidUtf8, "states" },
+             { "Batch", invalidUtf8 } })
     {
         const auto result = Protocol::PrepareArrayMessage(names.first, names.second, {});
-        ServerCoreTest::ExpectTrue(!result.IsOk() && result.GetStatus().Code() == ErrorCode::InvalidArgument,
+        ServerCoreTest::ExpectTrue(
+            !result.IsOk() && result.GetStatus().Code() == ErrorCode::InvalidArgument,
             "array assembly validates empty message types and UTF-8 in both envelope names");
     }
 }
@@ -1242,34 +1520,51 @@ void PreparedMessagesAdaptLegacySessions()
     class LegacySession final : public ServerCore::Session::Session
     {
     public:
-        ServerCore::Session::SessionId Id() const noexcept override { return static_cast<ServerCore::Session::SessionId>(1); }
-        ServerCore::Session::SessionState State() const noexcept override { return ServerCore::Session::SessionState::Connected; }
-        ServerCore::Core::Status MarkAuthenticated() override { return ServerCore::Core::Status::Ok(); }
+        ServerCore::Session::SessionId Id() const noexcept override
+        {
+            return static_cast<ServerCore::Session::SessionId>(1);
+        }
+        ServerCore::Session::SessionState State() const noexcept override
+        {
+            return ServerCore::Session::SessionState::Connected;
+        }
+        ServerCore::Core::Status MarkAuthenticated() override
+        {
+            return ServerCore::Core::Status::Ok();
+        }
         ServerCore::Core::Status Send(const MessageFields& fields) override
         {
             ++calls;
             auto serialized = ServerCore::Protocol::SerializeMessage(fields);
-            if (!serialized.IsOk()) return std::move(serialized).TakeStatus();
+            if (!serialized.IsOk())
+                return std::move(serialized).TakeStatus();
             received = std::move(serialized.Value());
             return ServerCore::Core::Status::FailWithoutMessage(ErrorCode::WouldBlock);
         }
-        ServerCore::Core::Status SendAndDisconnect(const MessageFields&, ServerCore::Core::Status) override
-        { return ServerCore::Core::Status::FailWithoutMessage(ErrorCode::Closed); }
+        ServerCore::Core::Status SendAndDisconnect(
+            const MessageFields&, ServerCore::Core::Status) override
+        {
+            return ServerCore::Core::Status::FailWithoutMessage(ErrorCode::Closed);
+        }
         void Disconnect(ServerCore::Core::Status) override {}
         std::size_t calls = 0;
         std::vector<std::byte> received;
     } session;
     const JsonValue sequence((std::numeric_limits<std::uint64_t>::max)());
     const JsonValue error(JsonValue::Object{ { "code", JsonValue(std::string("준비\"실패")) } });
-    auto prepared = ServerCore::Protocol::PrepareMessage({ "ErrorOnly", nullptr, &sequence, &error });
-    ServerCoreTest::ExpectTrue(prepared.IsOk(), "an error-only envelope can be prepared for a legacy session");
-    if (!prepared.IsOk()) return;
+    auto prepared =
+        ServerCore::Protocol::PrepareMessage({ "ErrorOnly", nullptr, &sequence, &error });
+    ServerCoreTest::ExpectTrue(
+        prepared.IsOk(), "an error-only envelope can be prepared for a legacy session");
+    if (!prepared.IsOk())
+        return;
     const auto result = session.SendPrepared(prepared.Value());
     ServerCoreTest::ExpectTrue(result.Code() == ErrorCode::WouldBlock && session.calls == 1,
         "the default prepared adapter calls existing Send once and preserves its status");
     ServerCoreTest::ExpectEqual(ToText(prepared.Value().Bytes()), ToText(session.received),
         "the legacy adapter preserves absent body, error, exact seq and escaped UTF-8");
-    ServerCoreTest::ExpectEqual(std::size_t{ 0 }, session.QueuedSendBytes(), "legacy sessions have an explicitly unavailable queue metric");
+    ServerCoreTest::ExpectEqual(std::size_t{ 0 }, session.QueuedSendBytes(),
+        "legacy sessions have an explicitly unavailable queue metric");
     auto owner = std::move(prepared.Value());
     const auto empty = session.SendPrepared(prepared.Value());
     ServerCoreTest::ExpectTrue(owner.Size() != 0 && !empty.IsOk() && session.calls == 1,
@@ -1283,12 +1578,14 @@ void PreparedArrayReservesEnvelopeDepth()
     for (int index = 0; index < 253; ++index)
         value = JsonValue(JsonValue::Array{ std::move(value) });
     auto prepared = Protocol::PrepareJsonValue(value);
-    ServerCoreTest::ExpectTrue(prepared.IsOk(), "array item permits the maximum depth left by its envelope");
+    ServerCoreTest::ExpectTrue(
+        prepared.IsOk(), "array item permits the maximum depth left by its envelope");
     if (prepared.IsOk())
     {
         const std::array<const Protocol::PreparedJsonValue*, 1> items{ &prepared.Value() };
         auto envelope = Protocol::PrepareArrayMessage("Batch", "items", items);
-        ServerCoreTest::ExpectTrue(envelope.IsOk() && Protocol::ParseMessage(envelope.Value().Bytes()).IsOk(),
+        ServerCoreTest::ExpectTrue(
+            envelope.IsOk() && Protocol::ParseMessage(envelope.Value().Bytes()).IsOk(),
             "maximum-depth prepared array remains parseable after envelope assembly");
     }
     value = JsonValue(JsonValue::Array{ std::move(value) });
@@ -1301,24 +1598,32 @@ void DatagramBoundariesAndWireOrder()
     namespace Codec = ServerCore::Protocol::DatagramCodec;
     const auto token = Codec::TokenFromHex("000102030405060708090a0b0c0d0e0f");
     ServerCoreTest::ExpectTrue(token.has_value() && !Codec::TokenFromHex("xyz") &&
-        !Codec::TokenFromHex("gg0102030405060708090a0b0c0d0e0f"), "datagram token parsing is exact and bounded");
-    if (!token) return;
-    ServerCoreTest::ExpectEqual(std::string("000102030405060708090a0b0c0d0e0f"), Codec::TokenToHex(*token),
-        "token text round-trips each byte");
+                                   !Codec::TokenFromHex("gg0102030405060708090a0b0c0d0e0f"),
+        "datagram token parsing is exact and bounded");
+    if (!token)
+        return;
+    ServerCoreTest::ExpectEqual(std::string("000102030405060708090a0b0c0d0e0f"),
+        Codec::TokenToHex(*token), "token text round-trips each byte");
     std::array<std::byte, Codec::MaximumDatagramBytes + 1> bytes{};
     std::array<std::byte, Codec::MaximumPayloadBytes + 1> payload{};
     const auto body = std::span(payload).first(Codec::MaximumPayloadBytes);
     const auto count = Codec::Encode(bytes, *token, 0x0102030405060708ull, body);
     const auto packet = Codec::Decode(std::span(bytes).first(count));
     ServerCoreTest::ExpectTrue(count == 1200 && packet && packet->token == *token &&
-        packet->sequence == 0x0102030405060708ull && packet->payload.size() == 1172 &&
-        bytes[20] == std::byte{1} && bytes[27] == std::byte{8}, "datagram wire format preserves exact big-endian sequence at MTU bound");
-    ServerCoreTest::ExpectTrue(!Codec::Decode(std::span(bytes).first(28)) && !Codec::Decode(bytes) &&
-        Codec::Encode(bytes, *token, 0, body) == 0 && Codec::Encode(bytes, *token, 1, payload) == 0 &&
-        Codec::Encode(std::span(bytes).first(100), *token, 1, body) == 0 &&
-        Codec::Encode(bytes, *token, 1, {}) == 0, "truncation, oversize, zero sequence and empty payload are rejected");
-    bytes[0] = std::byte{'X'};
-    ServerCoreTest::ExpectTrue(!Codec::Decode(std::span(bytes).first(count)), "foreign magic is ignored");
+                                   packet->sequence == 0x0102030405060708ull &&
+                                   packet->payload.size() == 1172 && bytes[20] == std::byte{ 1 } &&
+                                   bytes[27] == std::byte{ 8 },
+        "datagram wire format preserves exact big-endian sequence at MTU bound");
+    ServerCoreTest::ExpectTrue(
+        !Codec::Decode(std::span(bytes).first(28)) && !Codec::Decode(bytes) &&
+            Codec::Encode(bytes, *token, 0, body) == 0 &&
+            Codec::Encode(bytes, *token, 1, payload) == 0 &&
+            Codec::Encode(std::span(bytes).first(100), *token, 1, body) == 0 &&
+            Codec::Encode(bytes, *token, 1, {}) == 0,
+        "truncation, oversize, zero sequence and empty payload are rejected");
+    bytes[0] = std::byte{ 'X' };
+    ServerCoreTest::ExpectTrue(
+        !Codec::Decode(std::span(bytes).first(count)), "foreign magic is ignored");
 }
 
 ServerCoreTest::CheckRegistration gPreparedArrayReservesEnvelopeDepth(
@@ -1327,7 +1632,8 @@ ServerCoreTest::CheckRegistration gDatagramBoundariesAndWireOrder(
     "Protocol.DatagramBoundariesAndWireOrder", &DatagramBoundariesAndWireOrder);
 
 ServerCoreTest::CheckRegistration gPreparedMessagesOwnImmutableJsonAndEnvelope(
-    "Protocol.PreparedMessagesOwnImmutableJsonAndEnvelope", &PreparedMessagesOwnImmutableJsonAndEnvelope);
+    "Protocol.PreparedMessagesOwnImmutableJsonAndEnvelope",
+    &PreparedMessagesOwnImmutableJsonAndEnvelope);
 ServerCoreTest::CheckRegistration gPreparedMessagesRejectInvalidInputs(
     "Protocol.PreparedMessagesRejectInvalidInputs", &PreparedMessagesRejectInvalidInputs);
 ServerCoreTest::CheckRegistration gPreparedMessagesAdaptLegacySessions(
@@ -1361,4 +1667,14 @@ ServerCoreTest::CheckRegistration gMessageRejectsUnsafeOutboundJson(
     "Protocol.MessageRejectsUnsafeOutboundJson", &MessageRejectsUnsafeOutboundJson);
 ServerCoreTest::CheckRegistration gMessageRejectsNonObjectBodies(
     "Protocol.MessageRejectsNonObjectBodies", &MessageRejectsNonObjectBodies);
+ServerCoreTest::CheckRegistration gJsonTextConstructorsKeepTheirType(
+    "Protocol.JsonTextConstructorsKeepTheirType", &JsonTextConstructorsKeepTheirType);
+ServerCoreTest::CheckRegistration gParseMessageMovesTheParsedBody(
+    "Protocol.ParseMessageMovesTheParsedBody", &ParseMessageMovesTheParsedBody);
+ServerCoreTest::CheckRegistration gJsonObjectKeysResistHashFlooding(
+    "Protocol.JsonObjectKeysResistHashFlooding", &JsonObjectKeysResistHashFlooding);
+ServerCoreTest::CheckRegistration gJsonParseLimitsValueCount(
+    "Protocol.JsonParseLimitsValueCount", &JsonParseLimitsValueCount);
+ServerCoreTest::CheckRegistration gJsonNumbersUnderflowToSignedZero(
+    "Protocol.JsonNumbersUnderflowToSignedZero", &JsonNumbersUnderflowToSignedZero);
 }

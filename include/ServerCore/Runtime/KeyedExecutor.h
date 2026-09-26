@@ -36,7 +36,8 @@ public:
     [[nodiscard]] SERVERCORE_API bool IsFinished() const noexcept;
     [[nodiscard]] SERVERCORE_API Core::Status GetStatus() const;
     [[nodiscard]] SERVERCORE_API Core::Status Wait() const;
-    [[nodiscard]] SERVERCORE_API Core::Status WaitUntil(std::chrono::steady_clock::time_point deadline) const;
+    [[nodiscard]] SERVERCORE_API Core::Status WaitUntil(
+        std::chrono::steady_clock::time_point deadline) const;
     // Up to 16 pending one-shot observers; callbacks run outside scheduler
     // locks after task/completion captures retire. Terminal calls may run inline.
     SERVERCORE_API Core::Result<Core::CompletionSubscription> WaitForCompletion(
@@ -80,28 +81,28 @@ public:
     // Empty task: InvalidArgument. A task exceeding either byte cap: TooLarge.
     // Used count/bytes/key capacity: WouldBlock. Inactive/stopped: Closed.
     // Rejection retains no callback, invokes no completion and consumes no budget.
-    SERVERCORE_API Core::Result<KeyedTaskHandle> Submit(std::uint64_t key, Task task,
-        const TaskOptions& options = {});
-    SERVERCORE_API Core::Result<KeyedTaskHandle> SubmitWithCompletion(std::uint64_t key, Task task,
-        Completion completion, const TaskOptions& options = {});
+    SERVERCORE_API Core::Result<KeyedTaskHandle> Submit(
+        std::uint64_t key, Task task, const TaskOptions& options = {});
+    SERVERCORE_API Core::Result<KeyedTaskHandle> SubmitWithCompletion(
+        std::uint64_t key, Task task, Completion completion, const TaskOptions& options = {});
 
-    template<class Callback>
+    template <class Callback>
         requires std::same_as<std::remove_cvref_t<Callback>,
             std::function<Core::Status(std::stop_token)>>
-    Core::Result<KeyedTaskHandle> Submit(std::uint64_t key, Callback&& task,
-        const TaskOptions& options = {})
+    Core::Result<KeyedTaskHandle> Submit(
+        std::uint64_t key, Callback&& task, const TaskOptions& options = {})
     {
-        return Submit(key, Normalize<Core::Status(std::stop_token)>(
-            std::forward<Callback>(task)), options);
+        return Submit(
+            key, Normalize<Core::Status(std::stop_token)>(std::forward<Callback>(task)), options);
     }
-    template<class Work = Task, class Done = Completion>
-        requires (std::same_as<std::remove_cvref_t<Work>,
-                      std::function<Core::Status(std::stop_token)>> ||
-                  std::same_as<std::remove_cvref_t<Done>,
-                      std::function<void(const Core::Status&)>>) &&
-                 std::constructible_from<Task, Work> && std::constructible_from<Completion, Done>
-    Core::Result<KeyedTaskHandle> SubmitWithCompletion(std::uint64_t key, Work&& task,
-        Done&& completion, const TaskOptions& options = {})
+    template <class Work = Task, class Done = Completion>
+        requires(std::same_as<std::remove_cvref_t<Work>,
+                     std::function<Core::Status(std::stop_token)>> ||
+                    std::same_as<std::remove_cvref_t<Done>,
+                        std::function<void(const Core::Status&)>>) &&
+                std::constructible_from<Task, Work> && std::constructible_from<Completion, Done>
+    Core::Result<KeyedTaskHandle> SubmitWithCompletion(
+        std::uint64_t key, Work&& task, Done&& completion, const TaskOptions& options = {})
     {
         return SubmitWithCompletion(key,
             Normalize<Core::Status(std::stop_token)>(std::forward<Work>(task)),
@@ -118,14 +119,16 @@ public:
     [[nodiscard]] SERVERCORE_API std::size_t OutstandingCount(std::uint64_t key) const noexcept;
     [[nodiscard]] SERVERCORE_API std::size_t RetainedBytes() const noexcept;
     [[nodiscard]] SERVERCORE_API std::size_t RetainedBytes(std::uint64_t key) const noexcept;
-    [[nodiscard]] SERVERCORE_API Observability::TaskExecutorMetricsSnapshot GetMetrics() const noexcept;
+    [[nodiscard]] SERVERCORE_API Observability::TaskExecutorMetricsSnapshot GetMetrics()
+        const noexcept;
 
 private:
-    template<class Signature, class Callback>
+    template <class Signature, class Callback>
     static std::move_only_function<Signature> Normalize(Callback&& callback)
     {
         if constexpr (std::same_as<std::remove_cvref_t<Callback>, std::function<Signature>>)
-            if (!callback) return {};
+            if (!callback)
+                return {};
         return std::move_only_function<Signature>(std::forward<Callback>(callback));
     }
     std::shared_ptr<Detail::KeyedExecutorState> mState;

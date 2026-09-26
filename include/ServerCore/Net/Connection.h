@@ -1,7 +1,7 @@
 #pragma once
 
-#include "ServerCore/Core/Error.h"
 #include "ServerCore/Core/Endpoint.h"
+#include "ServerCore/Core/Error.h"
 
 #include <cstddef>
 #include <memory>
@@ -67,6 +67,14 @@ protected:
 /// 아무 측정도 없다(미정). 측정이 생기면 여기 한 줄을 고친다.
 /// </remarks>
 inline constexpr std::size_t SendQueueLimitBytes = 1024 * 1024;
+
+/// <summary>IConnectionObserver::OnBytesReceived 한 번이 넘기는 바이트의 상한이다.</summary>
+/// <remarks>
+/// 연결마다 수신 버퍼 하나를 이 크기로 두고 그 버퍼 하나를 채운 만큼만 넘기므로 이 값을 넘지 않는다.
+/// 수신한 바이트를 모아 두는 쪽(예: ServerHost의 대기 수신 예산)은 이 값보다 작은 예산으로는 정상
+/// 수신 한 번도 받지 못할 수 있으므로 이 값을 하한으로 쓴다. 값의 근거는 흔한 MTU보다 크다는 것뿐이다.
+/// </remarks>
+inline constexpr std::size_t MaximumReceiveChunkBytes = 16 * 1024;
 
 /// <summary>한 Send 호출의 상태와 그 실패가 연결을 직접 닫았는지를 함께 돌려준다.</summary>
 /// <remarks>
@@ -177,6 +185,17 @@ public:
     /// 요청도 Closed로 거절한다. 동시에 부른 Send()와의 포함 여부는 연결의 잠금을 먼저 잡은
     /// 호출 순서로 정한다.
     ///
+    /// 보내기 쪽을 닫은 뒤에도 소켓은 곧바로 닫지 않는다. 상대가 보내기를 닫거나 오류가 날
+    /// 때까지 들어오는 바이트를 PauseReceive()와 관계없이 읽어 버리고, 관찰자에게는 올리지 않는다.
+    /// 읽지 않은 수신 바이트가 남은 소켓을 닫으면 TCP가 FIN 대신 RST를 보내 아직 전송하지 못한
+    /// 송신 바이트를 버리기 때문이다. 이 경로는 Transport.CloseAfterSendWithUnreadInputDeliversQueuedBytes가
+    /// 고정한다. 그래서 OnDisconnected는 상대가 자기 쪽을 닫은 뒤에 온다. 이 층은 큐를 비우는
+    /// 기다림에도, 상대의 종료를 기다리는 것에도 기한을 두지 않는다. 상대가 EOF를 받고도 닫지 않으면
+    /// 소켓과 이벤트 등록이 남으므로, 이 함수를 부르는 쪽이 기한을 두고 Close()를 부른다. Close()는
+    /// 남은 기다림을 즉시 끝낸다. 이 라이브러리 안의 호출자는 모두 양수로 검증된 기한을 둔다.
+    /// ServerHost는 ServerHostOptions::gracefulCloseTimeout으로, HttpServer는 responseDrainTimeout·
+    /// webSocketCloseTimeout·idleTimeout으로 주기 검사에서 Close()를 부른다.
+    ///
     /// 이는 이 프로세스의 송신 큐를 끝까지 처리한다는 뜻이지, 원격 애플리케이션이 바이트를
     /// 소비했다는 확인은 아니다. 전송 중 즉시 Close()를 부르거나 peer가 먼저 끊기면 남은
     /// 바이트는 버려질 수 있다.
@@ -194,7 +213,8 @@ public:
     /// <summary>로컬 소켓이 아직 닫히지 않았는지 알려 준다.</summary>
     /// <remarks>
     /// CloseAfterSend() 뒤에는 큐를 비우는 동안 참일 수 있지만, 그 동안에도 Send()는 새
-    /// 바이트를 받지 않는다. 따라서 이 값은 Send()의 수락 가능 여부를 뜻하지 않는다.
+    /// 바이트를 받지 않는다. 따라서 이 값은 Send()의 수락 가능 여부를 뜻하지 않는다. 보내기 쪽을
+    /// 닫은 뒤 상대의 종료를 기다리며 입력을 읽어 버리는 동안에는 거짓이다.
     /// </remarks>
     [[nodiscard]] virtual bool IsOpen() const noexcept = 0;
 

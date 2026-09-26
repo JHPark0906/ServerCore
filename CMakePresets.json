@@ -7,7 +7,7 @@
       "hidden": true,
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
-      "cacheVariables": { "SERVERCORE_BUILD_SHARED": "OFF" },
+      "cacheVariables": { "SERVERCORE_BUILD_SHARED": "OFF", "SERVERCORE_BUILD_C_API": "ON" },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
     },
     {
@@ -41,7 +41,8 @@
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_CXX_COMPILER": "cl",
-        "SERVERCORE_BUILD_SHARED": "OFF"
+        "SERVERCORE_BUILD_SHARED": "OFF",
+        "SERVERCORE_BUILD_C_API": "ON"
       }
     },
     {

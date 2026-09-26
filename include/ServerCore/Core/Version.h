@@ -14,7 +14,7 @@ namespace ServerCore
 inline constexpr int VersionMajor = 0;
 
 /// <summary>버전의 부 번호. 0.x 개발 단계에서는 기능 추가와 공개 API 변경을 포함한다.</summary>
-inline constexpr int VersionMinor = 2;
+inline constexpr int VersionMinor = 3;
 
 /// <summary>버전의 수정 번호. 호환되는 버그 수정에 사용한다.</summary>
 inline constexpr int VersionPatch = 0;

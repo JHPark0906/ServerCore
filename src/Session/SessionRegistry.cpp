@@ -1,6 +1,9 @@
 #include "ServerCore/Session/SessionRegistry.h"
 
 #include "ServerCore/Core/Assert.h"
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+#include "Session/SessionRegistryTestAccess.h"
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -26,9 +29,13 @@ namespace
 /// </remarks>
 std::atomic<std::uint64_t> gNextSessionId{ 1 };
 
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+std::atomic<bool> gFailNextForEachSnapshot{ false };
+#endif
+
 [[nodiscard]] std::uint64_t ToValue(SessionId id) noexcept
 {
-    return static_cast<std::uint64_t>(id);
+    return std::to_underlying(id);
 }
 
 [[nodiscard]] Core::Status PlatformFailureFrom(const std::exception& failure) noexcept
@@ -245,7 +252,7 @@ std::shared_ptr<Session> SessionRegistry::Find(SessionId id) const
     return iterator->second;
 }
 
-void SessionRegistry::ForEach(
+Core::Status SessionRegistry::ForEach(
     const std::function<void(const std::shared_ptr<Session>&)>& visitor) const
 {
     RequireMutationThread();
@@ -255,7 +262,14 @@ void SessionRegistry::ForEach(
     // 방문자가 연결을 닫아 Registry에서 제거하더라도 이번 순회의 객체는 살아 있어야 한다.
     // 목록 잠금은 snapshot 복사에만 쓰고 사용자 코드는 모두 그 밖에서 실행한다.
     std::vector<std::shared_ptr<Session>> snapshot;
+    try
     {
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+        if (gFailNextForEachSnapshot.exchange(false, std::memory_order_acq_rel))
+        {
+            throw std::bad_alloc();
+        }
+#endif
         const std::scoped_lock sessionsLock(mState->sessionsMutex);
         snapshot.reserve(mState->sessions.size());
         for (const auto& [id, session] : mState->sessions)
@@ -264,11 +278,18 @@ void SessionRegistry::ForEach(
             snapshot.push_back(session);
         }
     }
+    catch (const std::bad_alloc&)
+    {
+        // snapshot을 다 만들지 못했으면 한 세션도 방문하지 않는다. 일부만 도는 순회는 호출자가
+        // 구분할 수 없다.
+        return Core::Status::AllocationFailure();
+    }
 
     for (const std::shared_ptr<Session>& session : snapshot)
     {
         visitor(session);
     }
+    return Core::Status::Ok();
 }
 
 std::size_t SessionRegistry::Count() const noexcept
@@ -285,4 +306,16 @@ void SessionRegistry::RequireMutationThread() const
     SERVERCORE_ASSERT(mState->mutationThread == std::this_thread::get_id(),
         "SessionRegistry must be used from its bound serial execution thread");
 }
+
+#if defined(SERVERCORE_ENABLE_TEST_HOOKS)
+void TestAccess::FailNextForEachSnapshot() noexcept
+{
+    gFailNextForEachSnapshot.store(true, std::memory_order_release);
+}
+
+void TestAccess::ClearForEachSnapshotFailure() noexcept
+{
+    gFailNextForEachSnapshot.store(false, std::memory_order_release);
+}
+#endif
 }

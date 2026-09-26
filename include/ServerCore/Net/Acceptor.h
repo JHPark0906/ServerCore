@@ -43,6 +43,15 @@ class IoContext;
 /// 방화벽 규칙은 이 라이브러리를 쓰는 서버 프로그램이 정한다. 그래야 서로 다른 서버가 같은
 /// 전송 라이브러리를 써도 각자의 배포 정책을 가질 수 있다.
 ///
+/// 자원 고갈:
+/// 수락 준비가 descriptor나 메모리 부족으로 실패하면 리스너를 닫지 않고 잠시 쉬었다가 다시
+/// 시도한다. Linux에서는 accept4의 EMFILE·ENFILE·ENOMEM·ENOBUFS가, Windows에서는 수락 소켓 생성이나
+/// AcceptEx 게시의 실패가 그 대상이다. 그 동안 들어온 상대는 backlog에서 기다린다. 쉬기 시작할 때
+/// 로거에 Warn 한 줄을 남기고, 회복하기 전까지의 재시도 실패는 남기지 않는다. 이것을 고정하는 것은
+/// Transport.AcceptorRetriesAfterAcceptResourceFailure와, Linux에서 실제 EMFILE을 쓰는
+/// Transport.AcceptorSurvivesDescriptorExhaustion이다. Linux에서 재시도 타이머나 이벤트 등록처럼
+/// 회복할 수 없는 실패가 나면 리스너를 닫고 Warn을 남기며, 그 뒤 Port()는 0이다.
+///
 /// 약속하지 않는 것:
 /// - 수락 처리기가 불린 시점에 그 연결이 아직 살아 있다고 약속하지 않는다. 붙자마자 끊는
 ///   상대가 있다.
@@ -80,11 +89,13 @@ public:
     /// OS 오류 코드(Windows WSAGetLastError 또는 Linux errno)가 들어간다. 포트가 사용 중이면 bind의
     /// 주소 사용 중 오류가 이 경로로 온다.
     /// </returns>
-    SERVERCORE_API Core::Status Listen(std::string_view listenAddress, std::uint16_t port, int backlog);
+    SERVERCORE_API Core::Status Listen(
+        std::string_view listenAddress, std::uint16_t port, int backlog);
     // IPv6 is explicitly V6ONLY by default on both platforms. Set false for an
     // IPv6 dual-stack listener; IPv4 peers then retain mapped IPv6 addresses.
     // DNS/interface-name zones are unsupported. TCP port zero remains invalid.
-    SERVERCORE_API Core::Status Listen(const Core::IpEndpoint& endpoint, int backlog, bool ipv6Only = true);
+    SERVERCORE_API Core::Status Listen(
+        const Core::IpEndpoint& endpoint, int backlog, bool ipv6Only = true);
     [[nodiscard]] SERVERCORE_API Core::IpEndpoint LocalEndpoint() const noexcept;
 
     /// <summary>
@@ -102,7 +113,8 @@ public:
     /// 지키는 것은 수락 경로가 처리기를 부른 다음에 수신을 거는 것이다. 관찰자를 걸지 않으면
     /// 받은 바이트는 버려진다.
     /// </remarks>
-    SERVERCORE_API void SetConnectionHandler(std::function<void(std::shared_ptr<Connection>)> handler);
+    SERVERCORE_API void SetConnectionHandler(
+        std::function<void(std::shared_ptr<Connection>)> handler);
 
     // Configure before Start, on the boot thread. Positive connectionBytes up to
     // 1 MiB and totalBytes up to 512 MiB; defaults are 1 MiB / 256 MiB. The shared
@@ -123,16 +135,18 @@ public:
 
     /// <summary>수락을 멈추고 포트를 닫는다. 이미 맺어진 연결은 그대로 둔다.</summary>
     /// <remarks>
-    /// 진행 중인 수락 요청과 완료 뒤의 처리기 인계가 전부 정리될 때까지 기다린다. 그래서 이
-    /// 함수가 돌아온 뒤에는 이 객체를 가리키는 완료나 인계 코드가 남지 않는다. 여러 번 불러도
-    /// 된다.
+    /// 진행 중인 수락 요청과 완료 뒤의 처리기 인계, 그리고 실행 중인 수락 재시도 콜백이 전부
+    /// 정리될 때까지 기다린다. 그래서 이 함수가 돌아온 뒤에는 이 객체를 가리키는 완료나 인계
+    /// 코드가 남지 않는다. 여러 번 불러도 된다.
     ///
     /// 이미 실행 중인 수락 처리기 인계에는 시간 제한이 없다. 처리기는 서버 프로그램의 일이라
     /// 실행 시간을 이 층이 정할 수 없고, 이 객체의 상태를 쓰는 동안 돌아오면 수명이 깨진다.
-    /// Windows에서는 리슨 소켓을 닫은 뒤 남은 AcceptEx 취소 완료에만 시간 제한이 있다. 그 제한을 넘기는
-    /// 유일하게 알려진 이유는 IoContext가 이미 멈춰서 완료를 처리할 스레드가 없는 것이고, 그것은
-    /// 종료 순서를 어긴 것이므로 계약 위반이다. 그래서 제한을 넘기면 단언으로 끊는다. 여기서
-    /// 그냥 돌아오면 이 객체가 사라진 뒤에 완료가 그 자리를 가리키게 된다.
+    /// Windows에서는 리슨 소켓을 닫은 뒤 남은 AcceptEx 취소 완료를 IoContext가 돌고 있는 동안 제한 없이
+    /// 기다린다. I/O 스레드가 다른 연결의 긴 콜백에 묶여 있어도 결국 처리하기 때문이다. 이것을 고정하는
+    /// 것은 Transport.AcceptorStopWaitsForBusyIoWorkers다. IoContext가 멈춘 것을 본 뒤에만 시간 제한을
+    /// 재고, 그것을 넘기면 완료를 처리할 스레드가 없다는 뜻이다. 그것은 종료 순서를 어긴 것이므로
+    /// 계약 위반이며 단언으로 끊는다. 여기서 그냥 돌아오면 이 객체가 사라진 뒤에 완료가 그 자리를
+    /// 가리키게 된다.
     ///
     /// I/O 스레드에서 부르는 것은 계약 위반이다. 자기가 처리해야 할 완료를 자기가 기다리게
     /// 된다. 그것을 잡는 것은 이 함수 안의 단언이며 판정 근거는 IoContext::IsCurrentThreadIoThread()다.

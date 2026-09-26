@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Net/Linux/EpollInternal.h"
 #include "Net/SendBudgetInternal.h"
 #include "Net/SendQueueInternal.h"
 #include "ServerCore/Net/Connection.h"
@@ -14,18 +15,22 @@
 
 namespace ServerCore::Net
 {
-inline constexpr std::size_t ReceiveBufferSize = 16 * 1024;
+inline constexpr std::size_t ReceiveBufferSize = MaximumReceiveChunkBytes;
 
-class TcpConnection final : public Connection, public ConnectionFlowControl,
+class TcpConnection final : public Connection,
+                            public ConnectionFlowControl,
                             public std::enable_shared_from_this<TcpConnection>
 {
 public:
-    struct CreationKey {};
+    struct CreationKey
+    {
+    };
     // Ownership of descriptor transfers only after Create succeeds.
-    [[nodiscard]] static std::shared_ptr<TcpConnection> Create(int descriptor,
-        IoContext& context, std::shared_ptr<SendBudget> budget,Core::IpEndpoint local = {},Core::IpEndpoint remote = {});
-    TcpConnection(CreationKey, int descriptor, IoContext& context, std::shared_ptr<SendBudget> budget,
-        Core::IpEndpoint local,Core::IpEndpoint remote);
+    [[nodiscard]] static std::shared_ptr<TcpConnection> Create(int descriptor, IoContext& context,
+        std::shared_ptr<SendBudget> budget, Core::IpEndpoint local = {},
+        Core::IpEndpoint remote = {});
+    TcpConnection(CreationKey, int descriptor, IoContext& context,
+        std::shared_ptr<SendBudget> budget, Core::IpEndpoint local, Core::IpEndpoint remote);
     ~TcpConnection() override;
 
     [[nodiscard]] Core::Status Start();
@@ -36,8 +41,14 @@ public:
     void SetObserver(std::weak_ptr<IConnectionObserver> observer) override;
     [[nodiscard]] bool IsOpen() const noexcept override;
     [[nodiscard]] std::size_t QueuedSendBytes() const noexcept override;
-    [[nodiscard]] Core::IpEndpoint LocalEndpoint() const noexcept override { return mLocalEndpoint; }
-    [[nodiscard]] Core::IpEndpoint RemoteEndpoint() const noexcept override { return mRemoteEndpoint; }
+    [[nodiscard]] Core::IpEndpoint LocalEndpoint() const noexcept override
+    {
+        return mLocalEndpoint;
+    }
+    [[nodiscard]] Core::IpEndpoint RemoteEndpoint() const noexcept override
+    {
+        return mRemoteEndpoint;
+    }
     Core::Status PauseReceive() override;
     Core::Status ResumeReceive() override;
     [[nodiscard]] bool IsReceivePaused() const noexcept override;
@@ -51,11 +62,16 @@ private:
     [[nodiscard]] Core::Status RearmLocked() noexcept;
     void CloseWithFailureLocked(Core::Status& failure) noexcept;
     void CloseLocked(Core::Status reason, bool graceful = false) noexcept;
+    // Unregisters and closes the descriptor, ending any lingering drain.
+    void ReleaseDescriptorLocked(int how) noexcept;
     void DiscardSendsLocked() noexcept;
     void NotifyDisconnected();
 
     mutable std::mutex mMutex;
-    IoContext& mContext;
+    // Shared, not IoContext&: Close and friends may run after the IoContext is
+    // destroyed; they then see Closed instead of freed state (pinned by
+    // Transport.ConnectionOutlivesIoContext).
+    const IoContextAccess::EventSet mEvents;
     int mDescriptor;
     const Core::IpEndpoint mLocalEndpoint;
     const Core::IpEndpoint mRemoteEndpoint;
@@ -66,6 +82,10 @@ private:
     bool mReceivePaused = false;
     bool mProcessing = false;
     bool mCloseAfterSend = false;
+    // CloseAfterSend shut down the send side; the descriptor stays registered
+    // and discards input until the peer closes. mClosed is already true, so
+    // NotifyDisconnected waits until ReleaseDescriptorLocked clears this.
+    bool mLingering = false;
     bool mDisconnectNotified = false;
     std::atomic<bool> mClosed{ false };
     Core::Status mCloseReason = Core::Status::Ok();

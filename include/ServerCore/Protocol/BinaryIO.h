@@ -1,7 +1,7 @@
 #pragma once
 
-#include "ServerCore/Export.h"
 #include "ServerCore/Core/Error.h"
+#include "ServerCore/Export.h"
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -29,7 +29,8 @@ public:
     SERVERCORE_API Core::Result<float> ReadFloat32() noexcept;
     SERVERCORE_API Core::Result<double> ReadFloat64() noexcept;
     SERVERCORE_API Core::Result<std::span<const std::byte>> ReadBytes(std::size_t length) noexcept;
-    SERVERCORE_API Core::Result<std::span<const std::byte>> ReadLengthPrefixed(std::size_t maximumLength) noexcept;
+    SERVERCORE_API Core::Result<std::span<const std::byte>> ReadLengthPrefixed(
+        std::size_t maximumLength) noexcept;
     SERVERCORE_API Core::Result<std::string_view> ReadUtf8(std::size_t maximumLength) noexcept;
     SERVERCORE_API Core::Status Skip(std::size_t length) noexcept;
     std::size_t Position() const noexcept { return mPosition; }
@@ -58,7 +59,8 @@ public:
     SERVERCORE_API Core::Status WriteFloat32(float value);
     SERVERCORE_API Core::Status WriteFloat64(double value);
     SERVERCORE_API Core::Status WriteBytes(std::span<const std::byte> value);
-    SERVERCORE_API Core::Status WriteLengthPrefixed(std::span<const std::byte> value, std::size_t maximumLength);
+    SERVERCORE_API Core::Status WriteLengthPrefixed(
+        std::span<const std::byte> value, std::size_t maximumLength);
     SERVERCORE_API Core::Status WriteUtf8(std::string_view value, std::size_t maximumLength);
     std::span<const std::byte> Bytes() const noexcept { return mBytes; }
     void Clear() noexcept { mBytes.clear(); }

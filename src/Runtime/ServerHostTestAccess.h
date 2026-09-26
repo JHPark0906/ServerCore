@@ -41,10 +41,12 @@ public:
 };
 
 /// <summary>다음 NetworkSession 수신 callback들이 만날 gate를 설치한다.</summary>
-SERVERCORE_TEST_API void InstallBeforeSessionReceiveGate(std::shared_ptr<IBeforeSessionReceiveGate> gate);
+SERVERCORE_TEST_API void InstallBeforeSessionReceiveGate(
+    std::shared_ptr<IBeforeSessionReceiveGate> gate);
 
 /// <summary>같은 수신 gate가 아직 설치되어 있을 때만 제거한다.</summary>
-SERVERCORE_TEST_API void ClearBeforeSessionReceiveGate(const std::shared_ptr<IBeforeSessionReceiveGate>& expected);
+SERVERCORE_TEST_API void ClearBeforeSessionReceiveGate(
+    const std::shared_ptr<IBeforeSessionReceiveGate>& expected);
 
 /// <summary>수락 handler가 새 Connection의 Start()로 돌아가기 직전에 멈추는 시험 gate다.</summary>
 class IBeforeConnectionStartGate
@@ -56,10 +58,12 @@ public:
 };
 
 /// <summary>다음 수락 handler가 Connection::Start() 직전에 만날 gate를 설치한다.</summary>
-SERVERCORE_TEST_API void InstallBeforeConnectionStartGate(std::shared_ptr<IBeforeConnectionStartGate> gate);
+SERVERCORE_TEST_API void InstallBeforeConnectionStartGate(
+    std::shared_ptr<IBeforeConnectionStartGate> gate);
 
 /// <summary>같은 Connection 시작 gate가 아직 설치되어 있을 때만 제거한다.</summary>
-SERVERCORE_TEST_API void ClearBeforeConnectionStartGate(const std::shared_ptr<IBeforeConnectionStartGate>& expected);
+SERVERCORE_TEST_API void ClearBeforeConnectionStartGate(
+    const std::shared_ptr<IBeforeConnectionStartGate>& expected);
 
 /// <summary>Acceptor 시작 성공 뒤 Host가 Running으로 전이하기 직전을 멈추는 시험 gate다.</summary>
 class IBeforeHostRunningGate
@@ -74,7 +78,8 @@ public:
 SERVERCORE_TEST_API void InstallBeforeHostRunningGate(std::shared_ptr<IBeforeHostRunningGate> gate);
 
 /// <summary>같은 Host 시작 gate가 아직 설치되어 있을 때만 제거한다.</summary>
-SERVERCORE_TEST_API void ClearBeforeHostRunningGate(const std::shared_ptr<IBeforeHostRunningGate>& expected);
+SERVERCORE_TEST_API void ClearBeforeHostRunningGate(
+    const std::shared_ptr<IBeforeHostRunningGate>& expected);
 
 /// <summary>실패한 Start의 소유자 파기와 Stop의 소유자 읽기가 겹치지 않는지 보는 시험 경계다.</summary>
 class IFailedStartOwnerGate
@@ -90,7 +95,8 @@ public:
 SERVERCORE_TEST_API void InstallFailedStartOwnerGate(std::shared_ptr<IFailedStartOwnerGate> gate);
 
 /// <summary>같은 실패 정리 gate가 아직 설치되어 있을 때만 제거한다.</summary>
-SERVERCORE_TEST_API void ClearFailedStartOwnerGate(const std::shared_ptr<IFailedStartOwnerGate>& expected);
+SERVERCORE_TEST_API void ClearFailedStartOwnerGate(
+    const std::shared_ptr<IFailedStartOwnerGate>& expected);
 
 /// <summary>다음 NetworkSession 종료가 JobRunner Post 실패 fallback을 타게 한다.</summary>
 SERVERCORE_TEST_API void FailNextFinalizePost() noexcept;

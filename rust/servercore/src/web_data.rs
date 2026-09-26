@@ -43,6 +43,10 @@ pub fn parse_form(body: &[u8], limits: FieldLimits) -> Result<Fields> { parse(sy
 /// Cookie values are strict ASCII cookie-octets, without percent decoding.
 pub fn parse_cookies(header: &[u8], limits: FieldLimits) -> Result<Fields> { parse(sys::SC_FIELDS_COOKIE, header, limits) }
 
+// WebData.h does not state that its text output is UTF-8, and the ABI version
+// check cannot tell native builds apart, so check before making a &str.
+fn utf8(value: &[u8]) -> Result<&str> { std::str::from_utf8(value).map_err(|_| Error::INVALID_FORMAT) }
+
 /// An owned native UTF-8 string, borrowing without another payload copy.
 pub struct Text { handle: NonNull<sys::sc_web_data_text>, view: sys::sc_bytes }
 unsafe impl Send for Text {}
@@ -51,13 +55,15 @@ impl Text {
     fn from_raw(raw: *mut sys::sc_web_data_text) -> Result<Self> {
         let handle = pointer(raw)?;
         let mut view = bytes(&[]);
-        if let Err(error) = check(unsafe { sys::sc_web_data_text_view(handle.as_ptr(), &mut view) }) {
+        let status = check(unsafe { sys::sc_web_data_text_view(handle.as_ptr(), &mut view) })
+            .and_then(|()| utf8(unsafe { borrowed_bytes(view) }).map(|_| ()));
+        if let Err(error) = status {
             unsafe { sys::sc_web_data_text_destroy(handle.as_ptr()) }; return Err(error);
         }
         Ok(Self { handle, view })
     }
     pub fn as_str(&self) -> &str {
-        // Native percent codecs validate UTF-8; cookie serialization emits ASCII.
+        // from_raw checked these immutable owner bytes.
         unsafe { std::str::from_utf8_unchecked(borrowed_bytes(self.view)) }
     }
 }
@@ -158,7 +164,12 @@ impl PartEvent {
         let mut view = sys::sc_multipart_event_view { abi_version: sys::SC_ABI_VERSION,
             struct_size: size_of::<sys::sc_multipart_event_view>() as u32, kind: 0, part_index: 0,
             name: bytes(&[]), filename: bytes(&[]), content_type: bytes(&[]), data: bytes(&[]), has_filename: 0 };
-        if let Err(error) = check(unsafe { sys::sc_multipart_event_get(handle.as_ptr(), &mut view) }) {
+        let status = check(unsafe { sys::sc_multipart_event_get(handle.as_ptr(), &mut view) })
+            .and_then(|()| utf8(unsafe { borrowed_bytes(view.name) }).map(|_| ()))
+            .and_then(|()| if view.has_filename != 0 {
+                utf8(unsafe { borrowed_bytes(view.filename) }).map(|_| ())
+            } else { Ok(()) });
+        if let Err(error) = status {
             unsafe { sys::sc_multipart_event_destroy(handle.as_ptr()) }; return Err(error);
         }
         Ok(Self { handle, view })
@@ -166,6 +177,7 @@ impl PartEvent {
     pub fn kind(&self) -> PartKind { match self.view.kind {
         sys::SC_MULTIPART_PART_BEGIN => PartKind::Begin, sys::SC_MULTIPART_DATA => PartKind::Data, _ => PartKind::End } }
     pub fn part_index(&self) -> u64 { self.view.part_index }
+    // name and filename: from_raw checked these immutable owner bytes.
     pub fn name(&self) -> &str { unsafe { std::str::from_utf8_unchecked(borrowed_bytes(self.view.name)) } }
     pub fn filename(&self) -> Option<&str> {
         (self.view.has_filename != 0).then(|| unsafe { std::str::from_utf8_unchecked(borrowed_bytes(self.view.filename)) })
@@ -177,7 +189,7 @@ impl PartEvent {
     pub fn header(&self, index: usize) -> Result<(&str, &[u8])> {
         let mut field = sys::sc_header { name: bytes(&[]), value: bytes(&[]) };
         check(unsafe { sys::sc_multipart_event_header_at(self.handle.as_ptr(), index, &mut field) })?;
-        Ok((unsafe { std::str::from_utf8_unchecked(borrowed_bytes(field.name)) }, unsafe { borrowed_bytes(field.value) }))
+        Ok((utf8(unsafe { borrowed_bytes(field.name) })?, unsafe { borrowed_bytes(field.value) }))
     }
 }
 impl Drop for PartEvent { fn drop(&mut self) { unsafe { sys::sc_multipart_event_destroy(self.handle.as_ptr()) }; } }

@@ -74,7 +74,10 @@ fn main() {
                 if static_link { "OFF" } else { "ON" }
             ))
             .arg("-DCMAKE_BUILD_TYPE=Release")
-            .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install.display()));
+            .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install.display()))
+            // This private prefix is read back as install/lib below. Pin it:
+            // GNUInstallDirs defaults to lib64 on non-Debian 64-bit Linux.
+            .arg("-DCMAKE_INSTALL_LIBDIR=lib");
         if let Some(generator) = env::var_os("SERVERCORE_CMAKE_GENERATOR") {
             configure.arg("-G").arg(generator);
         }
